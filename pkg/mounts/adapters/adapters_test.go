@@ -272,6 +272,162 @@ func TestNFSBuild_RejectsSourceNotInHostColonPathForm(t *testing.T) {
 	}
 }
 
+// TestS3Build_RejectsDashPrefixedSource mirrors the sshfs/rclone/nfs guards:
+// a source starting with '-' would land on mount-s3's argv as a flag.
+// Structured option keys must be emitted as daemon flags BEFORE extra_args,
+// and uid/gid must be validated as positive integers (>=1, matching
+// mount-s3's value_parser!(u32).range(1..) which rejects 0).
+func TestS3Build_EmitsStructuredUIDGidAndAllowFlagsWhenOptionsAreSet(t *testing.T) {
+	plan, err := (S3{}).Build("sb", 0, models.MountSpec{
+		Source: "s3://bucket/data",
+		Options: map[string]string{
+			"uid":            "1000",
+			"gid":            "1000",
+			"allow_other":    "true",
+			"allow_overwrite": "1",
+			"extra_args":     "--allow-delete",
+		},
+	}, "/mnt/t", "/creds")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	want := []string{"--uid", "1000", "--gid", "1000", "--allow-other", "--allow-overwrite"}
+	for _, w := range want {
+		if !contains(plan.Argv, w) {
+			t.Errorf("argv missing structured flag %q: %v", w, plan.Argv)
+		}
+	}
+	// Structured flags must precede extra_args.
+	if idxExtra := indexOf(plan.Argv, "--allow-delete"); idxExtra >= 0 && idxExtra < indexOf(plan.Argv, "--uid") {
+		t.Errorf("structured flags must precede extra_args: %v", plan.Argv)
+	}
+
+	// Invalid structured uid/gid values are rejected.
+	for _, bad := range []string{"0", "-5", "abc"} {
+		for _, key := range []string{"uid", "gid"} {
+			opts := map[string]string{key: bad}
+			if _, err := (S3{}).Build("sb", 0, models.MountSpec{Source: "s3://bucket", Options: opts}, "/mnt/t", "/creds"); err == nil {
+				t.Errorf("expected error for %s=%q", key, bad)
+			}
+		}
+	}
+}
+
+// Daemon-pinned flags must be denied in extra_args regardless of argv order:
+// mount-s3 (clap, no args_override_self) hard-errors on duplicate flags, so
+// the denylist — not ordering — is the only conflict protection.
+func TestS3Build_RejectsExtraArgsTokensConflictingWithPrefixEndpointProfileRegionReadOnly(t *testing.T) {
+	for _, extra := range []string{
+		"--prefix p/",             // space form
+		"--endpoint-url=http://x", // = form
+		"--profile other",
+		"--region eu-west-1",
+		"--read-only",
+	} {
+		_, err := (S3{}).Build("sb", 0, models.MountSpec{
+			Source:  "s3://bucket",
+			Options: map[string]string{"extra_args": extra},
+		}, "/mnt/t", "/creds")
+		if err == nil {
+			t.Errorf("expected error for extra_args %q", extra)
+		}
+	}
+}
+
+// Mixed spec (structured keys present + uid/gid/allow-* in extra_args) is
+// rejected fail-closed with a deprecation warning: otherwise any spec could
+// add one structured key to re-enable --uid injection via extra_args.
+func TestS3Build_RejectsUidGidAndAllowFlagsInExtraArgsWhenStructuredKeysArePresent(t *testing.T) {
+	for _, extra := range []string{
+		"--uid=1000",
+		"--uid 1000",
+		"--gid 1000",
+		"--allow-other",
+		"--allow-overwrite",
+	} {
+		_, err := (S3{}).Build("sb", 0, models.MountSpec{
+			Source: "s3://bucket",
+			Options: map[string]string{
+				"uid":        "1000",
+				"extra_args": extra,
+			},
+		}, "/mnt/t", "/creds")
+		if err == nil {
+			t.Errorf("expected error for mixed-spec extra_args %q", extra)
+			continue
+		}
+		if !strings.Contains(err.Error(), "deprecated") {
+			t.Errorf("error for %q should carry a deprecation warning, got: %v", extra, err)
+		}
+	}
+}
+
+func TestS3Build_RejectsDuplicatedDenylistedFlagsWithinExtraArgsAndBareDoubleDashToken(t *testing.T) {
+	for _, extra := range []string{
+		"--allow-delete --allow-delete",  // duplicate non-denylisted flag
+		"--uid 1 --uid 2",                // duplicate uid (legacy, no structured keys)
+		"--",                             // bare -- makes clap treat the rest as positionals
+		"--allow-delete -- --allow-other", // -- followed by more tokens
+	} {
+		_, err := (S3{}).Build("sb", 0, models.MountSpec{
+			Source:  "s3://bucket",
+			Options: map[string]string{"extra_args": extra},
+		}, "/mnt/t", "/creds")
+		if err == nil {
+			t.Errorf("expected error for extra_args %q", extra)
+		}
+	}
+}
+
+// The pre-task-002 subchat shape: uid/gid/allow-* flags arrive via extra_args
+// with no structured keys; the daemon must keep accepting them so the window
+// between the daemon deploy and the subchat migration stays green.
+func TestS3Build_AcceptsLegacyExtraArgsWithUidAndAllowFlagsWhenNoStructuredKeysAreSet(t *testing.T) {
+	plan, err := (S3{}).Build("sb", 0, models.MountSpec{
+		Source: "s3://bucket/data",
+		Options: map[string]string{
+			"extra_args": "--allow-other --allow-overwrite --uid=1000 --gid=1000",
+		},
+	}, "/mnt/t", "/creds")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{"--allow-other", "--allow-overwrite", "--uid=1000", "--gid=1000"} {
+		if !contains(plan.Argv, want) {
+			t.Errorf("argv missing legacy extra_args token %q: %v", want, plan.Argv)
+		}
+	}
+}
+
+// The exact production subchat options shape must be accepted unchanged.
+func TestS3Build_AcceptsProductionSubchatOptionsShapeRegionEndpointAndLegacyExtraArgsUnchanged(t *testing.T) {
+	plan, err := (S3{}).Build("sb", 0, models.MountSpec{
+		Source: "s3://bucket/data",
+		Options: map[string]string{
+			"region":     "us-east-1",
+			"endpoint":   "http://localhost:9000",
+			"extra_args": "--allow-other --allow-overwrite --uid=1000 --gid=1000",
+		},
+	}, "/mnt/t", "/creds")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{"--region", "us-east-1", "--endpoint-url", "http://localhost:9000", "--allow-other", "--allow-overwrite", "--uid=1000", "--gid=1000"} {
+		if !contains(plan.Argv, want) {
+			t.Errorf("argv missing %q: %v", want, plan.Argv)
+		}
+	}
+}
+
+func TestS3Build_RejectsDashPrefixedSource(t *testing.T) {
+	for _, source := range []string{"-oProxyCommand=evil", "--prefix=evil", "-bucket"} {
+		_, err := (S3{}).Build("sb", 0, models.MountSpec{Source: source}, "/mnt/s3", "/creds")
+		if err == nil {
+			t.Errorf("expected error for dash-prefixed s3 source %q", source)
+		}
+	}
+}
+
 func TestRcloneBuild_RejectsDashPrefixedSource(t *testing.T) {
 	_, err := (Rclone{}).Build("sb", 0, models.MountSpec{
 		Source:      "-oProxyCommand=evil",
@@ -283,10 +439,14 @@ func TestRcloneBuild_RejectsDashPrefixedSource(t *testing.T) {
 }
 
 func contains(items []string, want string) bool {
-	for _, item := range items {
+	return indexOf(items, want) >= 0
+}
+
+func indexOf(items []string, want string) int {
+	for i, item := range items {
 		if item == want {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
 }
