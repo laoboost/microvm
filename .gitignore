@@ -103,3 +103,4 @@ integration-tests/scenarios/domains.yml
 integration-tests/fixtures/wasm/*.wasm
 # Go coverage profiles
 *.out
+vendor/
