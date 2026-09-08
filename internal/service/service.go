@@ -1577,10 +1577,23 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if req.Image == "" && strings.TrimSpace(req.ModuleRef) == "" {
 		return nil, errors.New("image is required")
 	}
-	// Name rules are intake-only: a failover recreate replays whatever name
+// Name rules are intake-only: a failover recreate replays whatever name
 	// the replicated spec holds, including legacy names that predate them.
 	if !isStoredSpecReplay(ctx) {
 		if err := models.ValidateSandboxName(req.Name); err != nil {
+			return nil, err
+		}
+	}
+
+	// Tenant image-ref gate (plan task 012): every tenant-supplied image flows
+	// through here — the v1 create API, the daytona and e2b facades, and
+	// cluster creates all funnel into createSandbox. Transport-prefixed refs
+	// (oci-archive:, docker-archive:, dir:, oci:) are rejected before the
+	// runtime is touched. The internal template build pipeline
+	// (CreateTemplate/TemplateBuildRequest.ImageRef) is deliberately NOT
+	// gated: it is operator-only and legitimately carries transport refs.
+	if req.Image != "" {
+		if _, err := ValidateImageRef(req.Image); err != nil {
 			return nil, err
 		}
 	}
