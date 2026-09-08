@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,6 +14,29 @@ import (
 )
 
 const defaultWasmtimeFuel uint64 = 10_000_000_000
+
+// MemoryLimitError is returned when a wasmtime instantiation is attempted with
+// a non-positive memory limit: the engine fails closed rather than creating a
+// guest with unbounded linear memory.
+type MemoryLimitError struct{ MemoryMB int }
+
+func (e *MemoryLimitError) Error() string {
+	return fmt.Sprintf("wasmtime: non-positive memory limit %d MB, refusing unbounded linear memory", e.MemoryMB)
+}
+
+// createWasmtimeOutputTemp creates a capture file for guest stdout/stderr with
+// exclusive creation (O_EXCL) so concurrent instances cannot share a sink.
+func createWasmtimeOutputTemp(dir, kind string) (string, error) {
+	f, err := os.CreateTemp(dir, "aerol-wasm-"+kind+"-*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return name, nil
+}
 
 type wasmtimeEngine struct {
 	engine      *wasmtime.Engine
@@ -82,6 +104,10 @@ func (e *wasmtimeEngine) Instantiate(ctx context.Context, caps Capabilities) err
 }
 
 func (e *wasmtimeEngine) buildInstance(_ context.Context, caps Capabilities, stdoutPath, stderrPath string) error {
+	// Fail closed: never instantiate with unbounded linear memory.
+	if caps.MemoryMB <= 0 {
+		return &MemoryLimitError{MemoryMB: caps.MemoryMB}
+	}
 	store := wasmtime.NewStore(e.engine)
 	if err := store.SetFuel(defaultWasmtimeFuel); err != nil {
 		store.Close()
@@ -91,11 +117,11 @@ func (e *wasmtimeEngine) buildInstance(_ context.Context, caps Capabilities, std
 		store.SetEpochDeadline(uint64(d.Milliseconds()))
 	}
 
+	// Host isolation: only explicitly configured argv/env/streams reach the
+	// guest (mirrors engine_wazero.go moduleConfigFor). Nothing is inherited.
 	wasi := wasmtime.NewWasiConfig()
 	if len(caps.Args) > 0 {
 		wasi.SetArgv(caps.Args)
-	} else {
-		wasi.InheritArgv()
 	}
 	if len(caps.Env) > 0 {
 		keys := make([]string, 0, len(caps.Env))
@@ -105,8 +131,6 @@ func (e *wasmtimeEngine) buildInstance(_ context.Context, caps Capabilities, std
 			vals = append(vals, v)
 		}
 		wasi.SetEnv(keys, vals)
-	} else {
-		wasi.InheritEnv()
 	}
 	for _, p := range caps.Preopens {
 		guest := p.GuestPath
@@ -127,8 +151,12 @@ func (e *wasmtimeEngine) buildInstance(_ context.Context, caps Capabilities, std
 			store.Close()
 			return fmt.Errorf("stdout file: %w", err)
 		}
-	} else {
-		wasi.InheritStdout()
+	} else if err := wasi.SetStdoutFile(os.DevNull); err != nil {
+		// No output sink configured (Instantiate/RestoreSnapshot path): discard
+		// instead of inheriting the host stream.
+		wasi.Close()
+		store.Close()
+		return fmt.Errorf("stdout discard: %w", err)
 	}
 	if stderrPath != "" {
 		if err := wasi.SetStderrFile(stderrPath); err != nil {
@@ -136,8 +164,10 @@ func (e *wasmtimeEngine) buildInstance(_ context.Context, caps Capabilities, std
 			store.Close()
 			return fmt.Errorf("stderr file: %w", err)
 		}
-	} else {
-		wasi.InheritStderr()
+	} else if err := wasi.SetStderrFile(os.DevNull); err != nil {
+		wasi.Close()
+		store.Close()
+		return fmt.Errorf("stderr discard: %w", err)
 	}
 	store.SetWasi(wasi)
 
@@ -190,8 +220,15 @@ func (e *wasmtimeEngine) Run(ctx context.Context, caps Capabilities, export stri
 	defer cancel()
 
 	dir := os.TempDir()
-	stdoutPath := filepath.Join(dir, fmt.Sprintf("aerol-wasm-stdout-%d", time.Now().UnixNano()))
-	stderrPath := filepath.Join(dir, fmt.Sprintf("aerol-wasm-stderr-%d", time.Now().UnixNano()))
+	stdoutPath, err := createWasmtimeOutputTemp(dir, "stdout")
+	if err != nil {
+		return RunResult{}, fmt.Errorf("stdout temp: %w", err)
+	}
+	stderrPath, err := createWasmtimeOutputTemp(dir, "stderr")
+	if err != nil {
+		os.Remove(stdoutPath)
+		return RunResult{}, fmt.Errorf("stderr temp: %w", err)
+	}
 	defer os.Remove(stdoutPath)
 	defer os.Remove(stderrPath)
 
@@ -212,8 +249,8 @@ func (e *wasmtimeEngine) Run(ctx context.Context, caps Capabilities, export stri
 	if fn == nil {
 		return RunResult{}, fmt.Errorf("export %q not found", export)
 	}
-	_, err := fn.Call(e.store)
-	exitCode := wasmtimeExitCode(err)
+	_, callErr := fn.Call(e.store)
+	exitCode := wasmtimeExitCode(callErr)
 	stdout, _ := os.ReadFile(stdoutPath)
 	stderr, _ := os.ReadFile(stderrPath)
 
@@ -232,9 +269,9 @@ func (e *wasmtimeEngine) Run(ctx context.Context, caps Capabilities, export stri
 			Instructions:   instructions,
 		},
 	}
-	if err != nil && exitCode == 0 {
-		result.Stderr = stringsTrimJoin(result.Stderr, err.Error())
-		return result, err
+	if callErr != nil && exitCode == 0 {
+		result.Stderr = stringsTrimJoin(result.Stderr, callErr.Error())
+		return result, callErr
 	}
 	return result, nil
 }
