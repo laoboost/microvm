@@ -104,6 +104,8 @@ If you raise these bounds, keep both sides outside your kernel's ephemeral range
 
 The host firewall must permit inbound traffic on that range. The installer prints a reminder, but does not auto-open the firewall - operators decide their own policy.
 
+The configured range is validated at daemon startup: it must satisfy `1024 <= start < end <= 65535`, and it must not overlap the daemon's own bound ports (API, SSH gateway, toolbox/proxy listeners). An overlapping configuration is rejected with an error naming the colliding ports rather than surfacing as runtime bind failures.
+
 ### What gets restored on restart
 
 The `host_port` reservation is persisted alongside the exposure row. After a sandboxd restart, the periodic reconcile re-publishes the layer4 server pointing at the (possibly new) container IP, and the same host port stays bound - clients with cached connection strings keep working.
