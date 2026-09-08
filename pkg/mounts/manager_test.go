@@ -190,7 +190,7 @@ func TestManagerSuperviseRestartsAfterFirstCrash(t *testing.T) {
 		sandboxID:  "sb-sup",
 		index:      0,
 		hostPath:   hostPath,
-		plan:       adapters.Plan{Argv: []string{"true"}},
+		plan:       adapters.Plan{Argv: []string{"sleep", "0.5"}}, // restarted process stays up
 		cmd:        cmd,
 		startedAt:  time.Now().UTC(),
 		supervised: true,
@@ -199,9 +199,17 @@ func TestManagerSuperviseRestartsAfterFirstCrash(t *testing.T) {
 	m.state["sb-sup"] = []*mountState{state}
 	m.mu.Unlock()
 
+	// The restart path now waits for mount readiness; stub the probe so the
+	// fake mount counts as ready immediately.
+	stubProbe(t, func(string, time.Duration) error { return nil })
+
 	// Drive the supervisor synchronously; it'll Wait() on the cmd, observe
 	// the exit, and restart once.
 	m.superviseExit(state)
+
+	// Let the re-supervision goroutine (restarted cmd exits immediately) finish
+	// mutating state before asserting on it.
+	time.Sleep(50 * time.Millisecond)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
