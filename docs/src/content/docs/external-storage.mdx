@@ -25,6 +25,34 @@ The platform handles mounting on the host and bind-mounts the result into your s
 
 Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 KiB total payload.
 
+## S3 mount options
+
+The S3 adapter accepts structured option keys on the mount spec's `options` map:
+
+| Key | Value | mount-s3 flag |
+|---|---|---|
+| `uid` | positive integer (must be ≥ 1) | `--uid` |
+| `gid` | positive integer (must be ≥ 1) | `--gid` |
+| `allow_other` | `"true"` / `"1"` | `--allow-other` |
+| `allow_overwrite` | `"true"` / `"1"` | `--allow-overwrite` |
+
+The daemon pins `--prefix`, `--endpoint-url`, `--profile`, `--region`, and
+`--read-only` itself; `options.extra_args` is split into argv tokens and any
+flag from that pinned set is rejected (mount-s3 errors on duplicate flags
+rather than taking the last one, so the denylist is the only conflict
+protection). Duplicate flags inside `extra_args` are also rejected. If any
+structured key is set, `--uid`/`--gid`/`--allow-other`/`--allow-overwrite` are
+additionally denied in `extra_args` — mixing a structured key with the same
+flag in `extra_args` fails closed; the legacy path with no structured keys
+still accepts those flags in `extra_args` (deprecated).
+
+The `endpoint` option must be an absolute `http://` or `https://` URL; other
+values (including bare hosts) are rejected at spec validation instead of
+failing inside mount-s3.
+
+Mount `source` values must not begin with `-` for any mount type, so a
+source can never be parsed as a flag by the host-side mount tool.
+
 ## Mount an S3 Bucket
 
 <Tabs syncKey="lang">
@@ -191,7 +219,7 @@ Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 Ki
 - Credentials never enter the sandbox.
 - Credentials are encrypted at rest with AES-256-GCM.
 - Read APIs return `has_credentials: true` but never the actual values.
-- Mount fields (`source`, NFS `options.opts`, S3 `options.extra_args`, etc.) are passed verbatim to host-side mount tools (`mount`, `mount-s3`, `sshfs`, `rclone`) running as the daemon user, outside the sandbox isolation boundary. The platform assumes PAT holders are host operators.
+- Mount fields are passed to host-side mount tools (`mount`, `mount-s3`, `sshfs`, `rclone`) running as the daemon user, outside the sandbox isolation boundary. Sources are checked against a dash-prefix guard, S3 `extra_args` is filtered through a denylist of daemon-pinned flags, and the S3 endpoint must be an absolute `http(s)://` URL. The platform assumes PAT holders are host operators; the guards are hardening, not a tenant boundary.
 
 ## Operational Notes
 
