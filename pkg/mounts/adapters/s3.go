@@ -14,6 +14,9 @@ import (
 type S3 struct{}
 
 func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, credDir string) (Plan, error) {
+	if err := checkSource("s3", spec.Source); err != nil {
+		return Plan{}, err
+	}
 	bucket, prefix := parseS3Source(spec.Source)
 	if bucket == "" {
 		return Plan{}, fmt.Errorf("s3 source missing bucket: %q", spec.Source)
@@ -45,15 +48,27 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 		argv = append(argv, "--region", region)
 	}
 	if endpoint := spec.Options["endpoint"]; endpoint != "" {
+		if err := validateS3Endpoint(endpoint); err != nil {
+			return Plan{}, err
+		}
 		argv = append(argv, "--endpoint-url", endpoint)
 	}
 	if spec.ReadOnly {
 		argv = append(argv, "--read-only")
 	}
+	if err := validateS3StructuredOptions(spec.Options); err != nil {
+		return Plan{}, err
+	}
+	structured := s3StructuredFlags(spec.Options)
+	argv = append(argv, structured...)
 	if extra := spec.Options["extra_args"]; extra != "" {
 		// Whitespace-split; we trust the operator's image policy here. Each
 		// token becomes its own argv entry to avoid shell interpretation.
-		argv = append(argv, strings.Fields(extra)...)
+		tokens, err := s3ExtraArgsTokens(extra, len(structured) > 0)
+		if err != nil {
+			return Plan{}, err
+		}
+		argv = append(argv, tokens...)
 	}
 
 	if !useStaticCreds {

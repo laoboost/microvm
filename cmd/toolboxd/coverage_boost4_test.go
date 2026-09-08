@@ -329,7 +329,7 @@ func TestEnvdCloseStdinNoopWhileRunning(t *testing.T) {
 
 func TestExecStreamAdditionalBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger}
+	s := &server{authOptional: true, logger: logger}
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.handleExecStream(w, r)
 	}))

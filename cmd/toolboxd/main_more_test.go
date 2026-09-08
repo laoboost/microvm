@@ -74,7 +74,7 @@ func TestHandleExecShellErrorBranch(t *testing.T) {
 	lookPathFn = func(string) (string, error) { return "", os.ErrNotExist }
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/process/execute", bytes.NewReader([]byte(`{"command":"echo hi"}`)))
 	s.handleExec(rr, req)
@@ -85,7 +85,7 @@ func TestHandleExecShellErrorBranch(t *testing.T) {
 
 func TestHandleUploadWriteFailureBranch(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 	dir := t.TempDir()
 
 	var body bytes.Buffer

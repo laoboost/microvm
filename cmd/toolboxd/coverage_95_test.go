@@ -25,7 +25,7 @@ import (
 )
 
 func TestAdoptIdentityAndServingRequests(t *testing.T) {
-	srv := &server{parkedMode: true}
+	srv := &server{authOptional: true, parkedMode: true}
 	if srv.servingRequests() {
 		t.Fatal("parked+unadopted should not serve")
 	}
@@ -113,7 +113,7 @@ func TestEnvInt64AndNormalizeSandboxPathEdges(t *testing.T) {
 }
 
 func TestHandleUploadMissingFileAndMkdirFail(t *testing.T) {
-	srv := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	srv := &server{authOptional: true, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
@@ -248,7 +248,7 @@ func TestSessionHandlerErrorBranches(t *testing.T) {
 	if err := os.WriteFile(sandboxPath, []byte("blocker"), 0o600); err != nil {
 		t.Fatalf("WriteFile sandboxPath: %v", err)
 	}
-	noRecSrv := &server{sessions: okMgr, logger: logger}
+	noRecSrv := &server{authOptional: true, sessions: okMgr, logger: logger}
 	sess, err := okMgr.Create(context.Background(), models.CreateSessionRequest{Name: "norec", Command: "sleep 2"})
 	if err != nil {
 		t.Fatalf("Create norec: %v", err)
@@ -701,7 +701,7 @@ func TestDaytonaCodeRunScriptWriteError(t *testing.T) {
 	// Point TMPDIR at a file parent so writeCodeRunScript's temp file creation fails.
 	t.Setenv("TMPDIR", filepath.Join(blocker, "tmp"))
 	rec := httptest.NewRecorder()
-	srv := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	srv := &server{authOptional: true, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	body := `{"language":"python","code":"print(1)"}`
 	srv.handleDaytonaCodeRun(rec, httptest.NewRequest(http.MethodPost, "/process/code-run", strings.NewReader(body)))
 	if rec.Code == http.StatusOK {

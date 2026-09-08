@@ -49,7 +49,7 @@ func TestSessionFlusherAdapter_ListIDsAndFlushRecording(t *testing.T) {
 	// Create a session.
 	req := httptest.NewRequest(http.MethodPost, "/sessions",
 		strings.NewReader(`{"name":"flush-test","command":"printf hi"}`))
-	srv := &server{sessions: mgr, daytona: newDaytonaCompat(), logger: logger}
+	srv := &server{authOptional: true, sessions: mgr, daytona: newDaytonaCompat(), logger: logger}
 	rr := httptest.NewRecorder()
 	srv.handleSessionsCreate(rr, req)
 	if rr.Code != http.StatusCreated {
@@ -104,7 +104,7 @@ func TestDetectShell(t *testing.T) {
 
 func TestHandleExec_BasicShell(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 
 	body := `{"command":"printf exec-ok","timeout":5}`
 	rr := httptest.NewRecorder()
@@ -120,7 +120,7 @@ func TestHandleExec_BasicShell(t *testing.T) {
 
 func TestHandleExec_InvalidJSON(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/process/execute", strings.NewReader("{bad"))
@@ -132,7 +132,7 @@ func TestHandleExec_InvalidJSON(t *testing.T) {
 
 func TestHandleExec_EmptyCommand(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/process/execute", strings.NewReader(`{"command":""}`))
@@ -144,7 +144,7 @@ func TestHandleExec_EmptyCommand(t *testing.T) {
 
 func TestHandleUpload_InvalidJSON(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/files/upload", strings.NewReader("{bad"))
@@ -157,7 +157,7 @@ func TestHandleUpload_InvalidJSON(t *testing.T) {
 
 func TestHandleProxy_PortNotAllowed(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{8080: {}}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{8080: {}}}
 	h := s.routes()
 
 	// Port 9999 not in allowed list → 403.
@@ -344,7 +344,7 @@ func TestSessionHandlerRecording_WithContent(t *testing.T) {
 	}
 	t.Cleanup(mgr.Close)
 
-	srv := &server{
+	srv := &server{authOptional: true,
 		sessions:     mgr,
 		daytona:      newDaytonaCompat(),
 		logger:       logger,
@@ -643,7 +643,7 @@ func TestMapStreamSignal_AllCases(t *testing.T) {
 
 func TestHandleExecStream_Cwd(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger}
+	s := &server{authOptional: true, logger: logger}
 
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.handleExecStream(w, r)
@@ -739,7 +739,7 @@ func TestWriteFilesystemError_TypeMapping(t *testing.T) {
 
 func TestHandleSetAllowedPorts(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 	h := s.routes()
 
 	rr := httptest.NewRecorder()
@@ -753,7 +753,7 @@ func TestHandleSetAllowedPorts(t *testing.T) {
 
 func TestRoutesExecStreamRoute(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 
 	httpSrv := httptest.NewServer(s.routes())
 	defer httpSrv.Close()
@@ -789,7 +789,7 @@ func TestRoutesExecStreamRoute(t *testing.T) {
 
 func TestRoutesUploadDownload(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 	h := s.routes()
 	root := t.TempDir()
 	targetFile := filepath.Join(root, "uploaded.txt")

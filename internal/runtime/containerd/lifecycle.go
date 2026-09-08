@@ -186,7 +186,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, securitySpecOpts()...)
 	}
 	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(req)...)
+		specOpts = append(specOpts, d.resourceSpecOpts(req)...)
 	}
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
@@ -521,7 +521,23 @@ func (d *Driver) Resize(ctx context.Context, containerRef string, req models.Res
 		}
 		return fmt.Errorf("resize task: %w", err)
 	}
+	res := resizeLinuxResources(req, d.cfg.PidsLimit)
+	if res == nil {
+		return nil
+	}
+	// DiskGB is soft-ignored (containerd overlayfs has no live quota; same as
+	// create — plans/containerd-engine-phase0-decisions.md DiskGB row).
+	return task.Update(ctx, cntr.WithResources(res))
+}
+
+// resizeLinuxResources builds the LinuxResources payload for a live task
+// update. pidsLimit is always included (when configured) so a runtime update
+// cannot widen a previously applied pids limit; nil means nothing to apply.
+func resizeLinuxResources(req models.ResizeSandboxRequest, pidsLimit int) *specs.LinuxResources {
 	res := &specs.LinuxResources{}
+	if pidsLimit > 0 {
+		res.Pids = &specs.LinuxPids{Limit: int64(pidsLimit)}
+	}
 	if req.MemoryMB > 0 {
 		limit := int64(req.MemoryMB) * 1024 * 1024
 		res.Memory = &specs.LinuxMemory{Limit: &limit}
@@ -537,12 +553,10 @@ func (d *Driver) Resize(ctx context.Context, containerRef string, req models.Res
 		period := cpuPeriod
 		res.CPU = &specs.LinuxCPU{Quota: &quota, Period: &period}
 	}
-	if res.Memory == nil && res.CPU == nil {
+	if res.Memory == nil && res.CPU == nil && res.Pids == nil {
 		return nil
 	}
-	// DiskGB is soft-ignored (containerd overlayfs has no live quota; same as
-	// create — plans/containerd-engine-phase0-decisions.md DiskGB row).
-	return task.Update(ctx, cntr.WithResources(res))
+	return res
 }
 
 func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
@@ -929,8 +943,17 @@ func (d *Driver) removeHostFiles(sandboxID string) error {
 	return os.RemoveAll(dir)
 }
 
-func resourceSpecOpts(req models.CreateSandboxRequest) []oci.SpecOpts {
+func (d *Driver) resourceSpecOpts(req models.CreateSandboxRequest) []oci.SpecOpts {
 	var out []oci.SpecOpts
+	// The pids limit is applied OUTSIDE the per-resource conditionals: the
+	// warm-pool parked bootstrap creates containers with no meaningful
+	// CPU/memory requests and must still be fork-bomb protected (Devil's
+	// Advocate I4). gVisor honors pids.max (cgroup counts host-side sandbox
+	// processes too, so the effective in-guest limit is below the configured
+	// number).
+	if d.cfg.PidsLimit > 0 {
+		out = append(out, oci.WithPidsLimit(int64(d.cfg.PidsLimit)))
+	}
 	if req.MemoryMB > 0 {
 		out = append(out, oci.WithMemoryLimit(uint64(req.MemoryMB)*1024*1024))
 	}

@@ -323,7 +323,7 @@ func TestHandleExecNonExitWaitMerge(t *testing.T) {
 	if code != -1 || sig != "forced wait" {
 		t.Fatalf("interpretWaitResult = (%d,%q)", code, sig)
 	}
-	srv := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	srv := &server{authOptional: true, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	body := `{"command":"sh","argv":["-c","kill -9 $$"]}`
 	rec := httptest.NewRecorder()
 	srv.handleExec(rec, httptest.NewRequest(http.MethodPost, "/process/execute", strings.NewReader(body)))

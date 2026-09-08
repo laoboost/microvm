@@ -330,21 +330,8 @@ func (m *Manager) superviseExit(state *mountState) {
 	err := state.cmd.Wait()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Was this mount removed (UnmountAll)?
-	current := m.state[state.sandboxID]
-	stillTracked := false
-	for _, s := range current {
-		if s == state {
-			stillTracked = true
-			break
-		}
-	}
-	if !stillTracked {
-		return
-	}
-	if state.disabled {
+	if !m.trackedAndEnabledLocked(state) {
+		m.mu.Unlock()
 		return
 	}
 
@@ -367,23 +354,90 @@ func (m *Manager) superviseExit(state *mountState) {
 		// Two crashes in 30s — give up.
 		state.disabled = true
 		_ = unmountPath(state.hostPath)
+		m.mu.Unlock()
 		return
 	}
 
-	// Best-effort restart. Re-create cred file if needed.
-	if state.plan.CredFile != "" {
-		_ = writeCredFile(state.plan.CredFile, state.plan.CredBody)
+	// Snapshot what the restart needs, then drop the lock: the rewrite/spawn/
+	// probe sequence below blocks (the readiness probe waits up to waitTimeout)
+	// and must not stall concurrent mount operations (mountOne, UnmountAll,
+	// teardown) that share m.mu.
+	plan := state.plan
+	hostPath := state.hostPath
+	m.mu.Unlock()
+
+	m.restartMount(state, plan, hostPath)
+}
+
+// restartMount performs the blocking part of a supervised restart with the
+// manager mutex NOT held: re-write the credential file, re-spawn the mount
+// tool, wait for readiness, and unlink the credential. On success it
+// re-acquires the lock to publish the new process and re-enters supervision.
+// On failure it marks the mount disabled (if still tracked) and — on a probe
+// timeout — unlinks the credential so no 0600 secret outlives a dead mount.
+func (m *Manager) restartMount(state *mountState, plan adapters.Plan, hostPath string) {
+	if plan.CredFile != "" {
+		_ = writeCredFile(plan.CredFile, plan.CredBody)
 	}
-	cmd, out, err := spawnMountProcess(state.plan)
+	cmd, out, err := spawnMountProcess(plan)
 	if err != nil {
-		state.disabled = true
+		m.mu.Lock()
+		if m.trackedAndEnabledLocked(state) {
+			state.disabled = true
+		}
+		m.mu.Unlock()
 		m.logger.Warn("mount restart spawn failed", "sandbox_id", state.sandboxID, "index", state.index, "error", err)
 		return
 	}
-	state.cmd = cmd
-	state.output = out
 
-	go m.superviseExit(state)
+	if err := waitForMountProbe(hostPath, m.waitTimeout); err != nil {
+		m.logger.Warn("mount restart probe failed",
+			"sandbox_id", state.sandboxID,
+			"index", state.index,
+			"type", string(state.spec.Type),
+			"error", err,
+		)
+		_ = killMount(cmd)
+		_ = unmountPath(hostPath)
+		m.removeRestartCred(plan)
+		m.mu.Lock()
+		if m.trackedAndEnabledLocked(state) {
+			state.disabled = true
+		}
+		m.mu.Unlock()
+		return
+	}
+
+	m.removeRestartCred(plan)
+
+	m.mu.Lock()
+	if m.trackedAndEnabledLocked(state) {
+		state.cmd = cmd
+		state.output = out
+		m.mu.Unlock()
+		go m.superviseExit(state)
+		return
+	}
+	m.mu.Unlock()
+}
+
+// removeRestartCred unlinks the credential file after a successful restart,
+// mirroring the normal start path in mountOne. Best-effort.
+func (m *Manager) removeRestartCred(plan adapters.Plan) {
+	if plan.UnlinkCred && plan.CredFile != "" {
+		_ = os.Remove(plan.CredFile)
+	}
+}
+
+// trackedAndEnabledLocked reports whether state is still tracked by the
+// manager and not disabled. Caller must hold m.mu.
+func (m *Manager) trackedAndEnabledLocked(state *mountState) bool {
+	for _, s := range m.state[state.sandboxID] {
+		if s == state {
+			return !state.disabled
+		}
+	}
+	return false
 }
 
 // tearDownState kills/unmounts a single mount. Always best-effort.

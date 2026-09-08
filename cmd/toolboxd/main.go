@@ -57,7 +57,11 @@ type server struct {
 	logger    *slog.Logger
 	sandboxID string
 	authToken string
-	port      int
+	// authOptional preserves fail-open behavior when the token is empty
+	// (SB_TOOLBOX_AUTH_OPTIONAL=true|1). Dev-only escape hatch; default is
+	// fail closed (401) so a launch path that forgets the token stays safe.
+	authOptional bool
+	port         int
 
 	mu           sync.RWMutex
 	allowedPorts map[int]struct{}
@@ -70,6 +74,25 @@ type server struct {
 	daytona  *daytonaCompat
 	envd     *envdCompat
 	cloneGen *clonegen.Generation
+}
+
+// authOptionalFromEnv reports whether the dev escape hatch
+// SB_TOOLBOX_AUTH_OPTIONAL is enabled ("true"/"1", case-insensitive).
+// Default (unset/false) is fail closed: requireAuth returns 401 when
+// SB_TOOLBOX_TOKEN is empty.
+func authOptionalFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SB_TOOLBOX_AUTH_OPTIONAL")))
+	return v == "true" || v == "1"
+}
+
+// warnAuthOptional logs a startup warning when fail-open is explicitly
+// enabled with an empty token. No-op in the safe default configuration.
+func (s *server) warnAuthOptional() {
+	if s.authToken != "" || !s.authOptional {
+		return
+	}
+	s.logger.Warn("toolboxd running with auth optional and empty token; " +
+		"SB_TOOLBOX_AUTH_OPTIONAL is a dev-only escape hatch and must not be set in production")
 }
 
 func (s *server) servingRequests() bool {
@@ -127,6 +150,7 @@ func main() {
 		logger:       logger,
 		sandboxID:    readSandboxID(),
 		authToken:    strings.TrimSpace(os.Getenv("SB_TOOLBOX_TOKEN")),
+		authOptional: authOptionalFromEnv(),
 		port:         envInt("SB_TOOLBOX_PORT", 2280),
 		allowedPorts: map[int]struct{}{},
 		parkedMode:   strings.TrimSpace(os.Getenv("SB_POOL_PARKED")) == "1",
@@ -141,6 +165,7 @@ func main() {
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
 	os.Unsetenv("SB_TOOLBOX_TOKEN")
 	scrubReadyEnv()
+	srv.warnAuthOptional()
 
 	startReaperFn(logger)
 
@@ -549,9 +574,24 @@ func isKnownToolboxPath(path string) bool {
 	}
 }
 
+// requireAuth fails closed when the token is empty: a future runtime launch
+// path that forgets to set SB_TOOLBOX_TOKEN must not expose exec/file/proxy
+// endpoints to the network. All verified launch paths always set the token:
+//   - pkg/docker/client.go:418 (docker create)
+//   - pkg/docker/docker_pool.go:229 (warm-pool parked bootstrap)
+//   - internal/runtime/containerd/lifecycle.go:601
+//   - internal/runtime/containerd/warm_park.go:169 (parked bootstrap)
+//   - internal/runtime/firecracker/coldboot_agent.go:57
+//
+// Local development can restore today's fail-open behavior explicitly via
+// SB_TOOLBOX_AUTH_OPTIONAL=true|1 (warned at startup).
 func (s *server) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	if s.authToken == "" {
-		return true
+		if s.authOptional {
+			return true
+		}
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return false
 	}
 	const prefix = "Bearer "
 	authorization := r.Header.Get("Authorization")

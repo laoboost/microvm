@@ -18,6 +18,9 @@ func (Rclone) Build(sandboxID string, index int, spec models.MountSpec, hostTarg
 	if conf == "" {
 		return Plan{}, errors.New("rclone requires credentials.rclone_conf")
 	}
+	if err := checkSource("rclone", spec.Source); err != nil {
+		return Plan{}, err
+	}
 
 	credFile := filepath.Join(credDir, fmt.Sprintf("%s-%d.rclone.conf", sandboxID, index))
 

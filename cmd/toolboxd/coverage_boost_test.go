@@ -90,8 +90,8 @@ func TestNormalizeSandboxPath_ExtendedCases(t *testing.T) {
 func TestRequireAuth_WithAndWithoutToken(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// No token configured → always allowed.
-	sNoToken := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	// No token configured, auth optional (dev escape hatch) → allowed.
+	sNoToken := &server{logger: logger, authOptional: true, allowedPorts: map[int]struct{}{}}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	if !sNoToken.requireAuth(rr, req) {
@@ -99,7 +99,7 @@ func TestRequireAuth_WithAndWithoutToken(t *testing.T) {
 	}
 
 	// Token configured, no header → 401.
-	sWithToken := &server{logger: logger, authToken: "secret", allowedPorts: map[int]struct{}{}}
+	sWithToken := &server{authOptional: true, logger: logger, authToken: "secret", allowedPorts: map[int]struct{}{}}
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/health", nil)
 	if sWithToken.requireAuth(rr, req) {
@@ -128,7 +128,7 @@ func TestRequireAuth_WithAndWithoutToken(t *testing.T) {
 
 func TestRoutesRootVersionHealth(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, sandboxID: "testbox", allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, sandboxID: "testbox", allowedPorts: map[int]struct{}{}}
 	h := s.routes()
 
 	for _, tc := range []struct {
@@ -153,7 +153,7 @@ func TestRoutesRootVersionHealth(t *testing.T) {
 
 func TestRoutesDefaultNotFound(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, sandboxID: "sb-known", allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, sandboxID: "sb-known", allowedPorts: map[int]struct{}{}}
 	h := s.routes()
 
 	// /sb-known/definitely/not/a/known/path doesn't strip to a known prefix.
@@ -168,7 +168,7 @@ func TestRoutesDefaultNotFound(t *testing.T) {
 
 func TestRoutesCodeInterpreterNotImplemented(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, authToken: "", allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, authToken: "", allowedPorts: map[int]struct{}{}}
 	h := s.routes()
 
 	rr := httptest.NewRecorder()
@@ -202,7 +202,7 @@ func TestEnvHelpers_MissingKeys(t *testing.T) {
 
 func TestHandleDownload_InternalServerError(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 	dir := t.TempDir()
 
 	rr := httptest.NewRecorder()
@@ -612,7 +612,7 @@ func TestEnvdProcessCloseStdin_InvalidJSON(t *testing.T) {
 
 func TestEnvdProcessList_NoSessions(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := &server{logger: logger, authToken: "", allowedPorts: map[int]struct{}{}, envd: newEnvdCompat()}
+	srv := &server{authOptional: true, logger: logger, authToken: "", allowedPorts: map[int]struct{}{}, envd: newEnvdCompat()}
 	h := srv.routes()
 
 	rr := httptest.NewRecorder()
@@ -625,7 +625,7 @@ func TestEnvdProcessList_NoSessions(t *testing.T) {
 
 func TestEnvdProcessStart_NoSessions(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := &server{logger: logger, authToken: "", allowedPorts: map[int]struct{}{}, envd: newEnvdCompat()}
+	srv := &server{authOptional: true, logger: logger, authToken: "", allowedPorts: map[int]struct{}{}, envd: newEnvdCompat()}
 	h := srv.routes()
 
 	payload := []byte(`{"process":{"cmd":"/bin/sh"}}`)
@@ -659,7 +659,7 @@ func TestEnvdProcessStart_MissingCmd(t *testing.T) {
 
 func TestHandleDaytonaProcessRoute_NoSessionsManager(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := &server{logger: logger, daytona: newDaytonaCompat()}
+	srv := &server{authOptional: true, logger: logger, daytona: newDaytonaCompat()}
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/process/session", strings.NewReader(`{"sessionId":"x"}`))
@@ -958,7 +958,7 @@ func TestSessionAttach_ReplayAndExit(t *testing.T) {
 
 func TestSessionAttach_SessionsDisabled(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	srv := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 	h := srv.routes()
 
 	rr := httptest.NewRecorder()

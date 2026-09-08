@@ -133,6 +133,10 @@ type Config struct {
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
+	// SandboxPidsLimit caps the number of processes per sandbox container
+	// (docker HostConfig.PidsLimit / OCI pids cgroup controller).
+	// SB_SANDBOX_PIDS_LIMIT; default 1024, <=0 disables.
+	SandboxPidsLimit int
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
@@ -1400,6 +1404,7 @@ func Load() (Config, error) {
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 1024),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
@@ -1708,6 +1713,9 @@ func Load() (Config, error) {
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
 	}
+	if cfg.SandboxPidsLimit < 0 {
+		return Config{}, errors.New("SB_SANDBOX_PIDS_LIMIT must be >= 0 (0 disables the limit)")
+	}
 	if cfg.ImagePullFailureBackoff < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0")
 	}
@@ -1953,6 +1961,14 @@ func Load() (Config, error) {
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
 		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",
 			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+	}
+	// A tenant L4 allocation landing on one of the daemon's own bound ports
+	// could shadow (or be shadowed by) the API, toolbox, SSH, ingress proxy,
+	// wake listener or Caddy admin. Reject the range at boot, naming every
+	// colliding port.
+	if collisions := l4RangeDaemonPortCollisions(cfg, cfg.L4PortRangeStart, cfg.L4PortRangeEnd); len(collisions) > 0 {
+		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): overlaps daemon's own bound ports %v",
+			cfg.L4PortRangeStart, cfg.L4PortRangeEnd, collisions)
 	}
 
 	// If TLS-SNI multiplexing is enabled, the fallback HTTPS address must be
@@ -2448,6 +2464,36 @@ func requireLoopbackAddr(envKey, value string) error {
 		return fmt.Errorf("%s=%q must bind to a loopback interface (got %s); the wake ingress carries no auth", envKey, value, ip)
 	}
 	return nil
+}
+
+// l4RangeDaemonPortCollisions returns the sorted set of daemon-bound ports
+// inside [start, end]. Unparseable addrs (e.g. an explicit SB_CADDY_ADMIN_URL
+// without a port) contribute nothing — those are validated by their own fields.
+func l4RangeDaemonPortCollisions(cfg Config, start, end int) []int {
+	var ports []int
+	ports = append(ports, cfg.APIPort, cfg.ToolboxPort)
+	for _, addr := range []string{cfg.SSHListenAddr, cfg.InternalIngressAddr, cfg.InternalL4WakeAddr} {
+		if _, port, err := net.SplitHostPort(strings.TrimSpace(addr)); err == nil {
+			if p, err := strconv.Atoi(port); err == nil {
+				ports = append(ports, p)
+			}
+		}
+	}
+	if u, err := url.Parse(strings.TrimSpace(cfg.CaddyAdminURL)); err == nil {
+		if p, err := strconv.Atoi(u.Port()); err == nil {
+			ports = append(ports, p)
+		}
+	}
+	var out []int
+	seen := map[int]bool{}
+	for _, p := range ports {
+		if start <= p && p <= end && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Ints(out)
+	return out
 }
 
 func normalizeAdvertiseHost(value string) string {

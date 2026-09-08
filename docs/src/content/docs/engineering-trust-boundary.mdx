@@ -29,7 +29,14 @@ tenants sharing a physical CPU (Spectre / L1TF class). The user-supplied
 `env` block on a sandbox: it is propagated into the container as ordinary
 environment variables and is visible to every process there, including the
 in-container agent (see "What about toolboxd?" below). Treat `env` as
-"shared with the guest by design".
+"shared with the guest by design". Image references supplied to sandbox
+create APIs must be plain docker references — transport prefixes
+(`oci-archive:`, `docker-archive:`, `oci:`, `dir:`, …) are rejected at the
+tenant entry points, so a tenant cannot point the daemon at an arbitrary
+host file path; internal template/build pipelines (operator-only) keep
+transport refs. Each sandbox also runs under a per-sandbox pids limit
+(`SB_SANDBOX_PIDS_LIMIT`, default 1024, `0` disables) so a runaway process
+tree inside a container cannot exhaust the host's pids.
 
 ## What about runc?
 
@@ -58,6 +65,13 @@ container, not its own input validation. Anyone holding the per-sandbox
 toolbox token (32 random bytes, hex-encoded, generated at
 `internal/service/service.go:4140-4146`) gets full execution authority
 inside that one container.
+
+toolboxd is **fail-closed on auth**: if `SB_TOOLBOX_TOKEN` is empty, the
+exec endpoint refuses requests instead of serving unauthenticated. The only
+bypass is the explicit dev-only escape hatch `SB_TOOLBOX_AUTH_OPTIONAL=true`
+(warned at startup), which must never be set in production — parked and
+warm containers always carry a bootstrap token, so normal launch paths are
+unaffected.
 
 ## What about SSH?
 
@@ -254,6 +268,16 @@ processes, and two independent bind mounts.
 > else from the host. It does not see the credential file, the mount
 > tool, or any other host path. The boundary is enforced by the kernel's
 > mount namespace, not by sandboxd.
+
+The argv the host builds for those tools is hardened, since mount fields
+come from the API: mount sources starting with `-` are rejected for every
+mount type (they could otherwise be parsed as flags); S3 mounts use
+structured option keys (`uid`, `gid`, `allow_other`, `allow_overwrite`) and
+`extra_args` is denied any daemon-pinned flag (`--prefix`, `--endpoint-url`,
+`--profile`, `--region`, `--read-only`); S3 endpoints must be absolute
+`http(s)://` URLs. After a supervised mount restart, the staged credential
+file is unlinked again before the replacement process is considered ready.
+See [External Storage](/external-storage) for the exact option semantics.
 
 ## Property 4: the network can be forced through a host-side chokepoint
 
