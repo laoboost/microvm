@@ -1962,6 +1962,14 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",
 			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 	}
+	// A tenant L4 allocation landing on one of the daemon's own bound ports
+	// could shadow (or be shadowed by) the API, toolbox, SSH, ingress proxy,
+	// wake listener or Caddy admin. Reject the range at boot, naming every
+	// colliding port.
+	if collisions := l4RangeDaemonPortCollisions(cfg, cfg.L4PortRangeStart, cfg.L4PortRangeEnd); len(collisions) > 0 {
+		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): overlaps daemon's own bound ports %v",
+			cfg.L4PortRangeStart, cfg.L4PortRangeEnd, collisions)
+	}
 
 	// If TLS-SNI multiplexing is enabled, the fallback HTTPS address must be
 	// set — otherwise non-sandbox SNI (the API itself, the catch-all 404)
@@ -2456,6 +2464,36 @@ func requireLoopbackAddr(envKey, value string) error {
 		return fmt.Errorf("%s=%q must bind to a loopback interface (got %s); the wake ingress carries no auth", envKey, value, ip)
 	}
 	return nil
+}
+
+// l4RangeDaemonPortCollisions returns the sorted set of daemon-bound ports
+// inside [start, end]. Unparseable addrs (e.g. an explicit SB_CADDY_ADMIN_URL
+// without a port) contribute nothing — those are validated by their own fields.
+func l4RangeDaemonPortCollisions(cfg Config, start, end int) []int {
+	var ports []int
+	ports = append(ports, cfg.APIPort, cfg.ToolboxPort)
+	for _, addr := range []string{cfg.SSHListenAddr, cfg.InternalIngressAddr, cfg.InternalL4WakeAddr} {
+		if _, port, err := net.SplitHostPort(strings.TrimSpace(addr)); err == nil {
+			if p, err := strconv.Atoi(port); err == nil {
+				ports = append(ports, p)
+			}
+		}
+	}
+	if u, err := url.Parse(strings.TrimSpace(cfg.CaddyAdminURL)); err == nil {
+		if p, err := strconv.Atoi(u.Port()); err == nil {
+			ports = append(ports, p)
+		}
+	}
+	var out []int
+	seen := map[int]bool{}
+	for _, p := range ports {
+		if start <= p && p <= end && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Ints(out)
+	return out
 }
 
 func normalizeAdvertiseHost(value string) string {
