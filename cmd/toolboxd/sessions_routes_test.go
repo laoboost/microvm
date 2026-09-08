@@ -161,7 +161,7 @@ func TestSessionsRoute_DispatchAndErrors(t *testing.T) {
 }
 
 func TestSessionsRoute_DisabledManagerBranches(t *testing.T) {
-	srv := &server{}
+	srv := &server{authOptional: true}
 	h := srv.routes()
 
 	rr := httptest.NewRecorder()
@@ -187,7 +187,7 @@ func TestSessionsRoute_DisabledManagerBranches(t *testing.T) {
 }
 
 func TestSessionsRoute_DisabledManagerAdditionalBranches(t *testing.T) {
-	srv := &server{}
+	srv := &server{authOptional: true}
 	h := srv.routes()
 
 	cases := []struct {

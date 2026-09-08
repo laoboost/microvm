@@ -77,7 +77,7 @@ func TestInterpretWaitResultPreservesSignal(t *testing.T) {
 
 func TestExecStream_WebsocketRunWithPipes(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger}
+	s := &server{authOptional: true, logger: logger}
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.handleExecStream(w, r)
 	}))
@@ -130,7 +130,7 @@ func TestExecStream_WebsocketRunWithPipes(t *testing.T) {
 
 func TestExecStream_InvalidStartMessage(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger}
+	s := &server{authOptional: true, logger: logger}
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.handleExecStream(w, r)
 	}))
@@ -165,7 +165,7 @@ func TestExecStream_InvalidStartMessage(t *testing.T) {
 
 func TestExecStream_WebsocketRunWithPTY(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger}
+	s := &server{authOptional: true, logger: logger}
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.handleExecStream(w, r)
 	}))
@@ -284,7 +284,7 @@ func TestExecStreamControlBranches(t *testing.T) {
 
 func TestExecStreamRejectsEmptyCommand(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger}
+	s := &server{authOptional: true, logger: logger}
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.handleExecStream(w, r)
 	}))

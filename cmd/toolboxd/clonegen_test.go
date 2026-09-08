@@ -14,7 +14,7 @@ import (
 func TestCloneGenerationRoute_ReturnsToken(t *testing.T) {
 	cg := clonegen.New(filepath.Join(t.TempDir(), "clone-generation"), nil)
 	cg.Bump(1700000000000000000)
-	s := &server{
+	s := &server{authOptional: true,
 		sandboxID:    "sb-test",
 		authToken:    "token-123",
 		allowedPorts: map[int]struct{}{},

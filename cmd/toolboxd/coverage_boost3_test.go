@@ -197,7 +197,7 @@ func TestEnvdHelperCoverage(t *testing.T) {
 
 func TestDaytonaAndSessionRouteErrorBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	disabled := &server{logger: logger, daytona: newDaytonaCompat()}
+	disabled := &server{authOptional: true, logger: logger, daytona: newDaytonaCompat()}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/process/session", nil)
 	if !disabled.handleDaytonaProcessRoute(rr, req) || rr.Code != http.StatusNotImplemented {
@@ -239,7 +239,7 @@ func TestDaytonaAndSessionRouteErrorBranches(t *testing.T) {
 		t.Fatalf("missing session input status = %d", rr.Code)
 	}
 
-	h := (&server{logger: logger, sessions: nil}).routes()
+	h := (&server{authOptional: true, logger: logger, sessions: nil}).routes()
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/sessions/abc", nil)
 	h.ServeHTTP(rr, req)
@@ -354,7 +354,7 @@ func TestEnvdProcessStreamAndSelectorCleanup(t *testing.T) {
 
 func TestEnvdSelectorAndFilesystemErrorHelpers(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := &server{logger: logger, envd: newEnvdCompat()}
+	srv := &server{authOptional: true, logger: logger, envd: newEnvdCompat()}
 
 	rr := httptest.NewRecorder()
 	if _, _, ok := srv.lookupEnvdProcessSessionFromSelector(rr, envdProcessSelector{Tag: "x"}); ok {
@@ -500,7 +500,7 @@ func TestDrainAndDaytonaLogStreaming(t *testing.T) {
 
 func TestProxyAdminAndSandboxHelpers(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, sandboxID: "sb-proxy", allowedPorts: map[int]struct{}{65535: {}}}
+	s := &server{authOptional: true, logger: logger, sandboxID: "sb-proxy", allowedPorts: map[int]struct{}{65535: {}}}
 	h := s.routes()
 
 	rr := httptest.NewRecorder()

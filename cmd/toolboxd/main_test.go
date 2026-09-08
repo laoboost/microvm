@@ -69,7 +69,7 @@ func TestNormalizeSandboxPathCases(t *testing.T) {
 }
 
 func TestServerAllowedPorts(t *testing.T) {
-	s := &server{allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, allowedPorts: map[int]struct{}{}}
 	s.setAllowedPorts([]int{80, -1, 0, 65536, 8080, 8080})
 	if !s.portAllowed(80) || !s.portAllowed(8080) {
 		t.Fatalf("expected allowed ports to include 80 and 8080")
@@ -168,7 +168,7 @@ func TestUtilityHelpers(t *testing.T) {
 
 func TestMainRouteHandlerBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{
+	s := &server{authOptional: true,
 		logger:       logger,
 		sandboxID:    "sb-test",
 		authToken:    "token-123",
@@ -279,7 +279,7 @@ func TestMainRouteHandlerBranches(t *testing.T) {
 
 func TestMainHandlers_SuccessPaths(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	s := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 
 	t.Run("exec_success", func(t *testing.T) {
 		workDir := t.TempDir()
@@ -504,7 +504,7 @@ func TestRoutesDispatchCoverage(t *testing.T) {
 	}
 	t.Cleanup(mgr.Close)
 
-	srv := &server{
+	srv := &server{authOptional: true,
 		logger:       logger,
 		sandboxID:    "sb-test",
 		allowedPorts: map[int]struct{}{},
