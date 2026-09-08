@@ -107,6 +107,19 @@ func (s *Service) consumeExpectedStop(id string) stopMode {
 	return rec.mode
 }
 
+// hasExpectedStop reports whether an unexpired stop expectation is currently
+// recorded for id. Unlike consumeExpectedStop it does not consume the entry —
+// the events handler still needs it to classify the eventual die/stop/oom.
+func (s *Service) hasExpectedStop(id string) bool {
+	s.expectedStopsMu.Lock()
+	defer s.expectedStopsMu.Unlock()
+	rec, ok := s.expectedStops[id]
+	if !ok {
+		return false
+	}
+	return time.Since(rec.recordedAt) <= expectedStopMaxAge
+}
+
 // stopSandboxInternal is the single code path for stopping a sandbox row.
 // All wake-arming policy lives here so manual / lifecycle / recreate
 // callers cannot drift apart on whether wake gets set or cleared.
