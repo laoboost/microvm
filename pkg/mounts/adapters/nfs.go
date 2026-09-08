@@ -11,6 +11,9 @@ import (
 type NFS struct{}
 
 func (NFS) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, credDir string) (Plan, error) {
+	if err := checkNFSSource(spec.Source); err != nil {
+		return Plan{}, err
+	}
 	opts := spec.Options["opts"]
 	if opts == "" {
 		if spec.ReadOnly {

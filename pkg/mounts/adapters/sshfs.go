@@ -19,6 +19,9 @@ func (SSHFS) Build(sandboxID string, index int, spec models.MountSpec, hostTarge
 	if pem == "" {
 		return Plan{}, errors.New("sshfs requires credentials.private_key_pem")
 	}
+	if err := checkSource("sshfs", spec.Source); err != nil {
+		return Plan{}, err
+	}
 
 	credFile := filepath.Join(credDir, fmt.Sprintf("%s-%d.id", sandboxID, index))
 	opts := "IdentityFile=" + credFile +
