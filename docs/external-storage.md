@@ -10,7 +10,7 @@ The daemon does the mounting on the host and bind-mounts the result into your co
 2. Sandboxd spawns the appropriate mount tool (`mountpoint-s3`, `sshfs`, `mount.nfs`, `rclone mount`) on the host inside `/var/lib/sandboxd/mounts/<sandbox-id>/<index>/` (mode 0700, owned by the sandboxd user).
 3. The Docker container is created with that path bind-mounted at the target you chose. Inside the container `/workspace` (or whatever target) is just a directory.
 4. If the FUSE process crashes, sandboxd restarts it. Two crashes within 30 s and the mount is disabled - the kernel returns I/O errors at the mount point until you recreate the sandbox.
-5. On `Stop` the host mount is torn down. On `Start` it's re-established. After a host or sandboxd reboot the reconciler re-mounts every running sandbox automatically.
+5. On `Stop` the host mount is torn down. This covers API-driven stops **and** involuntary container exits (`die`/`stop`/`oom` Docker events) — a fresh container must never bind the previous container's FUSE connection. On `Start` it's re-established. After a host or sandboxd reboot the reconciler re-mounts every running sandbox automatically.
 
 Cross-tenant isolation is enforced by the kernel's mount namespace: container A cannot see container B's bind source. The host parent directory is mode 0700 so even other host users can't traverse it.
 
@@ -131,7 +131,7 @@ GET /v1/sandboxes/{id}/mounts
 
 ## Operational notes
 
-- **Lifecycle.** Mounts are established at `Create`, torn down at `Stop` or `Destroy`, and re-established at `Start`. After a sandboxd or host restart the reconciler re-mounts every running sandbox the next time it ticks (or at startup).
+- **Lifecycle.** Mounts are established at `Create`, torn down at `Stop` or `Destroy` (including the die/stop/oom event path for involuntary exits), and re-established at `Start`. Crash supervision preserves continuity only while the container keeps running; once the container has exited there is nothing to preserve, so the teardown still happens and the next start mounts fresh. After a sandboxd or host restart the reconciler re-mounts every running sandbox the next time it ticks (or at startup) — a pass that lands mid-stop skips sandboxes with a recorded expected-stop so the tick cannot resurrect mounts the stop path is tearing down.
 - **Crash supervision.** A FUSE process that exits is restarted once. Two crashes within 30 s disable the mount; sandboxd logs the event with `sandbox_id`, `index`, and the exit error.
 - **Host requirements.** Install `fuse3`, `sshfs`, `nfs-common`, `rclone`, and AWS's `mountpoint-s3` (`.deb` from AWS) on the host. The install script does this for you.
 - **Egress.** Network egress is enforced inside the container, not for the host's mount tools. If you enable per-sandbox egress blocking (`network_block_all`), the container loses internet access but the host's FUSE process keeps talking to your storage. This is the desired behavior for most "lock down the workload, keep storage" cases.
