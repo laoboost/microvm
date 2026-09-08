@@ -213,7 +213,7 @@ func TestWaitToolboxHTTPCancelDuringPollPush95(t *testing.T) {
 }
 
 func TestResourceSpecOptsTinyCPUPush95(t *testing.T) {
-	opts := resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.001})
+	opts := (&Driver{cfg: Config{}}).resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.001})
 	if len(opts) != 1 {
 		t.Fatalf("opts=%d", len(opts))
 	}

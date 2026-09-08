@@ -1373,7 +1373,7 @@ func TestConnectUnsupportedVersion(t *testing.T) {
 }
 
 func TestResourceSpecOptsFractionalCPU(t *testing.T) {
-	opts := resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.25, MemoryMB: 64})
+	opts := (&Driver{cfg: Config{}}).resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.25, MemoryMB: 64})
 	if len(opts) != 2 {
 		t.Fatalf("opts=%d", len(opts))
 	}

@@ -56,6 +56,7 @@ type Client struct {
 	toolboxLoopback    bool
 	privileged         bool
 	resourceLimitsOff  bool
+	pidsLimit          int
 	defaultRuntime     string
 	httpClient         *http.Client
 	streamClient       *http.Client
@@ -131,6 +132,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxLoopback:    cfg.DockerToolboxLoopback,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
+		pidsLimit:          cfg.SandboxPidsLimit,
 		defaultRuntime:     cfg.Runtime,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
 		streamClient:       &http.Client{Transport: transport},
@@ -544,6 +546,13 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	if !c.resourceLimitsOff {
 		resources := map[string]any{}
+		// Pids limit is applied OUTSIDE the per-resource conditionals: the
+		// warm-pool parked bootstrap creates containers with no meaningful
+		// CPU/memory requests and must still be fork-bomb protected
+		// (Devil's Advocate I4).
+		if c.pidsLimit > 0 {
+			resources["PidsLimit"] = int64(c.pidsLimit)
+		}
 		if req.CPU > 0 {
 			// CpuPeriod 100ms + CpuQuota = CPU*100000μs gives fractional cores
 			// (e.g. 0.5 CPU → 50000μs quota per 100ms period).

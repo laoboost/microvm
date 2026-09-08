@@ -56,7 +56,7 @@ func TestSecuritySpecOptsEnvelope(t *testing.T) {
 }
 
 func TestResourceSpecOptsUsesCFSQuotaNotCpuset(t *testing.T) {
-	spec := applyOpts(t, resourceSpecOpts(models.CreateSandboxRequest{MemoryMB: 256, CPU: 0.5}))
+	spec := applyOpts(t, (&Driver{cfg: Config{}}).resourceSpecOpts(models.CreateSandboxRequest{MemoryMB: 256, CPU: 0.5}))
 
 	if spec.Linux.Resources == nil || spec.Linux.Resources.Memory == nil || spec.Linux.Resources.Memory.Limit == nil {
 		t.Fatal("memory limit not set")
