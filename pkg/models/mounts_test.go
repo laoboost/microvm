@@ -47,6 +47,27 @@ func TestMountSpecValidate(t *testing.T) {
 	}
 }
 
+func TestMountSpecValidate_RejectsDashPrefixedSourceEveryType(t *testing.T) {
+	for _, typ := range []MountType{MountTypeS3, MountTypeNFS, MountTypeSSHFS, MountTypeRclone} {
+		m := MountSpec{Type: typ, Source: "-oProxyCommand=evil", Target: "/mnt/x"}
+		if err := m.Validate("/usr/local/bin/toolboxd"); err == nil {
+			t.Errorf("Validate(%s source %q) = nil, want error", typ, m.Source)
+		}
+	}
+}
+
+func TestMountSpecValidate_AcceptsWellFormedSSHFSAndNFSSources(t *testing.T) {
+	good := []MountSpec{
+		{Type: MountTypeSSHFS, Source: "user@example.com:/home/user", Target: "/home/dev"},
+		{Type: MountTypeNFS, Source: "10.0.0.2:/exports/data", Target: "/mnt/nfs"},
+	}
+	for _, m := range good {
+		if err := m.Validate("/usr/local/bin/toolboxd"); err != nil {
+			t.Errorf("Validate(%v) returned err: %v", m, err)
+		}
+	}
+}
+
 func TestMountSpecCredentialLimits(t *testing.T) {
 	base := MountSpec{Type: MountTypeS3, Source: "b", Target: "/x"}
 

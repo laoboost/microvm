@@ -244,6 +244,44 @@ func TestRcloneBuild(t *testing.T) {
 	}
 }
 
+// A tenant-supplied source starting with '-' would land on the mount tool's
+// argv and could be parsed as a flag (e.g. sshfs -oProxyCommand=...), so the
+// adapter itself must reject it even if a spec skipped spec validation.
+func TestSSHFSBuild_RejectsDashPrefixedSource(t *testing.T) {
+	_, err := (SSHFS{}).Build("sb", 0, models.MountSpec{
+		Source:      "-oProxyCommand=sh -c evil",
+		Credentials: map[string]string{"private_key_pem": "key"},
+	}, "/mnt/ssh", "/creds")
+	if err == nil {
+		t.Fatal("expected error for dash-prefixed sshfs source")
+	}
+}
+
+func TestNFSBuild_RejectsSourceNotInHostColonPathForm(t *testing.T) {
+	for _, source := range []string{
+		"-oProxyCommand=evil",  // dash-prefixed flag injection
+		"/etc/passwd",          // bare local path
+		"no-colon-slash",       // not host:/path
+		"host:/path extra arg", // trailing argv content
+		"",                     // empty
+	} {
+		_, err := (NFS{}).Build("sb", 0, models.MountSpec{Source: source}, "/mnt/nfs", "/creds")
+		if err == nil {
+			t.Errorf("expected error for nfs source %q", source)
+		}
+	}
+}
+
+func TestRcloneBuild_RejectsDashPrefixedSource(t *testing.T) {
+	_, err := (Rclone{}).Build("sb", 0, models.MountSpec{
+		Source:      "-oProxyCommand=evil",
+		Credentials: map[string]string{"rclone_conf": "[remote]\ntype = s3\n"},
+	}, "/mnt/rclone", "/creds")
+	if err == nil {
+		t.Fatal("expected error for dash-prefixed rclone source")
+	}
+}
+
 func contains(items []string, want string) bool {
 	for _, item := range items {
 		if item == want {

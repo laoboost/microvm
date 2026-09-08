@@ -222,6 +222,13 @@ func (m *MountSpec) Validate(toolboxMountPath string) error {
 
 func validateSource(t MountType, source string) error {
 	source = strings.TrimSpace(source)
+	// A source starting with '-' would land on the mount tool's argv and be
+	// parsed as a flag (argument injection, e.g. sshfs -oProxyCommand=...).
+	// Enforced here for every mount type at spec-validation time; the adapters
+	// re-check as defense-in-depth.
+	if strings.HasPrefix(source, "-") {
+		return fmt.Errorf("mount source must not start with '-': %q", source)
+	}
 	switch t {
 	case MountTypeS3:
 		// Accept either a bare bucket name or s3://bucket[/prefix]. Reject
