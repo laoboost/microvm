@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -46,6 +47,22 @@ func validateS3StructuredOptions(opts map[string]string) error {
 
 func isS3True(v string) bool {
 	return v == "true" || v == "1"
+}
+
+// validateS3Endpoint enforces that a non-empty endpoint is an absolute
+// http/https URL. Private-network http (MinIO-style endpoints) is explicitly
+// allowed. Scheme-less values like "host:9000" are rejected: url.Parse would
+// interpret them as scheme="host", and mount-s3 would fail at runtime — better
+// to fail at validate time with a clear message.
+func validateS3Endpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("s3 endpoint %q is not a valid URL: %w", endpoint, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("s3 endpoint %q must be an absolute http:// or https:// URL", endpoint)
+	}
+	return nil
 }
 
 // s3ExtraArgsTokens splits extra_args into argv tokens and enforces the

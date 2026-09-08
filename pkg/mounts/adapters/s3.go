@@ -48,6 +48,9 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 		argv = append(argv, "--region", region)
 	}
 	if endpoint := spec.Options["endpoint"]; endpoint != "" {
+		if err := validateS3Endpoint(endpoint); err != nil {
+			return Plan{}, err
+		}
 		argv = append(argv, "--endpoint-url", endpoint)
 	}
 	if spec.ReadOnly {

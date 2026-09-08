@@ -281,11 +281,11 @@ func TestS3Build_EmitsStructuredUIDGidAndAllowFlagsWhenOptionsAreSet(t *testing.
 	plan, err := (S3{}).Build("sb", 0, models.MountSpec{
 		Source: "s3://bucket/data",
 		Options: map[string]string{
-			"uid":            "1000",
-			"gid":            "1000",
-			"allow_other":    "true",
+			"uid":             "1000",
+			"gid":             "1000",
+			"allow_other":     "true",
 			"allow_overwrite": "1",
-			"extra_args":     "--allow-delete",
+			"extra_args":      "--allow-delete",
 		},
 	}, "/mnt/t", "/creds")
 	if err != nil {
@@ -364,9 +364,9 @@ func TestS3Build_RejectsUidGidAndAllowFlagsInExtraArgsWhenStructuredKeysArePrese
 
 func TestS3Build_RejectsDuplicatedDenylistedFlagsWithinExtraArgsAndBareDoubleDashToken(t *testing.T) {
 	for _, extra := range []string{
-		"--allow-delete --allow-delete",  // duplicate non-denylisted flag
-		"--uid 1 --uid 2",                // duplicate uid (legacy, no structured keys)
-		"--",                             // bare -- makes clap treat the rest as positionals
+		"--allow-delete --allow-delete",   // duplicate non-denylisted flag
+		"--uid 1 --uid 2",                 // duplicate uid (legacy, no structured keys)
+		"--",                              // bare -- makes clap treat the rest as positionals
 		"--allow-delete -- --allow-other", // -- followed by more tokens
 	} {
 		_, err := (S3{}).Build("sb", 0, models.MountSpec{
@@ -417,6 +417,62 @@ func TestS3Build_AcceptsProductionSubchatOptionsShapeRegionEndpointAndLegacyExtr
 			t.Errorf("argv missing %q: %v", want, plan.Argv)
 		}
 	}
+}
+
+// Requirement tests for task 011: Options["endpoint"], when present and
+// non-empty, must be an absolute http/https URL.
+func TestS3Build_EndpointSchemeValidation(t *testing.T) {
+	valid := map[string]string{"region": "us-east-1"}
+	base := models.MountSpec{Source: "s3://bucket/data", Options: valid}
+
+	t.Run("it rejects an endpoint with a non http or https scheme", func(t *testing.T) {
+		for _, ep := range []string{"ftp://files.example.com", "file:///tmp/x", "gopher://x"} {
+			opts := map[string]string{"endpoint": ep}
+			if _, err := (S3{}).Build("sb", 0, models.MountSpec{Source: base.Source, Options: opts}, "/mnt/s3", "/creds"); err == nil {
+				t.Errorf("expected error for endpoint %q", ep)
+			}
+		}
+	})
+
+	t.Run("it rejects an endpoint with an empty scheme", func(t *testing.T) {
+		for _, ep := range []string{"localhost:9000", "minio.internal:9000", "//host/path"} {
+			opts := map[string]string{"endpoint": ep}
+			if _, err := (S3{}).Build("sb", 0, models.MountSpec{Source: base.Source, Options: opts}, "/mnt/s3", "/creds"); err == nil {
+				t.Errorf("expected error for scheme-less endpoint %q", ep)
+			}
+		}
+	})
+
+	t.Run("it accepts an http endpoint on a private address", func(t *testing.T) {
+		for _, ep := range []string{"http://localhost:9000", "http://10.0.0.5:9000", "http://192.168.1.10:9000", "http://minio.internal:9000"} {
+			opts := map[string]string{"endpoint": ep}
+			plan, err := (S3{}).Build("sb", 0, models.MountSpec{Source: base.Source, Options: opts}, "/mnt/s3", "/creds")
+			if err != nil {
+				t.Errorf("Build with endpoint %q: %v", ep, err)
+				continue
+			}
+			if !contains(plan.Argv, "--endpoint-url") || !contains(plan.Argv, ep) {
+				t.Errorf("argv missing endpoint %q: %v", ep, plan.Argv)
+			}
+		}
+	})
+
+	t.Run("it accepts an https endpoint", func(t *testing.T) {
+		opts := map[string]string{"endpoint": "https://s3.amazonaws.com"}
+		plan, err := (S3{}).Build("sb", 0, models.MountSpec{Source: base.Source, Options: opts}, "/mnt/s3", "/creds")
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		if !contains(plan.Argv, "--endpoint-url") || !contains(plan.Argv, "https://s3.amazonaws.com") {
+			t.Fatalf("argv missing endpoint: %v", plan.Argv)
+		}
+	})
+
+	t.Run("it accepts a spec with no endpoint key", func(t *testing.T) {
+		if _, err := (S3{}).Build("sb", 0, models.MountSpec{Source: base.Source}, "/mnt/s3", "/creds"); err != nil {
+			t.Fatalf("Build with no endpoint: %v", err)
+		}
+	})
 }
 
 func TestS3Build_RejectsDashPrefixedSource(t *testing.T) {
