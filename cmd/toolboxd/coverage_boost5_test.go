@@ -152,7 +152,7 @@ func TestEnvdHelperBranchesAndProcessListCleanup(t *testing.T) {
 
 func TestHandleExecAndUploadAdditionalBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := &server{logger: logger, allowedPorts: map[int]struct{}{}}
+	srv := &server{authOptional: true, logger: logger, allowedPorts: map[int]struct{}{}}
 
 	t.Run("exec_nonzero_and_bad_workdir", func(t *testing.T) {
 		rr := httptest.NewRecorder()

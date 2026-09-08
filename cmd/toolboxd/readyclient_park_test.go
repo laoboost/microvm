@@ -20,7 +20,7 @@ func TestParkedReadyOnConn(t *testing.T) {
 	}
 	t.Cleanup(func() { startUserCommandFn = oldStart })
 
-	srv := &server{
+	srv := &server{authOptional: true,
 		logger:      slog.Default(),
 		deferredCmd: []string{"echo", "hi"},
 		parkedMode:  true,
@@ -80,7 +80,7 @@ func TestParkedAdoptOutlivesWriteTimeout(t *testing.T) {
 	startUserCommandFn = func(_ *slog.Logger, _ []string) {}
 	t.Cleanup(func() { startUserCommandFn = oldStart })
 
-	srv := &server{logger: slog.Default(), parkedMode: true}
+	srv := &server{authOptional: true, logger: slog.Default(), parkedMode: true}
 	guest, host := net.Pipe()
 	t.Cleanup(func() { _ = guest.Close(); _ = host.Close() })
 
@@ -119,17 +119,17 @@ func TestParkedAdoptOutlivesWriteTimeout(t *testing.T) {
 
 func TestRunParkedReadyHandshakeNoop(t *testing.T) {
 	runParkedReadyHandshake(slog.Default(), nil, "", "tok", "n")
-	runParkedReadyHandshake(slog.Default(), &server{}, "  ", "tok", "n")
+	runParkedReadyHandshake(slog.Default(), &server{authOptional: true}, "  ", "tok", "n")
 }
 
 func TestParkedReadyOnConnValidation(t *testing.T) {
-	if err := parkedReadyOnConn(nil, &server{}, nil, "t", "n"); err == nil {
+	if err := parkedReadyOnConn(nil, &server{authOptional: true}, nil, "t", "n"); err == nil {
 		t.Fatal("expected validation error")
 	}
 }
 
 func TestServingRequestsParkedMode(t *testing.T) {
-	srv := &server{parkedMode: true}
+	srv := &server{authOptional: true, parkedMode: true}
 	if srv.servingRequests() {
 		t.Fatal("pre-adopt should block")
 	}
@@ -141,7 +141,7 @@ func TestServingRequestsParkedMode(t *testing.T) {
 
 func TestDialParkReadyBounded(t *testing.T) {
 	start := time.Now()
-	runParkedReadyHandshake(slog.Default(), &server{parkedMode: true}, "/nonexistent.sock", "tok", "n")
+	runParkedReadyHandshake(slog.Default(), &server{authOptional: true, parkedMode: true}, "/nonexistent.sock", "tok", "n")
 	if time.Since(start) > 4*time.Second {
 		t.Fatal("handshake exceeded bounded dial timeout")
 	}

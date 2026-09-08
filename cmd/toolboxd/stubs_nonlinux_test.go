@@ -35,5 +35,5 @@ func TestNonLinuxStubs(t *testing.T) {
 
 	announceReady(slog.Default(), "sb", "tok", "nonce", "")
 	scrubReadyEnv()
-	runParkedReadyHandshake(slog.Default(), &server{}, "sock", "tok", "nonce")
+	runParkedReadyHandshake(slog.Default(), &server{authOptional: true}, "sock", "tok", "nonce")
 }

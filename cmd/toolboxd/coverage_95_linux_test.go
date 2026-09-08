@@ -203,8 +203,8 @@ func TestLinuxAnnounceReadyCoverage(t *testing.T) {
 	announceReady(slog.Default(), "sb", "", "nonce", "/tmp/nope.sock")
 	announceReady(slog.Default(), "sb", "tok", "nonce", "")
 	scrubReadyEnv()
-	runParkedReadyHandshake(slog.Default(), &server{parkedMode: true}, "", "tok", "n")
-	runParkedReadyHandshake(slog.Default(), &server{parkedMode: true}, "/nonexistent-ready.sock", "tok", "n")
+	runParkedReadyHandshake(slog.Default(), &server{authOptional: true, parkedMode: true}, "", "tok", "n")
+	runParkedReadyHandshake(slog.Default(), &server{authOptional: true, parkedMode: true}, "/nonexistent-ready.sock", "tok", "n")
 
 	// dialReadySocket missing fields + successful write.
 	dialReadySocket(slog.Default(), "  ", "sb", "tok", "n")
@@ -231,18 +231,18 @@ func TestLinuxAnnounceReadyCoverage(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Park handshake error paths.
-	if err := parkedReadyOnConn(slog.Default(), &server{}, nil, "t", "n"); err == nil {
+	if err := parkedReadyOnConn(slog.Default(), &server{authOptional: true}, nil, "t", "n"); err == nil {
 		t.Fatal("expected nil conn error")
 	}
 	gBlank, hBlank := net.Pipe()
 	_ = hBlank.Close()
 	_ = gBlank.Close()
-	if err := parkedReadyOnConn(slog.Default(), &server{}, gBlank, " ", " "); err == nil {
+	if err := parkedReadyOnConn(slog.Default(), &server{authOptional: true}, gBlank, " ", " "); err == nil {
 		t.Fatal("expected blank token/nonce error")
 	}
 	guest, host := net.Pipe()
 	_ = host.Close()
-	if err := parkedReadyOnConn(slog.Default(), &server{logger: slog.Default()}, guest, "tok", "nonce"); err == nil {
+	if err := parkedReadyOnConn(slog.Default(), &server{authOptional: true, logger: slog.Default()}, guest, "tok", "nonce"); err == nil {
 		t.Fatal("expected parked write/adopt failure on closed peer")
 	}
 	_ = guest.Close()
@@ -254,7 +254,7 @@ func TestLinuxAnnounceReadyCoverage(t *testing.T) {
 		_, _ = readyproto.DecodeParked(br)
 		_ = host2.Close() // fail adopt read
 	}()
-	if err := parkedReadyOnConn(slog.Default(), &server{logger: slog.Default()}, guest2, "tok", "nonce"); err == nil {
+	if err := parkedReadyOnConn(slog.Default(), &server{authOptional: true, logger: slog.Default()}, guest2, "tok", "nonce"); err == nil {
 		t.Fatal("expected adopt read failure")
 	}
 
@@ -268,7 +268,7 @@ func TestLinuxAnnounceReadyCoverage(t *testing.T) {
 		})
 		_ = host3.Close() // fail ready ack write
 	}()
-	if err := parkedReadyOnConn(slog.Default(), &server{logger: slog.Default()}, guest3, "tok", "nonce"); err == nil {
+	if err := parkedReadyOnConn(slog.Default(), &server{authOptional: true, logger: slog.Default()}, guest3, "tok", "nonce"); err == nil {
 		t.Fatal("expected ready ack failure")
 	}
 }

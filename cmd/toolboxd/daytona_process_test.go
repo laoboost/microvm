@@ -28,7 +28,7 @@ func newDaytonaTestServer(t *testing.T) *server {
 		t.Fatalf("sessions.New: %v", err)
 	}
 	t.Cleanup(mgr.Close)
-	return &server{sessions: mgr, daytona: newDaytonaCompat(), logger: logger}
+	return &server{authOptional: true, sessions: mgr, daytona: newDaytonaCompat(), logger: logger}
 }
 
 func TestHandleDaytonaProcessRouteSessionLifecycle(t *testing.T) {
@@ -695,7 +695,7 @@ func TestDaytonaProcessRouteAndLookupErrorBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	t.Run("sessions_disabled", func(t *testing.T) {
-		srv := &server{logger: logger, sessions: nil}
+		srv := &server{authOptional: true, logger: logger, sessions: nil}
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/process/session", nil)
 		if !srv.handleDaytonaProcessRoute(rr, req) {
@@ -756,7 +756,7 @@ func TestDaytonaProcessRouteAndLookupErrorBranches(t *testing.T) {
 		}
 		t.Cleanup(mgr.Close)
 
-		srv := &server{logger: logger, sessions: mgr, daytona: newDaytonaCompat()}
+		srv := &server{authOptional: true, logger: logger, sessions: mgr, daytona: newDaytonaCompat()}
 		srv.daytona.ensureSession("ghost")
 		if sess, state, ok := srv.lookupDaytonaSession("ghost"); ok || sess != nil || state != nil {
 			t.Fatalf("lookupDaytonaSession(stale) = (%v, %v, %v), want false/nil/nil", sess, state, ok)

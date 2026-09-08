@@ -288,7 +288,7 @@ func TestEnvdHandlerErrorBranches(t *testing.T) {
 	})
 
 	t.Run("process_handlers", func(t *testing.T) {
-		srvNil := &server{logger: srv.logger, envd: newEnvdCompat(), sessions: nil}
+		srvNil := &server{authOptional: true, logger: srv.logger, envd: newEnvdCompat(), sessions: nil}
 		rr := httptest.NewRecorder()
 		srvNil.handleEnvdProcessList(rr, httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/List", nil))
 		if rr.Code != http.StatusServiceUnavailable {
