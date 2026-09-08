@@ -10,8 +10,8 @@ require (
 	github.com/containerd/typeurl/v2 v2.3.0
 	github.com/coreos/go-iptables v0.8.0
 	github.com/creack/pty v1.1.24
-	github.com/daytonaio/daytona/libs/api-client-go v0.190.0
-	github.com/daytonaio/daytona/libs/sdk-go v0.190.0
+	github.com/daytonaio/daytona/libs/api-client-go v0.177.0
+	github.com/daytonaio/daytona/libs/sdk-go v0.177.0
 	github.com/distribution/reference v0.6.0
 	github.com/google/btree v1.1.3
 	github.com/google/nftables v0.3.0
@@ -27,7 +27,7 @@ require (
 	github.com/miekg/dns v1.1.73
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
-	github.com/opencontainers/runtime-spec v1.3.0
+	github.com/opencontainers/runtime-spec v1.2.1
 	github.com/tetratelabs/wazero v1.12.0
 	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
@@ -70,7 +70,7 @@ require (
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/containerd/cgroups/v3 v3.1.3 // indirect
+	github.com/containerd/cgroups/v3 v3.0.5 // indirect
 	github.com/containerd/continuity v0.5.0 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
@@ -81,7 +81,7 @@ require (
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf // indirect
 	github.com/coreos/pkg v0.0.0-20240122114842-bbd7aa9bf6fb // indirect
 	github.com/cyphar/filepath-securejoin v0.7.0 // indirect
-	github.com/daytonaio/daytona/libs/toolbox-api-client-go v0.190.0 // indirect
+	github.com/daytonaio/daytona/libs/toolbox-api-client-go v0.177.0 // indirect
 	github.com/docker/go-events v0.1.0 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
