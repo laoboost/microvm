@@ -4197,7 +4197,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// Re-establish host-side mounts for running sandboxes after a
 			// sandboxd restart. Idempotent — only mounts that aren't already
 			// tracked are spawned.
-			if specs, err := s.loadMounts(ctx, sandbox.ID); err != nil {
+			//
+			// Gap B: a stop in progress has recorded an expected-stop but the
+			// row still says Started until the final Upsert, and docker.Stop
+			// can take seconds. A tick inside that window must not re-mount,
+			// or the stop path's UnmountAll races the resurrect and a stale
+			// FUSE connection gets bound into the next container (ESTALE).
+			// The expectation is consumed by the events handler, not here.
+			if s.hasExpectedStop(sandbox.ID) {
+				s.logger.Info("reconcile: skipping mount reestablish, stop in progress",
+					"sandbox_id", sandbox.ID,
+				)
+			} else if specs, err := s.loadMounts(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("load mounts during reconcile", "sandbox_id", sandbox.ID, "error", err)
 			} else if len(specs) > 0 {
 				if err := s.mounts.Reestablish(ctx, sandbox.ID, specs); err != nil {

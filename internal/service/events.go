@@ -198,6 +198,28 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 
+	// Tear down host-side mounts. The container is gone either way: the
+	// docs/external-storage.md lifecycle ("On Stop the host mount is torn
+	// down. On Start it's re-established.") applies to involuntary stops
+	// too. Keeping the tracked state here would make the next
+	// StartSandbox → Reestablish bind the OLD FUSE connection into the
+	// fresh container (stale guest inode cache vs old FUSE conn → ESTALE).
+	// This does not weaken crash supervision: the supervisor only restarts
+	// FUSE processes for containers that keep RUNNING; once the container
+	// has exited there is no continuity left to preserve. Mirrors
+	// handleDestroyEvent. Failures are warn-only and never fail the event.
+	if s.mounts != nil {
+		err := s.mounts.UnmountAll(sandbox.ID)
+		if s.testForceUnmountErr != nil {
+			err = s.testForceUnmountErr
+		}
+		if err != nil {
+			s.logger.Warn("unmount on stop event failed", "sandbox_id", sandbox.ID, "error", err)
+		}
+	} else if s.testForceUnmountErr != nil {
+		s.logger.Warn("unmount on stop event failed", "sandbox_id", sandbox.ID, "error", s.testForceUnmountErr)
+	}
+
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.WakeArmed = arm
