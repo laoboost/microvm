@@ -320,6 +320,11 @@ func parkDefaultResources(c *Client) map[string]any {
 	cpu := models.DefaultCPU
 	mem := models.DefaultMemoryMB
 	resources := map[string]any{}
+	// Pids limit applies unconditionally: parked bootstrap containers are
+	// fork-bomb vectors too (Devil's Advocate I4).
+	if c.pidsLimit > 0 {
+		resources["PidsLimit"] = int64(c.pidsLimit)
+	}
 	if cpu > 0 {
 		resources["CpuPeriod"] = int64(100000)
 		resources["CpuQuota"] = int64(cpu * 100000)

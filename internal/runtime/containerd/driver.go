@@ -21,6 +21,7 @@ type Config struct {
 	ToolboxPort        int
 	Privileged         bool
 	ResourceLimitsOff  bool
+	PidsLimit          int
 	DefaultRuntime     string
 	WaitTimeout        time.Duration
 	ToolboxWaitTimeout time.Duration
@@ -57,6 +58,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		ToolboxPort:        cfg.ToolboxPort,
 		Privileged:         cfg.ContainerPrivileged,
 		ResourceLimitsOff:  cfg.ResourceLimitsOff,
+		PidsLimit:          cfg.SandboxPidsLimit,
 		DefaultRuntime:     cfg.Runtime,
 		WaitTimeout:        cfg.DockerRuntimeWaitTimeout,
 		ToolboxWaitTimeout: cfg.ToolboxWaitTimeout,

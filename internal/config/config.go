@@ -133,6 +133,10 @@ type Config struct {
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
+	// SandboxPidsLimit caps the number of processes per sandbox container
+	// (docker HostConfig.PidsLimit / OCI pids cgroup controller).
+	// SB_SANDBOX_PIDS_LIMIT; default 1024, <=0 disables.
+	SandboxPidsLimit int
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
@@ -1400,6 +1404,7 @@ func Load() (Config, error) {
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 1024),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
@@ -1707,6 +1712,9 @@ func Load() (Config, error) {
 	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
+	}
+	if cfg.SandboxPidsLimit < 0 {
+		return Config{}, errors.New("SB_SANDBOX_PIDS_LIMIT must be >= 0 (0 disables the limit)")
 	}
 	if cfg.ImagePullFailureBackoff < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0")
