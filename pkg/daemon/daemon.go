@@ -298,6 +298,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("configure secret provider: %w", err)
 	}
 	svc.SetDockerAuxClient(dockerClient)
+	// A mount crash under a running VM permanently breaks its 9p/bind channel
+	// (persistent EIO) — the sandbox must be restarted, an in-place FUSE respawn
+	// cannot heal it. The service gates restarts with a cooldown.
+	mountManager.SetOnMountCrash(svc.HandleMountCrash)
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
 		return fmt.Errorf("wire container engine: %w", err)
