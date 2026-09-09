@@ -3,6 +3,7 @@ package mounts
 import (
 	"bytes"
 	"context"
+	"expvar"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -58,6 +59,50 @@ func TestCredFailureScanDetectsMatchAfterSuccessfulMount(t *testing.T) {
 	if fired == 0 {
 		t.Fatal("live output stream containing NoSigningCredentials was not scanned")
 	}
+}
+
+func expvarSnapshot(t *testing.T, name string) int64 {
+	t.Helper()
+	v := expvar.Get(name)
+	if v == nil {
+		return 0
+	}
+	i, ok := v.(*expvar.Int)
+	if !ok {
+		t.Fatalf("expvar %s is not an Int", name)
+	}
+	n := i.Value()
+	return n
+}
+
+// TestCredFailureIncrementsMetricOnMatch requires the expvar counter
+// aerolvm_mount_cred_failure_total (surfaced as Prometheus text at
+// /v1/metrics) to advance on each credential-failure match.
+func TestCredFailureIncrementsMetricOnMatch(t *testing.T) {
+	logger, _ := newCapturingLogger(t)
+	m := newTestManager(t, map[models.MountType]adapters.Adapter{
+		models.MountTypeS3: shCredFailAdapter{},
+	})
+	m.logger = logger
+	stubProbe(t, func(string, time.Duration) error { return nil })
+
+	before := expvarSnapshot(t, "aerolvm_mount_cred_failure_total")
+
+	if _, err := m.MountAll(context.Background(), "sb-metric", []models.MountSpec{
+		{Type: models.MountTypeS3, Source: "s3://bucket", Target: "/data"},
+	}); err != nil {
+		t.Fatalf("MountAll: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if expvarSnapshot(t, "aerolvm_mount_cred_failure_total") == before+1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("metric aerolvm_mount_cred_failure_total did not advance: before=%d after=%d",
+		before, expvarSnapshot(t, "aerolvm_mount_cred_failure_total"))
 }
 
 // shCredFailAdapter mimics a mount-s3 whose credentials are rejected: it
