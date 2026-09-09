@@ -295,7 +295,7 @@ func TestS3Build_EmitsStructuredUIDGidAndAllowFlagsWhenOptionsAreSet(t *testing.
 			"gid":             "1000",
 			"allow_other":     "true",
 			"allow_overwrite": "1",
-			"extra_args":      "--allow-delete",
+			"allow_delete":    "true",
 		},
 	}, "/mnt/t", "/creds")
 	if err != nil {
@@ -546,7 +546,13 @@ func TestAdaptersTerminateOptionsBeforeSource(t *testing.T) {
 		}
 		plan, err := adapter.Build("sb", 0, models.MountSpec{Type: typ, Source: source, Credentials: creds}, "/mnt/t", "/creds")
 		if err != nil {
-			t.Fatalf("%s Build: %v", typ, err)
+			// Rejecting the source outright satisfies the property under test:
+			// it never reaches the mount tool at all. Spec validation now runs
+			// ahead of the adapter, so this is the usual outcome.
+			if !strings.Contains(err.Error(), "must not start with '-'") {
+				t.Fatalf("%s Build: %v", typ, err)
+			}
+			continue
 		}
 		dash := -1
 		for i, a := range plan.Argv {
