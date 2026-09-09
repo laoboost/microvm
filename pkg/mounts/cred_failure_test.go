@@ -175,6 +175,34 @@ func TestCredFailureDeduplicatesRepeatedMatches(t *testing.T) {
 	}
 }
 
+// TestCredFailureDoesNotTriggerMountCrashHook guards the "logging + metric
+// only" contract: a credential rejection is not a process crash, so
+// OnMountCrash (which restarts the sandbox) must not fire.
+func TestCredFailureDoesNotTriggerMountCrashHook(t *testing.T) {
+	logger, buf := newCapturingLogger(t)
+	m := newTestManager(t, map[models.MountType]adapters.Adapter{
+		models.MountTypeS3: shCredFailAdapter{},
+	})
+	m.logger = logger
+	stubProbe(t, func(string, time.Duration) error { return nil })
+
+	var crashes int
+	m.SetOnMountCrash(func(string, int) { crashes++ })
+
+	if _, err := m.MountAll(context.Background(), "sb-hook", []models.MountSpec{
+		{Type: models.MountTypeS3, Source: "s3://bucket", Target: "/data"},
+	}); err != nil {
+		t.Fatalf("MountAll: %v", err)
+	}
+
+	waitForLog(t, buf, "mount credentials rejected")
+	time.Sleep(100 * time.Millisecond) // give a wrongly-fired hook a chance to run
+
+	if crashes != 0 {
+		t.Errorf("OnMountCrash fired %d times on credential failure, want 0", crashes)
+	}
+}
+
 // waitForLog polls until buf contains want; output arrives asynchronously
 // from the mount process's stderr.
 func waitForLog(t *testing.T, buf *syncBuffer, want string) {
