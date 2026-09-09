@@ -153,8 +153,13 @@ type Service struct {
 	caddy     *caddy.Client
 	cipher    *secrets.Cipher
 	mounts    *mounts.Manager
-	admitter  *capacity.Admitter
-	images    ImageDistributionProvider
+
+	// mountCrashRestarts gates mount-crash auto-restarts (one per cooldown
+	// window per sandbox); guarded by mountCrashMu.
+	mountCrashMu       sync.Mutex
+	mountCrashRestarts map[string]time.Time
+	admitter           *capacity.Admitter
+	images             ImageDistributionProvider
 	// volumeReclaimer deletes the backing bytes (S3 prefix / NFS dir) of deleted
 	// platform volumes. Non-nil only when the daemon wired a backend reclaimer;
 	// nil leaves the pending_volume_deletions ledger for an external reconciler.
@@ -2202,6 +2207,72 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 // wake_armed is always cleared, so a serverless sandbox stopped via this
 // path stays down until the operator explicitly starts it again.
 // See serverless.go for the full wake-arming policy.
+// mountCrashRestartCooldown gates auto-restarts triggered by mount crashes: a
+// crashing mount must not produce a restart storm (stop/start churn on a
+// billable sandbox). One restart per sandbox per cooldown window; further
+// crashes inside the window leave the sandbox as-is for the operator/run to
+// observe (the mount supervisor still retries the tool itself).
+const mountCrashRestartCooldown = 2 * time.Minute
+
+// HandleMountCrash is the mounts.Manager OnMountCrash callback: a mount crash
+// under a running VM permanently breaks the container's channel to the FUSE
+// mount (persistent EIO — prod 2026-09-09: /workspace unreadable, uploads and
+// exec file IO all failing). An in-place tool respawn cannot heal the running
+// container, so the sandbox is restarted (fresh container re-binds fresh
+// mounts); workspace data is S3-backed and survives. No-op for sandboxes that
+// are not running and within the cooldown window.
+func (s *Service) HandleMountCrash(sandboxID string, index int) {
+	if !s.mountCrashRestartAllowed(sandboxID) {
+		s.logger.Warn("mount crash restart suppressed (cooldown)",
+			"sandbox_id", sandboxID,
+			"index", index,
+		)
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		sandbox, err := s.scopedGet(ctx, sandboxID)
+		if err != nil {
+			return
+		}
+		if sandbox.Status != models.SandboxStatusStarted {
+			return
+		}
+		s.logger.Warn("mount crashed under running sandbox — restarting it",
+			"sandbox_id", sandboxID,
+			"index", index,
+		)
+		if _, err := s.StopSandbox(ctx, sandboxID); err != nil {
+			s.logger.Warn("mount-crash restart: stop failed", "sandbox_id", sandboxID, "error", err)
+			return
+		}
+		if _, err := s.StartSandbox(ctx, sandboxID); err != nil {
+			s.logger.Warn("mount-crash restart: start failed", "sandbox_id", sandboxID, "error", err)
+		}
+	}()
+}
+
+// mountCrashRestartAllowed consumes one restart slot per cooldown window.
+func (s *Service) mountCrashRestartAllowed(sandboxID string) bool {
+	s.mountCrashMu.Lock()
+	defer s.mountCrashMu.Unlock()
+	if s.mountCrashRestarts == nil {
+		s.mountCrashRestarts = make(map[string]time.Time)
+	}
+	if last, ok := s.mountCrashRestarts[sandboxID]; ok && time.Since(last) < mountCrashRestartCooldown {
+		return false
+	}
+	s.mountCrashRestarts[sandboxID] = time.Now()
+	// Opportunistic map trim: drop long-expired entries.
+	for id, last := range s.mountCrashRestarts {
+		if time.Since(last) > 10*mountCrashRestartCooldown {
+			delete(s.mountCrashRestarts, id)
+		}
+	}
+	return true
+}
+
 func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
 	return s.stopSandboxInternal(ctx, id, stopModeManual)
 }
