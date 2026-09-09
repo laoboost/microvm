@@ -285,7 +285,7 @@ func TestS3Build_EmitsStructuredUIDGidAndAllowFlagsWhenOptionsAreSet(t *testing.
 			"gid":             "1000",
 			"allow_other":     "true",
 			"allow_overwrite": "1",
-			"extra_args":      "--allow-delete",
+			"allow_delete":    "true",
 		},
 	}, "/mnt/t", "/creds")
 	if err != nil {

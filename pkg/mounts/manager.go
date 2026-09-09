@@ -39,6 +39,11 @@ type Manager struct {
 
 	mu    sync.Mutex
 	state map[string][]*mountState // sandboxID -> per-index states
+	// inFlight holds sandboxIDs with a MountAll currently establishing mounts.
+	// Sweep consults it: a start in flight has not committed its state yet, so
+	// without this gate a reconcile-tick sweep would kill the starting
+	// sandbox's mounts as "orphans" (prod incident 2026-09-09).
+	inFlight map[string]struct{}
 
 	closeCh chan struct{}
 }
@@ -88,6 +93,7 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 		waitTimeout: cfg.WaitTimeout,
 		adapters:    adapters.Adapters(),
 		state:       make(map[string][]*mountState),
+		inFlight:    make(map[string]struct{}),
 		closeCh:     make(chan struct{}),
 	}, nil
 }
@@ -102,37 +108,79 @@ func (m *Manager) Close() {
 	}
 }
 
-// MountAll mounts every spec for a sandbox. On any failure already-mounted
-// entries are torn down before returning.
+// MountAll mounts every spec for a sandbox. The per-spec mounts are
+// independent (distinct host paths, distinct credential files), so they are
+// established concurrently — five serialized mount-s3 spawns are ~25s of
+// every sandbox start (prod 2026-09-09); in parallel the wall time is the
+// slowest single mount. On any failure already-mounted entries are torn down
+// before returning.
 func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []models.MountSpec) ([]ContainerBind, error) {
 	if len(mounts) == 0 {
 		return nil, nil
 	}
+	m.markInFlight(sandboxID)
+	defer m.clearInFlight(sandboxID)
+
 	if err := os.MkdirAll(filepath.Join(m.rootDir, sandboxID), 0o700); err != nil {
 		return nil, fmt.Errorf("create sandbox mount dir: %w", err)
 	}
 
-	binds := make([]ContainerBind, 0, len(mounts))
-	established := make([]*mountState, 0, len(mounts))
-
+	type mountResult struct {
+		state *mountState
+		bind  ContainerBind
+		err   error
+	}
+	results := make([]mountResult, len(mounts))
+	var wg sync.WaitGroup
 	for i, spec := range mounts {
-		state, bind, err := m.mountOne(ctx, sandboxID, i, spec)
-		if err != nil {
-			// Roll back everything we just established for this sandbox.
-			for _, s := range established {
-				_ = m.tearDownState(s)
-			}
-			_ = os.RemoveAll(filepath.Join(m.rootDir, sandboxID))
-			return nil, fmt.Errorf("mount %d (%s): %w", i, spec.Type, err)
+		wg.Add(1)
+		go func(i int, spec models.MountSpec) {
+			defer wg.Done()
+			state, bind, err := m.mountOne(ctx, sandboxID, i, spec)
+			results[i] = mountResult{state: state, bind: bind, err: err}
+		}(i, spec)
+	}
+	wg.Wait()
+
+	// The first failing spec (lowest index) is the reported error; every
+	// successfully established mount is rolled back.
+	for i, r := range results {
+		if r.err == nil {
+			continue
 		}
-		established = append(established, state)
-		binds = append(binds, bind)
+		for j, r2 := range results {
+			if j != i && r2.state != nil {
+				_ = m.tearDownState(r2.state)
+			}
+		}
+		_ = os.RemoveAll(filepath.Join(m.rootDir, sandboxID))
+		return nil, fmt.Errorf("mount %d (%s): %w", i, mounts[i].Type, r.err)
+	}
+
+	established := make([]*mountState, 0, len(mounts))
+	binds := make([]ContainerBind, 0, len(mounts))
+	for _, r := range results {
+		established = append(established, r.state)
+		binds = append(binds, r.bind)
 	}
 
 	m.mu.Lock()
 	m.state[sandboxID] = established
 	m.mu.Unlock()
 	return binds, nil
+}
+
+// markInFlight registers a sandbox as mid-establishment for Sweep's guard.
+func (m *Manager) markInFlight(sandboxID string) {
+	m.mu.Lock()
+	m.inFlight[sandboxID] = struct{}{}
+	m.mu.Unlock()
+}
+
+func (m *Manager) clearInFlight(sandboxID string) {
+	m.mu.Lock()
+	delete(m.inFlight, sandboxID)
+	m.mu.Unlock()
 }
 
 // UnmountAll tears down every mount for a sandbox. Always best-effort.
@@ -207,6 +255,15 @@ func (m *Manager) Sweep(keep map[string]struct{}) {
 		}
 		if _, ok := tracked[id]; ok {
 			// We're already managing it in-process; never sweep an active mount.
+			continue
+		}
+		// A MountAll may have registered itself between the directory listing
+		// and this check — re-read the in-flight set before destroying anything.
+		m.mu.Lock()
+		_, starting := m.inFlight[id]
+		m.mu.Unlock()
+		if starting {
+			m.logger.Info("mounts sweep: skipping sandbox with mounts in flight", "sandbox_id", id)
 			continue
 		}
 		path := filepath.Join(m.rootDir, id)
