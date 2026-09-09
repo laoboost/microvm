@@ -156,6 +156,25 @@ func TestCredFailureLogsStructuredWarningOnMatch(t *testing.T) {
 	})
 }
 
+// TestCredFailureDeduplicatesRepeatedMatches requires a per-mount-process
+// one-shot latch: the pattern recurs per request, so without a latch every
+// stderr line would produce a log storm and unbounded metric growth.
+func TestCredFailureDeduplicatesRepeatedMatches(t *testing.T) {
+	out := &capturedOutput{}
+	var fired int
+	out.onCredFailure = func() { fired++ }
+
+	for i := 0; i < 5; i++ {
+		if _, err := out.Write([]byte("<Warning>: ClientError(NoSigningCredentials) from request\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	if fired != 1 {
+		t.Fatalf("credential-failure callback fired %d times for 5 matches, want 1 (one-shot latch)", fired)
+	}
+}
+
 // waitForLog polls until buf contains want; output arrives asynchronously
 // from the mount process's stderr.
 func waitForLog(t *testing.T, buf *syncBuffer, want string) {
