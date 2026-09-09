@@ -18,6 +18,13 @@ import (
 // balloon memory across many sandboxes.
 const maxCapturedMountBytes = 4 << 10
 
+// credFailurePattern is the mount-tool output signature of rejected/expired
+// credentials (mountpoint-s3 logs ClientError(NoSigningCredentials) per
+// request). With the credential-lifetime invariant in place this should never
+// appear — which is exactly why it must be loud if it does (backstop for node
+// restores, manual restarts, config drift).
+const credFailurePattern = "NoSigningCredentials"
+
 // capturedOutput is a threadsafe io.Writer that retains the last
 // maxCapturedMountBytes bytes written to it. It backs cmd.Stdout/cmd.Stderr for
 // supervised FUSE mount processes so a mount that never becomes ready (bad
@@ -27,15 +34,30 @@ const maxCapturedMountBytes = 4 << 10
 type capturedOutput struct {
 	mu  sync.Mutex
 	buf []byte
+	// onCredFailure, when non-nil, fires once — the first time the live
+	// stream contains credFailurePattern. Scanning happens incrementally in
+	// Write so a mount that succeeds at startup and only later reports
+	// NoSigningCredentials per request is still detected; the failure-time
+	// tail buffer read in mountWaitError is a separate, failure-only path.
+	onCredFailure func()
+	credFired     bool
 }
 
 func (c *capturedOutput) Write(p []byte) (int, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.buf = append(c.buf, p...)
 	if len(c.buf) > maxCapturedMountBytes {
 		// Keep the tail; drop the oldest bytes.
 		c.buf = c.buf[len(c.buf)-maxCapturedMountBytes:]
+	}
+	fire := c.onCredFailure != nil && !c.credFired &&
+		strings.Contains(string(c.buf), credFailurePattern)
+	if fire {
+		c.credFired = true
+	}
+	c.mu.Unlock()
+	if fire {
+		c.onCredFailure()
 	}
 	return len(p), nil
 }
@@ -56,12 +78,12 @@ func (c *capturedOutput) String() string {
 // the supervisor's restart path so both surface the tool's output identically.
 // SysProcAttr.Setpgid keeps the process in its own group; killMount signals the
 // whole group so FUSE helper children die with it.
-func spawnMountProcess(plan adapters.Plan) (*exec.Cmd, *capturedOutput, error) {
+func spawnMountProcess(plan adapters.Plan, onCredFailure func()) (*exec.Cmd, *capturedOutput, error) {
 	cmd := exec.Command(plan.Argv[0], plan.Argv[1:]...)
 	if len(plan.Env) > 0 {
 		cmd.Env = append(os.Environ(), plan.Env...)
 	}
-	out := &capturedOutput{}
+	out := &capturedOutput{onCredFailure: onCredFailure}
 	cmd.Stdout = out
 	cmd.Stderr = out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
