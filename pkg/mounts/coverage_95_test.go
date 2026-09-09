@@ -157,7 +157,7 @@ func TestSpawnMountProcessWithEnv(t *testing.T) {
 	cmd, out, err := spawnMountProcess(adapters.Plan{
 		Argv: []string{"true"},
 		Env:  []string{"MOUNT_SPAWN_ENV=1"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("spawnMountProcess: %v", err)
 	}

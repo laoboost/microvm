@@ -78,12 +78,12 @@ func (c *capturedOutput) String() string {
 // the supervisor's restart path so both surface the tool's output identically.
 // SysProcAttr.Setpgid keeps the process in its own group; killMount signals the
 // whole group so FUSE helper children die with it.
-func spawnMountProcess(plan adapters.Plan) (*exec.Cmd, *capturedOutput, error) {
+func spawnMountProcess(plan adapters.Plan, onCredFailure func()) (*exec.Cmd, *capturedOutput, error) {
 	cmd := exec.Command(plan.Argv[0], plan.Argv[1:]...)
 	if len(plan.Env) > 0 {
 		cmd.Env = append(os.Environ(), plan.Env...)
 	}
-	out := &capturedOutput{}
+	out := &capturedOutput{onCredFailure: onCredFailure}
 	cmd.Stdout = out
 	cmd.Stderr = out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

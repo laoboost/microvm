@@ -372,7 +372,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 	// User-space FUSE: spawn and supervise. stdout+stderr are captured so a
 	// mount that never becomes ready surfaces the tool's own error instead of a
 	// bare "timed out waiting for mount" (cluster-hetero UC-81..84).
-	cmd, out, err := spawnMountProcess(plan)
+	cmd, out, err := spawnMountProcess(plan, m.credFailureHandler(sandboxID, index))
 	if err != nil {
 		m.cleanupCred(plan)
 		return nil, ContainerBind{}, fmt.Errorf("spawn mount tool: %w", err)
@@ -465,7 +465,7 @@ func (m *Manager) restartMount(state *mountState, plan adapters.Plan, hostPath s
 	if plan.CredFile != "" {
 		_ = writeCredFile(plan.CredFile, plan.CredBody)
 	}
-	cmd, out, err := spawnMountProcess(plan)
+	cmd, out, err := spawnMountProcess(plan, m.credFailureHandler(state.sandboxID, state.index))
 	if err != nil {
 		m.mu.Lock()
 		if m.trackedAndEnabledLocked(state) {
