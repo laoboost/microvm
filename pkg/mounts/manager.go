@@ -27,6 +27,13 @@ type Config struct {
 	RootDir     string        // /var/lib/sandboxd/mounts
 	CredDir     string        // /run/sandboxd
 	WaitTimeout time.Duration // how long to wait for a mount to become ready
+	// OnMountCrash fires when a supervised mount process exits while tracked.
+	// A crash under a running VM is not healable in place — the container's
+	// channel to the dead FUSE vfsmount stays broken (persistent EIO, prod
+	// 2026-09-09) no matter how often the host re-spawns the tool — so the
+	// service uses this to restart the sandbox itself (fresh container, fresh
+	// binds). The callback must be quick and non-blocking.
+	OnMountCrash func(sandboxID string, index int)
 }
 
 // Manager owns mount processes for every active sandbox.
@@ -44,6 +51,10 @@ type Manager struct {
 	// without this gate a reconcile-tick sweep would kill the starting
 	// sandbox's mounts as "orphans" (prod incident 2026-09-09).
 	inFlight map[string]struct{}
+
+	// onMountCrash snapshots Config.OnMountCrash; SetOnMountCrash allows late
+	// wiring (the service is constructed after the manager in the daemon).
+	onMountCrash func(sandboxID string, index int)
 
 	closeCh chan struct{}
 }
@@ -87,15 +98,23 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 	}
 
 	return &Manager{
-		logger:      logger,
-		rootDir:     cfg.RootDir,
-		credDir:     cfg.CredDir,
-		waitTimeout: cfg.WaitTimeout,
-		adapters:    adapters.Adapters(),
-		state:       make(map[string][]*mountState),
-		inFlight:    make(map[string]struct{}),
-		closeCh:     make(chan struct{}),
+		logger:       logger,
+		rootDir:      cfg.RootDir,
+		credDir:      cfg.CredDir,
+		waitTimeout:  cfg.WaitTimeout,
+		adapters:     adapters.Adapters(),
+		state:        make(map[string][]*mountState),
+		inFlight:     make(map[string]struct{}),
+		onMountCrash: cfg.OnMountCrash,
+		closeCh:      make(chan struct{}),
 	}, nil
+}
+
+// SetOnMountCrash late-wires the crash notifier (see Config.OnMountCrash).
+func (m *Manager) SetOnMountCrash(fn func(sandboxID string, index int)) {
+	m.mu.Lock()
+	m.onMountCrash = fn
+	m.mu.Unlock()
 }
 
 // Close stops the supervisor. Existing mounts are left in place so an
@@ -406,7 +425,17 @@ func (m *Manager) superviseExit(state *mountState) {
 		"restarts", state.restarts,
 		"within_30s", withinWindow,
 	)
+	onCrash := m.onMountCrash
+	m.mu.Unlock()
 
+	// Notify the service before the in-place restart: even a successful
+	// in-place respawn cannot heal a running container bound to the dead
+	// vfsmount — the service decides whether to restart the sandbox.
+	if onCrash != nil {
+		onCrash(state.sandboxID, state.index)
+	}
+
+	m.mu.Lock()
 	if withinWindow {
 		// Two crashes in 30s — give up.
 		state.disabled = true
