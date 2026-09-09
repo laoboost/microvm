@@ -35,6 +35,8 @@ The S3 adapter accepts structured option keys on the mount spec's `options` map:
 | `gid` | positive integer (must be ≥ 1) | `--gid` |
 | `allow_other` | `"true"` / `"1"` | `--allow-other` |
 | `allow_overwrite` | `"true"` / `"1"` | `--allow-overwrite` |
+| `allow_delete` | `"true"` / `"1"` | `--allow-delete` (skipped on read-only mounts) |
+| `maximum_throughput_gbps` | positive number (default `10`) | `--maximum-throughput-gbps` |
 
 The daemon pins `--prefix`, `--endpoint-url`, `--profile`, `--region`, and
 `--read-only` itself; `options.extra_args` is split into argv tokens and any
@@ -45,6 +47,11 @@ structured key is set, `--uid`/`--gid`/`--allow-other`/`--allow-overwrite` are
 additionally denied in `extra_args` — mixing a structured key with the same
 flag in `extra_args` fails closed; the legacy path with no structured keys
 still accepts those flags in `extra_args` (deprecated).
+
+The daemon also pins `--maximum-throughput-gbps` by default (value `10`): without it
+mount-s3 probes IMDS for the instance throughput, which burns ~4s per mount and
+fails on bare-metal runners without IMDS. An explicit `maximum_throughput_gbps`
+option (or the same flag in legacy `extra_args`) overrides the pin.
 
 The `endpoint` option must be an absolute `http://` or `https://` URL; other
 values (including bare hosts) are rejected at spec validation instead of

@@ -59,17 +59,21 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 	if err := validateS3StructuredOptions(spec.Options); err != nil {
 		return Plan{}, err
 	}
-	structured := s3StructuredFlags(spec.Options)
-	argv = append(argv, structured...)
+	// extra_args tokens are parsed before the structured block: mixed-spec
+	// detection keys off the actual structured option keys (NOT len(structured)
+	// — the daemon-pinned throughput flag would otherwise make it always true
+	// and break legacy extra_args), and the throughput pin yields to an
+	// operator-supplied --maximum-throughput-gbps.
+	var extraTokens []string
 	if extra := spec.Options["extra_args"]; extra != "" {
-		// Whitespace-split; we trust the operator's image policy here. Each
-		// token becomes its own argv entry to avoid shell interpretation.
-		tokens, err := s3ExtraArgsTokens(extra, len(structured) > 0)
+		tokens, err := s3ExtraArgsTokens(extra, hasS3StructuredKeys(spec.Options))
 		if err != nil {
 			return Plan{}, err
 		}
-		argv = append(argv, tokens...)
+		extraTokens = tokens
 	}
+	argv = append(argv, s3StructuredFlags(spec.Options, spec.ReadOnly, extraTokens)...)
+	argv = append(argv, extraTokens...)
 
 	if !useStaticCreds {
 		// No profile file; ambient instance-role credentials are used.
