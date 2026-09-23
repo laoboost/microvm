@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -332,10 +333,31 @@ func interpretWaitResult(err error) (int, string) {
 	return -1, err.Error()
 }
 
+// isPrivilegedEnvKey reports whether a caller-supplied env key must never
+// reach the privileged wrapper: dynamic linker (LD_*), shell startup/tracing,
+// glibc code-loading paths, PATH (binary lookup hijack), and any key that is
+// not a plain identifier. The container's own os.Environ() is trusted base
+// state and is not filtered.
+func isPrivilegedEnvKey(key string) bool {
+	if key == "" || strings.ContainsAny(key, "=\x00") {
+		return true
+	}
+	switch key {
+	case "ENV", "BASH_ENV", "BASHOPTS", "SHELLOPTS", "PS4", "IFS",
+		"GCONV_PATH", "LOCPATH", "HOSTALIASES", "LOCALDOMAIN", "RES_OPTIONS",
+		"PATH":
+		return true
+	}
+	return strings.HasPrefix(key, "LD_") || strings.HasPrefix(key, "BASH_FUNC_")
+}
+
 func mergeEnvForExec(extra map[string]string) []string {
 	// Inherit container env so PATH, HOME, etc. are present.
 	base := append([]string(nil), os.Environ()...)
 	for k, v := range extra {
+		if isPrivilegedEnvKey(k) {
+			continue
+		}
 		base = append(base, fmt.Sprintf("%s=%s", k, v))
 	}
 	return base
