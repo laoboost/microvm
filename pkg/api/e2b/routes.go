@@ -32,6 +32,10 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshots", d.Auth(h.clusterForwardWrap(http.HandlerFunc(h.createSnapshot))))
 	mux.Handle("GET "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.listSnapshots)))
 	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(http.HandlerFunc(h.deleteSnapshot)))
+	// /e2b/runtime is intentionally mounted WITHOUT d.Auth: E2B clients
+	// authenticate envd calls with the per-sandbox X-Access-Token, not a
+	// gateway credential. runtimeProxy enforces that token (constant-time) on
+	// every request; do not "simplify" this into an unauthenticated route.
 	mux.Handle(PathPrefix+"/runtime", http.HandlerFunc(h.runtimeProxy))
 	mux.Handle(PathPrefix+"/runtime/", http.HandlerFunc(h.runtimeProxy))
 }

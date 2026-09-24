@@ -56,6 +56,57 @@ type recreateFailureTracker struct {
 	counts map[string]int
 }
 
+// deliberatelyDeletedTombstoneTTL bounds how long a "destroyed on purpose"
+// tombstone suppresses owner-watcher recreation. Short-lived and in-memory on
+// purpose: it only has to outlive the window where a leftover Placed row (from
+// a DeletePlacement that failed after a successful local destroy) could make
+// the watcher resurrect a deleted sandbox. After the TTL the id becomes
+// recreatable again so a later re-create with the same id is never blocked.
+const deliberatelyDeletedTombstoneTTL = 5 * time.Minute
+
+// deletedTombstones is the short-lived in-memory record of deliberately
+// deleted sandbox ids (C6b). The owner watcher consults it before every
+// recreate so a stale Placed row cannot resurrect a sandbox whose destroy
+// already succeeded.
+type deletedTombstones struct {
+	mu      sync.Mutex
+	entries map[string]time.Time
+}
+
+func newDeletedTombstones() *deletedTombstones {
+	return &deletedTombstones{entries: make(map[string]time.Time)}
+}
+
+// mark records id as deliberately deleted as of now (refreshes the TTL on
+// repeat marks).
+func (t *deletedTombstones) mark(id string, now time.Time) {
+	if t == nil || id == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.entries[id] = now
+}
+
+// isDeliberatelyDeleted reports whether id is still within its tombstone TTL.
+// Expired entries are dropped lazily on lookup.
+func (t *deletedTombstones) isDeliberatelyDeleted(id string, now time.Time) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	marked, ok := t.entries[id]
+	if !ok {
+		return false
+	}
+	if now.Sub(marked) >= deliberatelyDeletedTombstoneTTL {
+		delete(t.entries, id)
+		return false
+	}
+	return true
+}
+
 func (t *recreateFailureTracker) record(id string) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -82,6 +133,12 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 	}
 	placements := c.fsm.fullPlacementsForOwner(c.nodeID)
 	for id, p := range placements {
+		if c.deliberatelyDeleted.isDeliberatelyDeleted(id, time.Now()) {
+			// Destroyed on purpose (C6b): never re-materialize, even when a
+			// leftover Placed row survived a failed DeletePlacement after a
+			// successful local destroy. The tombstone expires on its own TTL.
+			continue
+		}
 		if !placementWantsFailoverRecreate(p) {
 			continue
 		}

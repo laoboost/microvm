@@ -60,7 +60,8 @@ func TestMergeExecEnvEmpty(t *testing.T) {
 // ─── handleExecStream via WebSocket ──────────────────────────────────────────
 
 func TestHandleExecStreamNoCommand(t *testing.T) {
-	h := &Host{workDir: t.TempDir()}
+	requireHostExec(t)
+	h := &Host{workDir: t.TempDir(), hostExecEnabled: true}
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
 
@@ -88,7 +89,8 @@ func TestHandleExecStreamNoCommand(t *testing.T) {
 }
 
 func TestHandleExecStreamPipes(t *testing.T) {
-	h := &Host{workDir: t.TempDir()}
+	requireHostExec(t)
+	h := &Host{workDir: t.TempDir(), hostExecEnabled: true}
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
 
@@ -124,7 +126,8 @@ func TestHandleExecStreamPipes(t *testing.T) {
 }
 
 func TestHandleExecStreamPipesWithStdin(t *testing.T) {
-	h := &Host{workDir: t.TempDir()}
+	requireHostExec(t)
+	h := &Host{workDir: t.TempDir(), hostExecEnabled: true}
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
 
@@ -170,7 +173,8 @@ func TestHandleExecStreamPipesWithStdin(t *testing.T) {
 }
 
 func TestHandleExecStreamInvalidStartMessage(t *testing.T) {
-	h := &Host{workDir: t.TempDir()}
+	requireHostExec(t)
+	h := &Host{workDir: t.TempDir(), hostExecEnabled: true}
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
 
@@ -192,7 +196,8 @@ func TestHandleExecStreamInvalidStartMessage(t *testing.T) {
 }
 
 func TestHandleExecStreamPTY(t *testing.T) {
-	h := &Host{workDir: t.TempDir()}
+	requireHostExec(t)
+	h := &Host{workDir: t.TempDir(), hostExecEnabled: true}
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
 
@@ -229,7 +234,8 @@ func TestHandleExecStreamPTY(t *testing.T) {
 }
 
 func TestHandleExecStreamPTYResizeAndSignal(t *testing.T) {
-	h := &Host{workDir: t.TempDir()}
+	requireHostExec(t)
+	h := &Host{workDir: t.TempDir(), hostExecEnabled: true}
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
 

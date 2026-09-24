@@ -259,8 +259,13 @@ prereqs, `sudo`), plus:
 - A **private network** the operator controls (VPC, WireGuard mesh,
   dedicated subnet). Cluster-internal traffic must not be reachable from
   the public internet.
-- Same `SB_PAT_TOKEN` on every node. The simplest way is to pass the same
-  `--pat-token` to each `install.sh`.
+- Same `SB_PAT_TOKEN` on every node. The simplest way is to stage it in a
+  root-only file and pass the same `--pat-token-file` to each `install.sh`.
+- Your operator CIDR for admin access (SSH 22, operator API 21212, Grafana
+  3000). Terraform's `admin_allowed_cidrs` has no working default — an empty
+  list fails plan — and the `config/terraform.tfvars.example` placeholder
+  (`203.0.113.42/32`, an RFC 5737 documentation range) is rejected by the
+  variable validation, so replace it with your real range before planning.
 - `openssl` available (cluster-init generates the gossip key, the TLS CA,
   and the credential encryption key with it).
 - Cluster-internal ports open between nodes only:
@@ -285,11 +290,15 @@ every node.
 
 On `node-a`, `node-b`, `node-c`:
 
+Stage the PAT in a root-only file first (argv is visible in `ps` and shell
+history):
+
 ```bash
+sudo install -m 0600 /dev/null /root/pat-token   # then paste the PAT into it
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
   | sudo bash -s -- \
       --domain sandbox.example.com \
-      --pat-token shared-pat-token \
+      --pat-token-file /root/pat-token \
       --dns-provider cloudflare \
       --dns-api-token <cloudflare-token>
 ```
@@ -334,7 +343,7 @@ sudo /usr/local/bin/cluster-init.sh \
 
 Replace `10.0.0.5` with `node-a`'s private IP. The script:
 
-1. Auto-generates a 32-byte gossip secret key (override with `--gossip-key`).
+1. Auto-generates a 32-byte gossip secret key (override with `--gossip-key-file /root/gossip-key`).
 2. Generates a self-signed cluster CA + this node's keypair.
 3. Reads or generates the credential encryption key.
 4. Bundles `ca.crt`, `ca.key`, and `credential_encryption.key` into
@@ -388,10 +397,14 @@ sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/clu
 sudo chmod +x /usr/local/bin/cluster-join.sh
 sudo /usr/local/bin/cluster-join.sh \
     --node-id node-b \
-    --gossip-key '<key-from-cluster-init-output>' \
+    --gossip-key-file /root/gossip-key \
     --peers 10.0.0.5:7001 \
     --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
 ```
+
+`/root/gossip-key` must contain the key cluster-init printed — copy it over a
+secure channel. Pass the key via a root-only file, never on the command line:
+argv is visible in `ps` and shell history.
 
 The script:
 
@@ -816,15 +829,17 @@ SSH to each instance (the EIPs you allocated earlier are the SSH targets):
 
 ```bash
 ssh ubuntu@<node-a-EIP>
+# Stage the PAT in a root-only file (argv is visible in `ps` + shell history).
+sudo install -m 0600 /dev/null /root/pat-token   # then paste the PAT into it
 sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
   | sudo bash -s -- \
       --domain sandbox.example.com \
-      --pat-token shared-pat-token-pick-something-strong \
+      --pat-token-file /root/pat-token \
       --dns-provider cloudflare \
       --dns-api-token <cloudflare-token>
 ```
 
-Repeat on `node-b` and `node-c`. **Use the same `--pat-token` and the same
+Repeat on `node-b` and `node-c`. **Use the same PAT and the same
 `--dns-api-token` on all three.**
 
 Each node's Caddy will independently solve a DNS-01 challenge against
@@ -884,7 +899,7 @@ sudo chmod +x /usr/local/bin/cluster-join.sh
 
 sudo /usr/local/bin/cluster-join.sh \
     --node-id node-b \
-    --gossip-key "$GOSSIP_KEY" \
+    --gossip-key-file /root/gossip-key \
     --peers $NODE_A_PRIVATE_IP:7001 \
     --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
 ```
@@ -1241,7 +1256,7 @@ If the lost voters are gone for good (disk loss, hardware destroyed):
 
    ```bash
    sudo rm -rf /var/lib/sandboxd/raft   # on each rejoining node
-   sudo cluster-join.sh --gossip-key '<key>' \
+   sudo cluster-join.sh --gossip-key-file /root/gossip-key \
                         --peers <recovered-node>:7001 \
                         --tls-bundle <bundle> \
                         --force
@@ -1322,7 +1337,7 @@ Full incident runbooks are available under `setup/runbooks/`:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Joiner stuck, gossip never lands | Wrong `--gossip-key`, or `:7001` blocked | Compare gossip key char-for-char; check security group |
+| Joiner stuck, gossip never lands | Wrong gossip key, or `:7001` blocked | Compare gossip key char-for-char; check security group |
 | Joiner gossiped but no voter promotion | Raft `:7000` blocked | Open `:7000` between nodes |
 | Daemon refuses to start: `SB_GOSSIP_SECRET_KEY is required` | Cluster env file missing or empty | Re-run `cluster-init.sh` / `cluster-join.sh` |
 | Daemon refuses to start: `SB_CREDENTIAL_ENCRYPTION_KEY is required` | Same - credential key not in `cluster.env` and no key file on disk | Re-run cluster scripts (they now distribute the key); or copy `/var/lib/sandboxd/credential_encryption.key` from another node |

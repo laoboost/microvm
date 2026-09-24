@@ -54,9 +54,19 @@ export interface MicroVMConfig {
   retry?: RetryConfig;
 }
 
+const patTokens = new WeakMap<MicroVM, string>();
+
 export class MicroVM {
   readonly apiUrl: string;
-  readonly patToken: string;
+
+  /**
+   * The PAT this client authenticates with. Held outside the instance
+   * (and non-enumerable via the prototype getter) so `JSON.stringify`,
+   * `console.log`, and object spreads cannot leak it.
+   */
+  get patToken(): string {
+    return patTokens.get(this) ?? "";
+  }
 
   private readonly client: APIClient;
 
@@ -69,7 +79,7 @@ export class MicroVM {
     }
 
     this.apiUrl = apiUrl;
-    this.patToken = patToken;
+    patTokens.set(this, patToken);
     this.client = new APIClient({
       baseURL: apiUrl,
       patToken,
@@ -79,9 +89,17 @@ export class MicroVM {
     });
   }
 
+  toJSON(): { apiUrl: string; patToken: string } {
+    return { apiUrl: this.apiUrl, patToken: "***" };
+  }
+
+  [Symbol.for("nodejs.util.inspect.custom")](): unknown {
+    return this.toJSON();
+  }
+
   async create(options: CreateOptions): Promise<Sandbox> {
     const sandbox = await this.client.create(options);
-    return this.wrap(sandbox.toJSON());
+    return this.wrap(sandbox.toJSON({ includeSecrets: true }));
   }
 
   async list(options?: ListOptions): Promise<Sandbox[]> {

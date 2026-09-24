@@ -89,7 +89,14 @@ func (r *SnapshotPushReconciler) RunOnce(ctx context.Context) (SnapshotPushRecon
 
 	for _, snapshot := range pending {
 		if err := ctx.Err(); err != nil {
-			return stats, err
+			// Workers already admitted are still running (and still mutating
+			// stats under mu) — wait them out and return a consistent copy
+			// instead of racing them from this frame.
+			wg.Wait()
+			mu.Lock()
+			out := stats
+			mu.Unlock()
+			return out, err
 		}
 		wg.Add(1)
 		sem <- struct{}{}

@@ -209,9 +209,23 @@ func (c *Client) Exec(sandboxID string, caps wasmengine.Capabilities, export str
 	}, nil
 }
 
-// Invoke calls an exported function (defaults to _start).
+// Invoke calls an exported function (defaults to _start) as a ONE-SHOT
+// invocation: the worker bounds it with the sandbox wall timeout.
 func (c *Client) Invoke(sandboxID, export string) error {
-	body, err := encodePayload(invokePayload{Export: export})
+	return c.invoke(sandboxID, export, false)
+}
+
+// InvokeBackground calls an exported function as the LONG-LIVED guest entry —
+// the HTTP serve loop, whose body does not return until the sandbox is stopped.
+// The worker must not bound it with the wall timeout, which would kill the serve
+// at the per-request budget; it is bounded by the sandbox lifecycle instead
+// (StopInstance/Close interrupt it via the engine's in-flight call registry).
+func (c *Client) InvokeBackground(sandboxID, export string) error {
+	return c.invoke(sandboxID, export, true)
+}
+
+func (c *Client) invoke(sandboxID, export string, background bool) error {
+	body, err := encodePayload(invokePayload{Export: export, Background: background})
 	if err != nil {
 		return err
 	}

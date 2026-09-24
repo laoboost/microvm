@@ -72,7 +72,23 @@ func (r *Resolver) resolvePath(ref string) (string, error) {
 	if r.ModulesDir == "" {
 		return "", fmt.Errorf("relative module ref %q requires modules dir", ref)
 	}
-	return filepath.Join(r.ModulesDir, ref), nil
+	joined := filepath.Join(r.ModulesDir, ref)
+	// filepath.Join cleans ".." segments; a cleaned result outside
+	// ModulesDir is a traversal attempt (e.g. "../../../etc/passwd").
+	rel, err := filepath.Rel(r.ModulesDir, joined)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: %q escapes the modules directory", ErrUnsafeModuleRef, ref)
+	}
+	return joined, nil
+}
+
+// IsHostPathRef reports whether ref names a host filesystem location
+// (file:// URL or absolute path) rather than a name resolved under the
+// modules directory or a registry ref. Callers on the API path use this to
+// keep host-file access operator-only.
+func IsHostPathRef(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	return strings.HasPrefix(ref, "file://") || filepath.IsAbs(ref)
 }
 
 func (r *Resolver) digestFor(path string) (hexDigest string, size int64, err error) {

@@ -20,8 +20,11 @@ func (inst *sandboxInstance) bumpRunGeneration() uint64 {
 	return inst.runGeneration
 }
 
-// startGuestEntryAsync runs the module entry export in the background. HTTP guests block
-// inside _start; one-shot guests return quickly. Safe to call after Instantiate or SetListenPort.
+// startGuestEntryAsync runs the module entry export in the background as the
+// long-lived serve entry. HTTP guests block inside _start for the sandbox's
+// whole lifetime, so this uses the background invoke: the per-request wall
+// timeout must not kill the serve. Guest entries that must stay wall-bounded go
+// through Exec/Invoke instead. Safe to call after Instantiate or SetListenPort.
 func (d *Driver) startGuestEntryAsync(inst *sandboxInstance, client WorkerClient) {
 	if inst == nil || client == nil {
 		return
@@ -41,7 +44,10 @@ func (d *Driver) startGuestEntryAsync(inst *sandboxInstance, client WorkerClient
 	inst.guestServeMu.Unlock()
 
 	go func() {
-		_ = client.Invoke(sandboxID, export)
+		// Background: this entry blocks in the guest's HTTP accept loop for the
+		// sandbox's whole lifetime, so it must not carry the wall timeout that
+		// bounds a one-shot invocation. StopInstance ends it.
+		_ = client.InvokeBackground(sandboxID, export)
 		inst.guestServeMu.Lock()
 		if inst.guestServeGen == gen {
 			inst.guestServeGen = 0
@@ -82,10 +88,14 @@ func wasip1ListenPort(exposed []int) int {
 }
 
 // syncGuestListenPort hot-updates the worker listener and (re)starts the guest HTTP accept loop.
+// The accept loop is the long-lived serve, so it is invoked as a background
+// entry (no wall-timeout deadline); the sandbox lifecycle stops it.
 func (d *Driver) syncGuestListenPort(ctx context.Context, inst *sandboxInstance, client WorkerClient, listenPort int) error {
 	if listenPort == wasmengine.WASIListenPortDisabled {
 		inst.bumpRunGeneration()
+		d.mu.Lock()
 		inst.resolvedListenPort = 0
+		d.mu.Unlock()
 		if err := client.SetListenPort(inst.sandboxID, wasmengine.WASIListenPortDisabled, ""); err != nil {
 			return err
 		}
@@ -109,13 +119,15 @@ func (d *Driver) syncGuestListenPort(ctx context.Context, inst *sandboxInstance,
 			return fmt.Errorf("ephemeral listen port not resolved")
 		}
 	}
+	d.mu.Lock()
 	inst.resolvedListenPort = resolved
+	d.mu.Unlock()
 	export := inst.entryExport
 	if export == "" {
 		export = "_start"
 	}
 	sandboxID := inst.sandboxID
-	go func() { _ = client.Invoke(sandboxID, export) }()
+	go func() { _ = client.InvokeBackground(sandboxID, export) }()
 	if d.waitListenReady != nil {
 		return d.waitListenReady(host, resolved)
 	}

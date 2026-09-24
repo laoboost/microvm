@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -65,8 +63,7 @@ var codeRunSpecs = map[string]codeRunSpec{
 
 func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 	var req daytonaCodeRunRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeError) {
 		return
 	}
 	if req.Code == "" {
@@ -106,7 +103,7 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 	args = append(args, scriptPath)
 	args = append(args, req.Argv...)
 	cmd := exec.CommandContext(ctx, interp, args...)
-	cmd.Env = append(os.Environ(), envMapToSlice(req.Envs)...)
+	cmd.Env = mergeEnvForExec(req.Envs)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -123,16 +120,16 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var stdoutBytes, stderrBytes []byte
+	var stdoutBytes, stderrBytes string
 	var readWG sync.WaitGroup
 	readWG.Add(2)
 	go func() {
 		defer readWG.Done()
-		stdoutBytes, _ = io.ReadAll(stdout)
+		stdoutBytes = readCappedCapture(stdout)
 	}()
 	go func() {
 		defer readWG.Done()
-		stderrBytes, _ = io.ReadAll(stderr)
+		stderrBytes = readCappedCapture(stderr)
 	}()
 	readWG.Wait()
 	waitErr := cmd.Wait()
@@ -142,8 +139,8 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 	// when stdout is empty so users on a non-zero exit aren't staring at a
 	// blank string; otherwise mirror handleExec and discard it. This also
 	// preserves the spawn-failure message we appended below.
-	stdoutStr := string(stdoutBytes)
-	stderrStr := string(stderrBytes)
+	stdoutStr := stdoutBytes
+	stderrStr := stderrBytes
 	if waitErr != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(waitErr, &exitErr) && !errors.Is(waitErr, syscall.ECHILD) {

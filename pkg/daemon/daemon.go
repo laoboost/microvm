@@ -62,6 +62,66 @@ type FleetConfig struct {
 // bound to the daemon lifecycle.
 type ProviderFactory func(ctx context.Context, fc FleetConfig) (controlplane.Provider, error)
 
+// dockerBridgeInterface is the docker bridge interface this config produces:
+// docker0 for the default network. A custom network gets a br-<id> name only
+// once dockerd has created it, so that case returns "" — the caller still
+// writes the host-wide all/default sysctls, which is what a later-created
+// bridge inherits.
+func dockerBridgeInterface(cfg config.Config) string {
+	// "" is config.Config's zero value; production config.Load defaults
+	// SB_DOCKER_NETWORK to "bridge".
+	if cfg.DockerNetwork == "" || cfg.DockerNetwork == "bridge" {
+		return dockerDefaultBridge
+	}
+	return ""
+}
+
+// sandboxBridgeInterfaces lists the bridge interfaces a host with this config
+// carries sandbox traffic on. A host migrating off docker can have both: the
+// containerd engine's aerolvm0 and the docker0 that pre-flip sandboxes still
+// use.
+func sandboxBridgeInterfaces(cfg config.Config) []string {
+	if cfg.ContainerEngine == models.ContainerEngineContainerd {
+		return []string{containerdSandboxBridge, dockerBridgeInterface(cfg)}
+	}
+	return []string{dockerBridgeInterface(cfg)}
+}
+
+// bootSandboxNetworkIsolation hard-disables IPv6 on every sandbox bridge this
+// host can create, teaches netrules which bridge interface to probe per sandbox,
+// and only then runs install — the boot-time chain/rule work (on the containerd
+// path, the AEROLVM-USER chain + FORWARD jump).
+//
+// The ordering is the point. netrules installs IPv4-only rules, so a bridge that
+// still carries IPv6 when the first chain lands lets sandbox traffic bypass every
+// per-IP DROP, the bridge ACCEPTs and the link-local (IMDS) DROP. And a sandbox
+// created with no egress policy never calls netrules at all, so for that sandbox
+// this boot-time disable IS the protection — it must not sit behind later boot
+// steps that can fail or be reordered.
+//
+// Fail closed: a disable that does not take (read-back mismatch) aborts boot
+// rather than shipping sandboxes whose egress policy fails open over IPv6.
+func bootSandboxNetworkIsolation(cfg config.Config, rules *netrules.Manager, install func() error) error {
+	if cfg.EnableNetworkRules {
+		for _, bridge := range sandboxBridgeInterfaces(cfg) {
+			if err := ensureSandboxIPv6Disabled(bridge); err != nil {
+				return fmt.Errorf("disable sandbox IPv6: %w", err)
+			}
+		}
+		// The per-sandbox installs must probe the bridge itself: an interface
+		// whose IPv6 was enabled on its own after boot reads as "disabled"
+		// through all/default alone. Custom docker networks pass "" (no bridge
+		// name known yet) and stay on the host-wide probe.
+		if rules != nil {
+			rules.SetBridgeName(dockerBridgeInterface(cfg))
+		}
+	}
+	if install == nil {
+		return nil
+	}
+	return install()
+}
+
 // Run loads configuration and executes the full daemon boot sequence, blocking
 // until ctx is cancelled (SIGINT/SIGTERM in the standard wrapper), then performs
 // graceful shutdown. Every fatal boot failure is returned as a wrapped error
@@ -281,12 +341,23 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// (persistent EIO) — the sandbox must be restarted, an in-place FUSE respawn
 	// cannot heal it. The service gates restarts with a cooldown.
 	mountManager.SetOnMountCrash(svc.HandleMountCrash)
+	// IPv6 is hard-disabled on the sandbox bridges BEFORE the engine wiring runs,
+	// because that wiring bootstraps the AEROLVM-USER chain on the containerd
+	// path. netrules' rules are IPv4-only, so the two cannot be reordered (see
+	// bootSandboxNetworkIsolation).
 	var ctdWiring *containerdEngineWiring
-	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
-		return fmt.Errorf("wire container engine: %w", err)
-	} else if ctd != nil {
+	if err := bootSandboxNetworkIsolation(cfg, rules, func() error {
+		ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter)
+		if err != nil {
+			return fmt.Errorf("wire container engine: %w", err)
+		}
 		ctdWiring = ctd
-		defer ctd.Stop()
+		return nil
+	}); err != nil {
+		return err
+	}
+	if ctdWiring != nil {
+		defer ctdWiring.Stop()
 	}
 	// Wire the control-plane usage reporter into the service's background loops
 	// (reconcile / event monitor / netstats / live sampler). Under
@@ -300,7 +371,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if dockerWarmPool != nil {
 		defer func() { drainDockerWarmPool(dockerWarmPool, logger) }()
 	}
-	if netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient); netnsPool != nil {
+	if netnsPool, err := wireDockerNetnsPool(ctx, cfg, logger, dockerClient); err != nil {
+		return fmt.Errorf("wire docker netns pool: %w", err)
+	} else if netnsPool != nil {
 		defer netnsPool.Stop(context.WithoutCancel(ctx))
 	}
 	// Start the standing-driven enforcement loop. EnforcementFor binds the loop
@@ -949,8 +1022,12 @@ var clusterOwnershipReplayTick = 10 * time.Second
 
 func startClusterOwnershipReplayRetry(ctx context.Context, svc *service.Service, logger *slog.Logger) {
 	logger.Warn("cluster: scheduling ownership replay retry")
+	// Read the interval on the caller's goroutine. It is a package-level test
+	// seam, and a retry goroutine that outlives its test would read it while the
+	// next test writes it — a data race `go test -race ./pkg/daemon/` reports.
+	tick := clusterOwnershipReplayTick
 	go func() {
-		t := time.NewTicker(clusterOwnershipReplayTick)
+		t := time.NewTicker(tick)
 		defer t.Stop()
 		for {
 			select {

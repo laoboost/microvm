@@ -778,6 +778,11 @@ func TestSandboxMetaFromNativeDestroyAtAgeBranch(t *testing.T) {
 }
 
 func TestRuntimeProxyEmptyPublicPath(t *testing.T) {
+	// secure:false + the operator flag: the subject under test is the
+	// empty-publicPath→/envd/ rewrite, not auth (pinned in
+	// runtime_proxy_auth_test.go).
+	t.Setenv("SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME", "1")
+
 	toolboxServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/envd/" {
 			t.Fatalf("path = %q, want /envd/", r.URL.Path)
@@ -989,6 +994,10 @@ func TestCreateRequestFingerprintAndMetadataHelpers(t *testing.T) {
 }
 
 func TestRuntimeProxyWasmRuntimeBranch(t *testing.T) {
+	// secure:false + the operator flag: the subject under test is the wasm
+	// proxy branch, not auth (pinned in runtime_proxy_auth_test.go).
+	t.Setenv("SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME", "1")
+
 	svc, st, handler := newE2BHandlerTestEnv(t)
 	id := createE2BSandbox(t, handler)
 
@@ -1015,6 +1024,11 @@ func TestRuntimeProxyWasmRuntimeBranch(t *testing.T) {
 }
 
 func TestRuntimeProxyPublicPathWithoutLeadingSlash(t *testing.T) {
+	// secure:false + the operator flag: the subject under test is the
+	// publicPath→/envd/foo rewrite, not auth (which is pinned in
+	// runtime_proxy_auth_test.go).
+	t.Setenv("SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME", "1")
+
 	toolboxServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/envd/foo" {
 			t.Fatalf("path = %q, want /envd/foo", r.URL.Path)

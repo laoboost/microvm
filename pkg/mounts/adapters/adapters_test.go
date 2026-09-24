@@ -160,7 +160,7 @@ func TestNFSBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NFS.Build: %v", err)
 	}
-	want := []string{"mount", "-t", "nfs", "-o", "ro", "10.0.0.2:/exports/data", "/mnt/nfs"}
+	want := []string{"mount", "-t", "nfs", "-o", "ro,nosuid,nodev", "10.0.0.2:/exports/data", "/mnt/nfs"}
 	if !reflect.DeepEqual(plan.Argv, want) {
 		t.Fatalf("NFS argv mismatch: got=%v want=%v", plan.Argv, want)
 	}
@@ -168,12 +168,12 @@ func TestNFSBuild(t *testing.T) {
 		t.Fatal("IsKernelMount = false, want true")
 	}
 
-	plan, err = (NFS{}).Build("sb", 0, models.MountSpec{Source: "10.0.0.2:/exports/data", ReadOnly: true, Options: map[string]string{"opts": "rw,vers=4"}}, "/mnt/nfs", "/creds")
+	plan, err = (NFS{}).Build("sb", 0, models.MountSpec{Source: "10.0.0.2:/exports/data", ReadOnly: true, Options: map[string]string{"opts": "vers=4"}}, "/mnt/nfs", "/creds")
 	if err != nil {
 		t.Fatalf("NFS.Build with opts: %v", err)
 	}
-	if got := plan.Argv[4]; got != "rw,vers=4,ro" {
-		t.Fatalf("NFS opts = %q, want rw,vers=4,ro", got)
+	if got := plan.Argv[4]; got != "vers=4,ro,nosuid,nodev" {
+		t.Fatalf("NFS opts = %q, want vers=4,ro,nosuid,nodev", got)
 	}
 }
 
@@ -403,6 +403,10 @@ func TestS3Build_AcceptsLegacyExtraArgsWithUidAndAllowFlagsWhenNoStructuredKeysA
 func TestS3Build_AcceptsProductionSubchatOptionsShapeRegionEndpointAndLegacyExtraArgsUnchanged(t *testing.T) {
 	plan, err := (S3{}).Build("sb", 0, models.MountSpec{
 		Source: "s3://bucket/data",
+		Credentials: map[string]string{
+			"access_key_id":     "AKIAEXAMPLE",
+			"secret_access_key": "secret",
+		},
 		Options: map[string]string{
 			"region":     "us-east-1",
 			"endpoint":   "http://localhost:9000",
@@ -424,6 +428,13 @@ func TestS3Build_AcceptsProductionSubchatOptionsShapeRegionEndpointAndLegacyExtr
 func TestS3Build_EndpointSchemeValidation(t *testing.T) {
 	valid := map[string]string{"region": "us-east-1"}
 	base := models.MountSpec{Source: "s3://bucket/data", Options: valid}
+	// Endpoint overrides are only accepted alongside static keys (ambient
+	// instance-role credentials must never be signed to a caller-supplied
+	// host), so the acceptance cases carry static credentials.
+	staticCreds := map[string]string{
+		"access_key_id":     "AKIAEXAMPLE",
+		"secret_access_key": "secret",
+	}
 
 	t.Run("it rejects an endpoint with a non http or https scheme", func(t *testing.T) {
 		for _, ep := range []string{"ftp://files.example.com", "file:///tmp/x", "gopher://x"} {
@@ -446,7 +457,7 @@ func TestS3Build_EndpointSchemeValidation(t *testing.T) {
 	t.Run("it accepts an http endpoint on a private address", func(t *testing.T) {
 		for _, ep := range []string{"http://localhost:9000", "http://10.0.0.5:9000", "http://192.168.1.10:9000", "http://minio.internal:9000"} {
 			opts := map[string]string{"endpoint": ep}
-			plan, err := (S3{}).Build("sb", 0, models.MountSpec{Source: base.Source, Options: opts}, "/mnt/s3", "/creds")
+			plan, err := (S3{}).Build("sb", 0, models.MountSpec{Source: base.Source, Options: opts, Credentials: staticCreds}, "/mnt/s3", "/creds")
 			if err != nil {
 				t.Errorf("Build with endpoint %q: %v", ep, err)
 				continue
@@ -459,7 +470,7 @@ func TestS3Build_EndpointSchemeValidation(t *testing.T) {
 
 	t.Run("it accepts an https endpoint", func(t *testing.T) {
 		opts := map[string]string{"endpoint": "https://s3.amazonaws.com"}
-		plan, err := (S3{}).Build("sb", 0, models.MountSpec{Source: base.Source, Options: opts}, "/mnt/s3", "/creds")
+		plan, err := (S3{}).Build("sb", 0, models.MountSpec{Source: base.Source, Options: opts, Credentials: staticCreds}, "/mnt/s3", "/creds")
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}

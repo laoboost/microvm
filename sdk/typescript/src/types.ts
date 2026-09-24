@@ -17,15 +17,15 @@ export interface RegistryAuth {
 
 /**
  * Per-request push directive for `MicroVM.buildImage`. Credentials are
- * forwarded to the daemon as a one-shot `X-Registry-Auth` header on the
- * push call and are never persisted.
+ * forwarded to the daemon in the `push` object of the `/v1/images/build`
+ * request body and are never persisted.
  */
 export interface BuildImagePushOptions {
   /** Destination repository, e.g. "ghcr.io/my-org/my-image". */
   registry: string;
   /** Destination tag. Defaults to "latest" on the daemon when omitted. */
   tag?: string;
-  /** Registry serveraddress, e.g. "ghcr.io". Sent inside X-Registry-Auth. */
+  /** Registry serveraddress, e.g. "ghcr.io". Sent inside the push body. */
   server?: string;
   username: string;
   password: string;
@@ -540,6 +540,14 @@ export interface ExecStreamOptions {
   onStdout?: (chunk: Uint8Array) => void;
   onStderr?: (chunk: Uint8Array) => void;
   onError?: (message: string) => void;
+  /**
+   * Force the PAT onto `Sec-WebSocket-Protocol` (`sandbox.bearer, <token>`)
+   * instead of an Authorization header. Browsers cannot attach headers to
+   * WebSocket handshakes, so this mode is selected automatically outside Node;
+   * the subprotocol is visible to the page and to any intermediaries, so it is
+   * only used there or when set explicitly. Pass `false` to force header mode.
+   */
+  authViaSubprotocol?: boolean;
 }
 
 export interface ExecExitInfo {
@@ -567,6 +575,14 @@ export interface SessionAttachOptions {
   onError?: (message: string) => void;
   cols?: number;
   rows?: number;
+  /**
+   * Force the PAT onto `Sec-WebSocket-Protocol` (`sandbox.bearer, <token>`)
+   * instead of an Authorization header. Browsers cannot attach headers to
+   * WebSocket handshakes, so this mode is selected automatically outside Node;
+   * the subprotocol is visible to the page and to any intermediaries, so it is
+   * only used there or when set explicitly. Pass `false` to force header mode.
+   */
+  authViaSubprotocol?: boolean;
 }
 
 export interface SessionAttachHandle {

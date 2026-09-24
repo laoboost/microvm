@@ -105,13 +105,9 @@ output "ssh_command_seed" {
 }
 
 output "verify_cluster_command" {
-  description = "Run this from any node (after bootstrap) to confirm membership."
-  # nonsensitive() so the PAT is interpolated into the copy-pasteable command
-  # rather than redacted to <sensitive>. This deliberately prints the real token
-  # in plan/apply output — acceptable only because these are throwaway
-  # integration-test clusters whose PAT is rotated/destroyed with the infra.
-  value     = "curl -s -H 'Authorization: Bearer ${nonsensitive(local.pat_token)}' http://127.0.0.1:21212/v1/cluster/members | jq ."
-  sensitive = false
+  description = "Run this from any node (after bootstrap) to confirm membership. Substitute <PAT> with the cluster PAT from config/secrets.yml (cluster.pat_token) — it is never interpolated into outputs."
+  value       = "curl -s -H 'Authorization: Bearer <PAT>' http://127.0.0.1:21212/v1/cluster/members | jq ."
+  sensitive   = false
 }
 
 output "prometheus_scrape_targets" {

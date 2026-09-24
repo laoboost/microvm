@@ -95,7 +95,10 @@ func TestWireDockerNetnsPool_Enabled(t *testing.T) {
 		DockerNetnsPoolPauseImage:     "alpine:3.20",
 		DockerNetnsPoolRefillInterval: 10 * time.Millisecond,
 	}
-	pool := wireDockerNetnsPool(ctx, cfg, testLogger(), c)
+	pool, err := wireDockerNetnsPool(ctx, cfg, testLogger(), c)
+	if err != nil {
+		t.Fatalf("wireDockerNetnsPool: %v", err)
+	}
 	if pool == nil {
 		t.Fatal("expected netns pool")
 	}

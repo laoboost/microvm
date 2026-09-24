@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -200,10 +201,26 @@ func (h *Host) Start(ctx context.Context) error {
 	// Fail-closed jail gate: if confinement is REQUIRED but this platform can't
 	// realize it (or the spec is incomplete), refuse to spawn rather than run
 	// untrusted tenant JS unconfined while the operator believes it is jailed.
+	// LockOSThread keeps PR_SET_NO_NEW_PRIVS (set by applyJail) on the thread
+	// that forks workerd — it is a per-OS-thread attribute inherited at fork.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if h.cfg.Jail.Require {
 		if err := applyJail(cmd, h.cfg.Jail); err != nil {
 			_ = h.stopServers()
 			return fmt.Errorf("isolate: jail required but not realized here — refusing to spawn workerd unconfined (set SB_ISOLATE_USE_JAIL=false to run without a jail, accepting the risk): %w", err)
+		}
+		// Require=true means the FULL confinement. While applyJail realizes
+		// %s only, starting anyway would be false confinement —
+		// fail closed unless the operator explicitly accepted the weak jail.
+		if !seccompApplied() && !allowWeakJail() {
+			_ = h.stopServers()
+			return fmt.Errorf("isolate: jail Require=true but applyJail realizes %s — refusing to spawn workerd (set SB_ISOLATE_ALLOW_WEAK_JAIL=true to explicitly accept this weak jail, or SB_ISOLATE_USE_JAIL=false to run unjailed)", jailCoverage())
+		}
+		if !seccompApplied() {
+			h.logger.Warn("isolate: running WEAK jail by explicit override",
+				"group", h.cfg.GroupKey, "coverage", jailCoverage(),
+				"override", "SB_ISOLATE_ALLOW_WEAK_JAIL=true")
 		}
 	}
 	if err := cmd.Start(); err != nil {

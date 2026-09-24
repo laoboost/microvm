@@ -39,6 +39,10 @@ func newTestClusterWithRoleAndGrace(t *testing.T, nodeID, role string, bootstrap
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterDeadOwnerGrace:         grace,
+		// Test clusters run plaintext gossip (no fleet key). Production only
+		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+		// opt-in here so voter-promotion subjects stay exercisable.
+		ClusterInsecureGossip: true,
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

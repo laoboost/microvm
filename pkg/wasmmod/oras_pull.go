@@ -67,6 +67,10 @@ func PullSnapshotArtifact(ctx context.Context, cfg ORASPullConfig, registryRef, 
 		return fmt.Errorf("oras pull resolve %s: %w", registryRef, err)
 	}
 
+	// The copy unpacks layers by filename and does not filter on media type,
+	// so both the current (v2) and the legacy (v1) artifact media types pull
+	// and restore. This is what keeps a rolling upgrade from rejecting
+	// checkpoints written before the media-type bump.
 	if _, err := oras.Copy(ctx, repo, tag, fs, tag, oras.DefaultCopyOptions); err != nil {
 		return fmt.Errorf("oras pull copy from %s: %w", registryRef, err)
 	}

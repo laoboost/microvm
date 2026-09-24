@@ -13,14 +13,18 @@ import (
 	"oras.land/oras-go/v2/content/file"
 )
 
+// snapshotLayerMediaTypes tracks the artifact schema version (v2 added the
+// globals_checksum field). The pull path is media-type agnostic — it unpacks
+// layers by filename — so a v1-typed artifact pushed before the bump still
+// restores.
 var snapshotLayerMediaTypes = map[string]string{
-	"config.json":     "application/vnd.aerolvm.wasm-snapshot.v1+json",
-	"memory.zstd":     "application/vnd.aerolvm.wasm-snapshot.v1.memory.zstd",
-	"globals.cbor":    "application/vnd.aerolvm.wasm-snapshot.v1.globals.cbor",
-	"wasi-state.cbor": "application/vnd.aerolvm.wasm-snapshot.v1.wasi-state.cbor",
+	"config.json":     "application/vnd.aerolvm.wasm-snapshot.v2+json",
+	"memory.zstd":     "application/vnd.aerolvm.wasm-snapshot.v2.memory.zstd",
+	"globals.cbor":    "application/vnd.aerolvm.wasm-snapshot.v2.globals.cbor",
+	"wasi-state.cbor": "application/vnd.aerolvm.wasm-snapshot.v2.wasi-state.cbor",
 }
 
-const wasmSnapshotArtifactType = "application/vnd.aerolvm.wasm-snapshot.v1"
+const wasmSnapshotArtifactType = "application/vnd.aerolvm.wasm-snapshot.v2"
 
 // ORASPushConfig wires AOCR auth for WASM checkpoint push. Mirrors the
 // snapshot-push PAT file semantics: token is re-read on every call.

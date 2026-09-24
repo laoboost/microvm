@@ -63,6 +63,20 @@ func (p *PoolSpawner) DestroyParked(ctx context.Context, slot *dockerpool.Parked
 	return p.Client.destroyParked(ctx, slot)
 }
 
+// normalizeOSUser collapses the common spellings of the built-in root account
+// to the exact, resolvable name "root". Linux account names are case-sensitive,
+// so "ROOT"/"Root" are not resolvable by dockerd; normalizing here keeps the
+// warm-pool eligibility decision and the cold-path HostConfig.User in lockstep.
+// Any other account name is returned trimmed and unchanged (dockerd decides
+// whether it exists in the image).
+func normalizeOSUser(user string) string {
+	user = strings.TrimSpace(user)
+	if strings.EqualFold(user, "root") {
+		return "root"
+	}
+	return user
+}
+
 func poolEligible(req models.CreateSandboxRequest, hostMounts []mounts.ContainerBind, parkDiskGB int) bool {
 	if len(req.Env) > 0 {
 		return false
@@ -70,13 +84,16 @@ func poolEligible(req models.CreateSandboxRequest, hostMounts []mounts.Container
 	if len(req.Mounts) > 0 || len(req.PlatformVolumes) > 0 || len(hostMounts) > 0 {
 		return false
 	}
-	// normalizeCreateRequest fills OSUser="root" for every default create.
-	// Parked containers also run as the image default user (root for alpine),
-	// and the cold Docker path never sets Docker's User field from OSUser —
-	// so the default/root case is byte-identical to a park slot. Only a
-	// non-default OSUser forces a miss (we cannot change the container user
-	// post-create).
-	if user := strings.TrimSpace(req.OSUser); user != "" && !strings.EqualFold(user, "root") {
+	// An unspecified OSUser now means "the image's own USER" (normalizeCreateRequest
+	// no longer defaults it to root), which is exactly what a park slot does —
+	// parkContainer sets no User field — so the unspecified case is byte-identical
+	// to a park slot. A container's user is fixed at create time and the cold path
+	// honors req.OSUser via HostConfig.User, so any non-default OSUser must miss
+	// the pool and take the cold path (adopting would silently run it as the image
+	// default instead). An explicit "root" is treated as the common warmed-image
+	// default and stays eligible. Compare on the normalized spelling so the
+	// eligibility decision and the cold-path User value cannot disagree.
+	if user := normalizeOSUser(req.OSUser); user != "" && user != "root" {
 		return false
 	}
 	if len(req.ContainerCommand) > 0 {
@@ -244,15 +261,22 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 		"Labels":     labels,
 	}
 
+	toolboxBind, err := bindEntry(c.toolboxBinaryPath, c.toolboxMountPath, "ro")
+	if err != nil {
+		_ = pl.Close()
+		return nil, err
+	}
 	binds := []string{
-		fmt.Sprintf("%s:%s:ro", c.toolboxBinaryPath, c.toolboxMountPath),
+		toolboxBind,
+		// Operator-trusted and validated (operator park-socket dir + hex-nonce
+		// path), so this bind is intentionally exempt from the tenant-mount
+		// option-injection guard; see bindEntry.
 		pl.BindSpec(),
 	}
 
-	hostConfig := map[string]any{
-		"Privileged": c.privileged,
-		"Binds":      binds,
-	}
+	// Shared base so park and cold creates cannot drift on the hardening
+	// envelope (Privileged / Binds / no-new-privileges).
+	hostConfig := c.baseHostConfig(binds)
 	if c.network != "" && c.network != "bridge" {
 		hostConfig["NetworkMode"] = c.network
 	}

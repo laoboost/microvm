@@ -221,8 +221,10 @@ func TestServiceCreateWithIDAndAccessors(t *testing.T) {
 	if resp.CPU != models.DefaultCPU || resp.MemoryMB != models.DefaultMemoryMB || resp.DiskGB != models.DefaultDiskGB {
 		t.Fatalf("normalized defaults = cpu:%v mem:%d disk:%d, want %v/%d/%d", resp.CPU, resp.MemoryMB, resp.DiskGB, models.DefaultCPU, models.DefaultMemoryMB, models.DefaultDiskGB)
 	}
-	if resp.OSUser != "root" {
-		t.Fatalf("os user = %q, want root", resp.OSUser)
+	// Unspecified OSUser is no longer defaulted to root: an empty value means
+	// "use the image's own USER", distinct from an explicit root request.
+	if resp.OSUser != "" {
+		t.Fatalf("os user = %q, want empty (unspecified)", resp.OSUser)
 	}
 	if !strings.Contains(resp.SSHPrivateKey, "PRIVATE KEY") {
 		t.Fatalf("ssh private key missing PEM block: %q", resp.SSHPrivateKey)

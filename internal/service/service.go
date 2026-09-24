@@ -865,6 +865,13 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 	if id == "" {
 		return nil, errors.New("CreateSandboxWithID: id required")
 	}
+	// The id is caller-supplied (X-Cluster-Create-ID) and is later joined into
+	// host paths (mounts rootfs dirs, runtime state dirs). Reject traversal /
+	// separators here at the service boundary — every runtime path below
+	// trusts this value.
+	if err := mounts.ValidateSandboxID(id); err != nil {
+		return nil, err
+	}
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
 		// Already present locally — recreate is a no-op. The watcher tick that
 		// noticed the FSM-only entry must have raced with a local create.
@@ -1108,6 +1115,14 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
 	done := beginSandboxCreateMetric()
 	defer func() { done(err) }()
+	// idOverride is the cluster create-id (X-Cluster-Create-ID). Validate it
+	// before any use: createFirecrackerSandbox / createWasmSandbox /
+	// createIsolateSandbox / the docker path all join it into host paths.
+	if idOverride != "" {
+		if err := mounts.ValidateSandboxID(idOverride); err != nil {
+			return nil, err
+		}
+	}
 	// Bound the entire create operation so a stalled image pull or a slow
 	// registry cannot block a goroutine forever. 0 disables the guard.
 	if t := s.cfg.CreateSandboxTimeout(); t > 0 {
@@ -5227,9 +5242,11 @@ func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandbo
 	if req.DiskGB <= 0 {
 		req.DiskGB = models.DefaultDiskGB
 	}
-	if req.OSUser == "" {
-		req.OSUser = "root"
-	}
+	// OSUser is deliberately NOT defaulted. An empty value means "use the
+	// image's own USER", which is distinct from an explicit "root"; defaulting
+	// to root forced images shipping a non-root USER to run as root and
+	// diverged from warm-pool park slots (pkg/docker/client.go only sends a
+	// User field when the caller asked for one).
 	if req.Env == nil {
 		req.Env = map[string]string{}
 	}

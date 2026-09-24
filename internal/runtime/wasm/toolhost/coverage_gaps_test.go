@@ -46,6 +46,7 @@ func TestWriteCodeRunScriptErrors(t *testing.T) {
 }
 
 func TestHandleCodeRunSuccessAndWaitError(t *testing.T) {
+	requireHostExec(t)
 	dir := t.TempDir()
 	h := New(Config{SandboxID: "sb", WorkDir: dir})
 
@@ -82,6 +83,7 @@ func TestHandleCodeRunSuccessAndWaitError(t *testing.T) {
 }
 
 func TestHandleCodeRunContextTimeoutAppendsError(t *testing.T) {
+	requireHostExec(t)
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	payload, _ := json.Marshal(map[string]interface{}{
 		"code":     "sleep 10",
@@ -133,6 +135,7 @@ func TestPumpWasmSessionStderrFrames(t *testing.T) {
 }
 
 func TestHandleCodeRunStderrOnlyResult(t *testing.T) {
+	requireHostExec(t)
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	payload, _ := json.Marshal(map[string]string{
 		"code":     "echo oops 1>&2",
@@ -155,6 +158,7 @@ func TestHandleCodeRunStderrOnlyResult(t *testing.T) {
 }
 
 func TestHandleExecStreamCustomWorkdir(t *testing.T) {
+	requireHostExec(t)
 	workdir := t.TempDir()
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	srv := httptest.NewServer(h.Handler())
@@ -251,6 +255,7 @@ func TestStripSandboxPrefixEmptyRemainder(t *testing.T) {
 }
 
 func TestHandleCodeRunScriptWriteErrorHTTP(t *testing.T) {
+	requireHostExec(t)
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Skip("chmod not supported")
@@ -277,6 +282,7 @@ func TestWriteCodeRunScriptMkdirTempParentIsFile(t *testing.T) {
 }
 
 func TestHandleExecStreamPipesStartFailureBadWorkdir(t *testing.T) {
+	requireHostExec(t)
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
@@ -301,6 +307,7 @@ func TestHandleExecStreamPipesStartFailureBadWorkdir(t *testing.T) {
 }
 
 func TestDaytonaSessionExecRandIDFailure(t *testing.T) {
+	requireHostExec(t)
 	orig := daytonaRandRead
 	t.Cleanup(func() { daytonaRandRead = orig })
 	daytonaRandRead = func([]byte) (int, error) { return 0, errors.New("rand failed") }
@@ -323,6 +330,7 @@ func TestDaytonaSessionExecRandIDFailure(t *testing.T) {
 }
 
 func TestDaytonaSessionCommandInputCRSuffix(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-cr"})
 	rec := httptest.NewRecorder()
@@ -402,6 +410,7 @@ func TestDaytonaSessionEntrypointLogsNotImplemented(t *testing.T) {
 }
 
 func TestHandleCodeRunWithArgvAndEnv(t *testing.T) {
+	requireHostExec(t)
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	payload, _ := json.Marshal(map[string]interface{}{
 		"code":     "echo $1 $CODE_RUN_ARG",
@@ -471,6 +480,7 @@ func TestWriteCodeRunScriptMkdirTempError(t *testing.T) {
 }
 
 func TestDaytonaSessionExecStderrAndFollowLogs(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-stderr"})
 	rec := httptest.NewRecorder()
@@ -730,6 +740,7 @@ func TestHandleExecStreamUpgradeFailure(t *testing.T) {
 }
 
 func TestHandleExecStreamPTYDefaultsAndStartError(t *testing.T) {
+	requireHostExec(t)
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
@@ -979,6 +990,7 @@ func TestDaytonaSessionListSkipsStaleCompat(t *testing.T) {
 }
 
 func TestDaytonaSessionDeleteSuccessPath(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-del-ok"})
 	rec := httptest.NewRecorder()
@@ -995,6 +1007,7 @@ func TestDaytonaSessionDeleteSuccessPath(t *testing.T) {
 }
 
 func TestDaytonaSessionDeleteRaceNotFound(t *testing.T) {
+	requireHostExec(t)
 	h, mgr := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-del-race"})
 	rec := httptest.NewRecorder()
@@ -1034,6 +1047,7 @@ func TestDaytonaCommandStreamSlowSubscriber(t *testing.T) {
 }
 
 func TestDaytonaRunSessionCommandBranches(t *testing.T) {
+	requireHostExec(t)
 	h, mgr := newHostWithRealSessions(t)
 
 	t.Run("stderr and sync echo", func(t *testing.T) {
@@ -1122,6 +1136,7 @@ func TestDaytonaRunSessionCommandBranches(t *testing.T) {
 }
 
 func TestHandleDaytonaSessionDeleteDirectPaths(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 
 	rec := httptest.NewRecorder()
@@ -1215,6 +1230,7 @@ func TestAtomicWriteFileChmodAndRenameErrors(t *testing.T) {
 }
 
 func TestDaytonaStreamLogsClientDisconnect(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
@@ -1247,6 +1263,7 @@ func TestDaytonaStreamLogsClientDisconnect(t *testing.T) {
 }
 
 func TestDaytonaSessionCommandInputWithNewline(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-nl"})
 	rec := httptest.NewRecorder()
@@ -1288,6 +1305,7 @@ func TestNewDaytonaCommandIDRandFailure(t *testing.T) {
 }
 
 func TestHandleDaytonaSessionCreateDuplicateReturnsOK(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-dup-create"})
 	rec := httptest.NewRecorder()
@@ -1334,6 +1352,7 @@ func TestHandleUploadMissingFileAndPathRequired(t *testing.T) {
 }
 
 func TestHandleDaytonaSessionCreateValidationErrors(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 
 	rec := httptest.NewRecorder()
@@ -1364,6 +1383,7 @@ func TestStripSandboxPrefixExactID(t *testing.T) {
 }
 
 func TestHandleDaytonaSessionDeleteClearsCompatState(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-del-clear"})
 	rec := httptest.NewRecorder()
@@ -1501,6 +1521,7 @@ func TestWriteCodeRunScriptCoderunNotDirectory(t *testing.T) {
 }
 
 func TestHandleCodeRunNonZeroExitWithStderr(t *testing.T) {
+	requireHostExec(t)
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	payload, _ := json.Marshal(map[string]string{
 		"code":     "echo failed 1>&2; exit 7",

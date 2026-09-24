@@ -180,12 +180,12 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		timing.RecordStage("wasm_instantiate", time.Since(instStart))
 	}
 	// _start is deferred until expose_port enables wasip1 listen (HTTP) or Exec/Invoke (one-shot).
-	inst.status = models.SandboxStatusStarted
 	d.mu.Lock()
+	inst.status = models.SandboxStatusStarted
 	d.byID[sandboxID] = inst
+	state := d.runtimeState(inst)
 	d.mu.Unlock()
-
-	return d.runtimeState(inst), nil
+	return state, nil
 }
 
 // recordLoadSubStages emits the wasm_load breakdown as separate Server-Timing
@@ -246,6 +246,9 @@ func wasmArgs(req models.CreateSandboxRequest) []string {
 	return []string{"wasm"}
 }
 
+// runtimeState builds a fresh state snapshot from inst's current fields.
+// Caller must hold d.mu: sandboxInstance is owned by d.mu and its mutable
+// fields (status, socketPath, resolvedListenPort) must not be read unlocked.
 func (d *Driver) runtimeState(inst *sandboxInstance) *models.SandboxRuntimeState {
 	if inst == nil {
 		return nil

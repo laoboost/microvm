@@ -772,6 +772,25 @@ class ClientTests(unittest.TestCase):
         finally:
             client_module._load_websocket_module = original_loader
 
+    def test_exec_stream_rejects_oversized_message(self):
+        stdout_chunks = []
+        oversized = bytes([1]) + b"x" * (32 * 1024 * 1024)
+        fake_ws = FakeWebSocket([oversized, json.dumps({"type": "exit", "code": 0})])
+        fake_module = FakeWebSocketModule(fake_ws)
+        original_loader = client_module._load_websocket_module
+        client_module._load_websocket_module = lambda: fake_module
+        try:
+            client = RecordingMicroVM()
+            handle = client.exec_stream("sb-1", {"command": "bash", "onStdout": stdout_chunks.append})
+
+            with self.assertRaises(client_module.MicroVMError) as ctx:
+                handle.wait(2)
+
+            self.assertIn("exceeds", str(ctx.exception))
+            self.assertEqual(stdout_chunks, [], "oversized message must not reach onStdout")
+        finally:
+            client_module._load_websocket_module = original_loader
+
     def test_session_methods_map_api_shapes(self):
         client = RecordingMicroVM()
         sandbox = client.create({"image": "ubuntu:22.04"})
@@ -863,6 +882,25 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(fake_ws.sent[1], (b"pwd\n", 2))
             self.assertEqual(json.loads(fake_ws.sent[2][0]), {"type": "resize", "cols": 100, "rows": 30})
             self.assertEqual(json.loads(fake_ws.sent[3][0]), {"type": "signal", "signal": "INT"})
+        finally:
+            client_module._load_websocket_module = original_loader
+
+    def test_attach_session_rejects_oversized_message(self):
+        stdout_chunks = []
+        oversized = bytes([1]) + b"x" * (32 * 1024 * 1024)
+        fake_ws = FakeWebSocket([oversized, json.dumps({"type": "exit", "code": 0})])
+        fake_module = FakeWebSocketModule(fake_ws)
+        original_loader = client_module._load_websocket_module
+        client_module._load_websocket_module = lambda: fake_module
+        try:
+            client = RecordingMicroVM()
+            handle = client.attach_session("sb-1", "ses-1", {"onStdout": stdout_chunks.append})
+
+            with self.assertRaises(client_module.MicroVMError) as ctx:
+                handle.wait(2)
+
+            self.assertIn("exceeds", str(ctx.exception))
+            self.assertEqual(stdout_chunks, [], "oversized message must not reach onStdout")
         finally:
             client_module._load_websocket_module = original_loader
 

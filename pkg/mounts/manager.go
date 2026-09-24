@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"syscall"
 	"time"
@@ -127,6 +128,21 @@ func (m *Manager) Close() {
 	}
 }
 
+// sandboxIDPattern matches every sandbox id the manager is willing to join
+// into a host path. Anything else (separators, "..", whitespace, NUL) is
+// rejected so a caller-supplied id cannot traverse out of RootDir/CredDir.
+var sandboxIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// ValidateSandboxID reports whether s is safe to use as a single path segment
+// under the manager's directories. Every per-id path operation (MountAll,
+// UnmountAll, Sweep) must call it before touching the filesystem.
+func ValidateSandboxID(s string) error {
+	if !sandboxIDPattern.MatchString(s) {
+		return fmt.Errorf("invalid sandbox id %q", s)
+	}
+	return nil
+}
+
 // MountAll mounts every spec for a sandbox. The per-spec mounts are
 // independent (distinct host paths, distinct credential files), so they are
 // established concurrently — five serialized mount-s3 spawns are ~25s of
@@ -134,6 +150,9 @@ func (m *Manager) Close() {
 // slowest single mount. On any failure already-mounted entries are torn down
 // before returning.
 func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []models.MountSpec) ([]ContainerBind, error) {
+	if err := ValidateSandboxID(sandboxID); err != nil {
+		return nil, err
+	}
 	if len(mounts) == 0 {
 		return nil, nil
 	}
@@ -204,6 +223,9 @@ func (m *Manager) clearInFlight(sandboxID string) {
 
 // UnmountAll tears down every mount for a sandbox. Always best-effort.
 func (m *Manager) UnmountAll(sandboxID string) error {
+	if err := ValidateSandboxID(sandboxID); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	states := m.state[sandboxID]
 	delete(m.state, sandboxID)
@@ -269,6 +291,13 @@ func (m *Manager) Sweep(keep map[string]struct{}) {
 			continue
 		}
 		id := e.Name()
+		// A directory entry whose name is not a plausible sandbox id never came
+		// from MountAll — do nothing rather than feed an untrusted name to
+		// cleanupOrphanDir (defense-in-depth; ReadDir names cannot traverse).
+		if err := ValidateSandboxID(id); err != nil {
+			m.logger.Warn("mounts sweep: skipping invalid sandbox id entry", "sandbox_id", id, "error", err)
+			continue
+		}
 		if _, ok := keep[id]; ok {
 			continue
 		}

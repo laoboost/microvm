@@ -12,6 +12,7 @@ VERSION="latest"
 SANDBOXD_URL=""
 TOOLBOXD_URL=""
 CHECKSUMS_URL=""
+SKIP_CHECKSUM_VERIFY="false"
 IDLE_TIMEOUT_MIN="0"
 DNS_PROVIDER=""
 DNS_API_TOKEN=""
@@ -68,12 +69,21 @@ Usage: install.sh [options]
 Options:
   --domain <domain>            Base domain for wildcard sandbox routes
   --public-host <host-or-ip>   Public host used for IP mode or local URLs
-	--pat-token <token>          PAT token required for sandbox API requests
+	--pat-token <token>          PAT token required for sandbox API requests.
+                               WARNING: argv is visible in `ps` and shell
+                               history — prefer --pat-token-file or the
+                               SB_PAT_TOKEN environment variable.
+  --pat-token-file <path>      Read the PAT token from a root-only file
+                               instead of argv (preferred).
   --github-repo <owner/repo>   GitHub repo used for release downloads
   --version <tag|latest>       Release tag to install (default: latest)
   --sandboxd-url <url>         Download URL for sandboxd binary
   --toolboxd-url <url>         Download URL for toolboxd binary
   --checksums-url <url>        Download URL for release checksums file
+  --skip-checksum-verify       Escape hatch: install even when checksums are
+                               missing or fail to download. Downloads are
+                               SHA-256 verified by default and the install
+                               FAILS CLOSED when verification is impossible.
   --caddy-binary-url <url>     Download URL for a prebuilt custom Caddy binary
                                containing caddy-l4, caddy-dns/cloudflare, and
                                certmagic-s3. Defaults to the matching GitHub
@@ -92,6 +102,11 @@ Options:
   --dns-api-token <token>      API token for the configured DNS provider.
                                For cloudflare: a scoped API token with
                                Zone:Read + DNS:Edit on the target zone.
+                               WARNING: argv is visible in `ps` and shell
+                               history — prefer --dns-api-token-file or the
+                               SB_DNS_API_TOKEN environment variable.
+  --dns-api-token-file <path>  Read the DNS API token from a root-only file
+                               instead of argv (preferred).
   --acme-email <email>         Contact email registered with Let's Encrypt.
                                Lets ACME send cert-expiry and revocation
                                notices, and surfaces this account in any
@@ -177,8 +192,18 @@ Options:
                                Static access key. Optional — empty falls
                                back to the AWS default credential chain
                                (env vars, EC2 instance role, IRSA).
+                               WARNING: argv is visible in `ps` and shell
+                               history — prefer --caddy-storage-s3-access-key-file.
   --caddy-storage-s3-secret-key <secret>
                                Static secret key. Pair with access key.
+                               WARNING: argv is visible in `ps` and shell
+                               history — prefer --caddy-storage-s3-secret-key-file.
+  --caddy-storage-s3-access-key-file <path>
+                               Read the S3 access key from a root-only
+                               file instead of argv (preferred).
+  --caddy-storage-s3-secret-key-file <path>
+                               Read the S3 secret key from a root-only
+                               file instead of argv (preferred).
   --caddy-storage-s3-encryption-key <b64>
                                Base64-encoded 32-byte key used to encrypt
                                cert + private key bytes before upload.
@@ -187,6 +212,11 @@ Options:
                                SAME value on every node. Required when
                                --caddy-storage-s3 is set; losing it
                                renders stored certs unrecoverable.
+                               WARNING: argv is visible in `ps` and shell
+                               history — prefer --caddy-storage-s3-encryption-key-file.
+  --caddy-storage-s3-encryption-key-file <path>
+                               Read the encryption key from a root-only
+                               file instead of argv (preferred).
   --local                      Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
                                on both macOS and Linux. Docker Desktop (macOS)
@@ -197,11 +227,11 @@ Options:
   --help                       Show this help
 
 Examples:
-	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
+	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com --pat-token-file /root/pat-token
   ./scripts/install.sh --version v0.1.0 --public-host 203.0.113.42
-	./scripts/install.sh --public-host 203.0.113.42 --pat-token dev-token --build-from-source
-	./scripts/install.sh --domain sandbox.example.com --pat-token my-pat-token \
-	    --dns-provider cloudflare --dns-api-token cf-scoped-token
+	./scripts/install.sh --public-host 203.0.113.42 --pat-token-file /root/pat-token --build-from-source
+	./scripts/install.sh --domain sandbox.example.com --pat-token-file /root/pat-token \
+	    --dns-provider cloudflare --dns-api-token-file /root/dns-api-token
 EOF
 }
 
@@ -293,21 +323,30 @@ verify_downloads() {
 	local sandboxd_asset="$2"
 	local toolboxd_asset="$3"
 
-	if [[ -z "$CHECKSUMS_URL" ]]; then
+	if [[ "$SKIP_CHECKSUM_VERIFY" == "true" ]]; then
+		echo "Warning: --skip-checksum-verify given; installing WITHOUT checksum verification" >&2
 		return 0
 	fi
 
+	# Fail closed from here on: a missing/unreachable checksums file or a
+	# missing hash entry must abort the install, not silently skip the
+	# verification (the old behavior — supply-chain hole).
+	if [[ -z "$CHECKSUMS_URL" ]]; then
+		echo "Error: CHECKSUMS_URL is empty; cannot verify downloads. Pass --checksums-url, or --skip-checksum-verify to override." >&2
+		return 1
+	fi
+
 	if ! download_asset "$CHECKSUMS_URL" "$tmp_dir/checksums.txt"; then
-		echo "Warning: failed to download checksums; skipping verification" >&2
-		return 0
+		echo "Error: failed to download checksums from $CHECKSUMS_URL; refusing to install unverified binaries. Pass --skip-checksum-verify to override." >&2
+		return 1
 	fi
 
 	(
 		cd "$tmp_dir"
 		grep -E "[[:space:]](${sandboxd_asset}|${toolboxd_asset})$" checksums.txt > selected-checksums.txt || true
 		if [[ ! -s selected-checksums.txt ]]; then
-			echo "Warning: no checksum entries found for downloaded assets; skipping verification" >&2
-			exit 0
+			echo "Error: no checksum entries found for downloaded assets; refusing to install unverified binaries. Pass --skip-checksum-verify to override." >&2
+			exit 1
 		fi
 		sha256sum -c selected-checksums.txt
 	)
@@ -324,7 +363,12 @@ while [[ $# -gt 0 ]]; do
 			shift 2
 			;;
 		--pat-token)
+			echo "Warning: --pat-token on argv is visible in process listings and shell history; prefer --pat-token-file or the environment variable documented in --help" >&2
 			PAT_TOKEN="$2"
+			shift 2
+			;;
+		--pat-token-file)
+			PAT_TOKEN="$(cat "$2")"
 			shift 2
 			;;
 		--github-repo)
@@ -350,6 +394,10 @@ while [[ $# -gt 0 ]]; do
 			BUILD_FROM_SOURCE="false"
 			shift 2
 			;;
+		--skip-checksum-verify)
+			SKIP_CHECKSUM_VERIFY="true"
+			shift
+			;;
 		--caddy-binary-url)
 			CADDY_BINARY_URL="$2"
 			CADDY_BINARY_URL_EXPLICIT="true"
@@ -372,7 +420,12 @@ while [[ $# -gt 0 ]]; do
 			shift 2
 			;;
 		--dns-api-token)
+			echo "Warning: --dns-api-token on argv is visible in process listings and shell history; prefer --dns-api-token-file or the environment variable documented in --help" >&2
 			DNS_API_TOKEN="$2"
+			shift 2
+			;;
+		--dns-api-token-file)
+			DNS_API_TOKEN="$(cat "$2")"
 			shift 2
 			;;
 		--acme-email)
@@ -436,15 +489,30 @@ while [[ $# -gt 0 ]]; do
 			shift 2
 			;;
 		--caddy-storage-s3-access-key)
+			echo "Warning: --caddy-storage-s3-access-key on argv is visible in process listings and shell history; prefer --caddy-storage-s3-access-key-file" >&2
 			CADDY_STORAGE_S3_ACCESS_KEY="$2"
 			shift 2
 			;;
+		--caddy-storage-s3-access-key-file)
+			CADDY_STORAGE_S3_ACCESS_KEY="$(cat "$2")"
+			shift 2
+			;;
 		--caddy-storage-s3-secret-key)
+			echo "Warning: --caddy-storage-s3-secret-key on argv is visible in process listings and shell history; prefer --caddy-storage-s3-secret-key-file" >&2
 			CADDY_STORAGE_S3_SECRET_KEY="$2"
 			shift 2
 			;;
+		--caddy-storage-s3-secret-key-file)
+			CADDY_STORAGE_S3_SECRET_KEY="$(cat "$2")"
+			shift 2
+			;;
 		--caddy-storage-s3-encryption-key)
+			echo "Warning: --caddy-storage-s3-encryption-key on argv is visible in process listings and shell history; prefer --caddy-storage-s3-encryption-key-file" >&2
 			CADDY_STORAGE_S3_ENCRYPTION_KEY="$2"
+			shift 2
+			;;
+		--caddy-storage-s3-encryption-key-file)
+			CADDY_STORAGE_S3_ENCRYPTION_KEY="$(cat "$2")"
 			shift 2
 			;;
 		--help)
@@ -458,6 +526,15 @@ while [[ $# -gt 0 ]]; do
 			;;
 	esac
 done
+
+# Environment variables beat argv for secrets (nothing lands in `ps`); the
+# argv flags remain for backward compatibility but warn when used.
+if [[ -z "$PAT_TOKEN" && -n "${SB_PAT_TOKEN:-}" ]]; then
+	PAT_TOKEN="$SB_PAT_TOKEN"
+fi
+if [[ -z "$DNS_API_TOKEN" && -n "${SB_DNS_API_TOKEN:-}" ]]; then
+	DNS_API_TOKEN="$SB_DNS_API_TOKEN"
+fi
 
 if [[ -z "$PAT_TOKEN" ]]; then
 	if command -v openssl >/dev/null 2>&1; then
@@ -782,17 +859,25 @@ install_binaries() {
 	fi
 }
 
-write_environment() {
+# Body runs in a subshell so the umask below doesn't leak to later non-secret
+# writes (the Caddyfile must stay readable by the caddy service user).
+write_environment() (
+	# Secret-bearing env file (SB_PAT_TOKEN): create it 0600 from the first
+	# byte so it never has a world-readable window before the chmod at the end.
+	umask 077
 	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	cat > /etc/sandboxd/sandboxd.env <<EOF
 SB_PAT_TOKEN=$PAT_TOKEN
 SB_NODE_NAME=$NODE_NAME
-SB_API_HOST=0.0.0.0
+# Loopback by default: the API speaks plaintext HTTP with bearer PATs, and
+# Caddy reverse-proxies the public path to 127.0.0.1:21212. Binding 0.0.0.0
+# here would expose the PATs on the wire on every interface.
+SB_API_HOST=127.0.0.1
 SB_API_PORT=21212
 SB_DOMAIN=$DOMAIN
 SB_PUBLIC_HOST=$PUBLIC_HOST
-SB_CADDY_ADMIN_URL=http://127.0.0.1:2019
+SB_CADDY_ADMIN_URL=unix:///run/caddy/caddy-admin.sock
 SB_CADDY_SERVER_ID=srv0
 SB_DB_PATH=/var/lib/sandboxd/state.db
 SB_DOCKER_NETWORK=bridge
@@ -852,20 +937,26 @@ SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true
 EOF
 	fi
 	chmod 0600 /etc/sandboxd/sandboxd.env
-}
+)
 
 write_caddyfile() {
-	mkdir -p /etc/caddy
+	# Force /etc/caddy to 0755 root:root. The bootstrap runs install.sh under
+	# `umask 077` (sudo does not lower a umask), so a fresh mkdir as non-root
+	# would leave the dir 0700 and the caddy service user unable to traverse it.
+	install -d -m 0755 /etc/caddy
 	if [[ -z "$DOMAIN" ]]; then
 		cat > /etc/caddy/Caddyfile <<EOF
 {
-	admin localhost:2019
+	admin unix//run/caddy/caddy-admin.sock
 }
 
 :80 {
 	respond "Sandbox not found" 404
 }
 EOF
+		# No secrets in the Caddyfile (env references only); the caddy user
+		# must read it, and the bootstrap umask would otherwise leave it 0600.
+		chmod 0644 /etc/caddy/Caddyfile
 		return
 	fi
 
@@ -928,7 +1019,7 @@ EOF
 	fi
 	cat > /etc/caddy/Caddyfile <<EOF
 {
-	admin localhost:2019${email_line}
+	admin unix//run/caddy/caddy-admin.sock${email_line}
 	# caddy-l4 owns :443; the HTTPS sites below run on 127.0.0.1:8443 and
 	# only receive traffic forwarded from caddy-l4's SNI fallback route.
 	# Disable Caddy's auto-managed :80 -> :443 redirect since :443 isn't ours.
@@ -957,9 +1048,18 @@ https://*.$DOMAIN:8443 {
 	respond "Sandbox not found" 404
 }
 EOF
+	# The caddy user must be able to read its own config; the bootstrap umask
+	# (077) would otherwise create this 0600 and Caddy would fail to start.
+	chmod 0644 /etc/caddy/Caddyfile
 }
 
-write_caddy_env() {
+# Body runs in a subshell so the umask below doesn't leak to later non-secret
+# writes (the Caddyfile must stay readable by the caddy service user).
+write_caddy_env() (
+	# Secret-bearing env file (DNS API token, S3 credentials, encryption key):
+	# create it 0600 from the first byte so it never has a world-readable
+	# window before the chmod below.
+	umask 077
 	if [[ -z "$DNS_PROVIDER" && "$CADDY_STORAGE_S3" != "true" ]]; then
 		return
 	fi
@@ -1000,16 +1100,86 @@ write_caddy_env() {
 	} > /etc/default/caddy
 	chmod 0600 /etc/default/caddy
 	chown root:root /etc/default/caddy
-}
+)
 
 write_caddy_systemd_dropin() {
+	# Always ensure /run/caddy exists for the admin unix socket (the dir mode
+	# is the access gate — 0750 root:caddy). EnvironmentFile is only needed
+	# for the DNS/S3 credential-backed deployments.
+	mkdir -p /etc/systemd/system/caddy.service.d
 	if [[ -z "$DNS_PROVIDER" && "$CADDY_STORAGE_S3" != "true" ]]; then
+		cat > /etc/systemd/system/caddy.service.d/override.conf <<'EOF'
+[Service]
+RuntimeDirectory=caddy
+RuntimeDirectoryMode=0750
+EOF
 		return
 	fi
-	mkdir -p /etc/systemd/system/caddy.service.d
 	cat > /etc/systemd/system/caddy.service.d/override.conf <<'EOF'
 [Service]
+RuntimeDirectory=caddy
+RuntimeDirectoryMode=0750
 EnvironmentFile=/etc/default/caddy
+EOF
+}
+
+# systemd_hardening_block prints the shared [Service] hardening directives both
+# sandboxd unit writers splice in. Kept byte-identical to the canonical
+# reference copy at packaging/sandboxd.service (which nothing installs) so the
+# two never drift. Each directive is load-bearing; the capability list is
+# justified inline because removing an entry breaks a runtime silently (a
+# jailed VM that won't boot, an isolate that can't chown its chroot), not
+# loudly at unit start.
+systemd_hardening_block() {
+	cat <<'EOF'
+
+# --- Hardening ---------------------------------------------------------------
+# The daemon drives dockerd over its socket (no extra caps needed for that),
+# sets up sandbox networking, mounts FUSE/bind volumes, and runs the
+# Firecracker jailer (chroot + privilege drop).
+NoNewPrivileges=true
+#
+# Deliberately NO file-system-namespacing directives here (ProtectSystem=,
+# ProtectHome=, PrivateTmp=, ReadWritePaths=, ...). Why:
+#   sandboxd creates each per-sandbox external-storage mount under
+#   /var/lib/sandboxd/mounts/<id>/ and passes dockerd a plain "src:dst[:ro]"
+#   bind string (pkg/mounts + pkg/docker/client.go). dockerd runs in the host
+#   mount namespace and resolves that source path itself, so the mount has to
+#   propagate from sandboxd's namespace to the host.
+#   Every one of those directives instead puts the unit in a private mount
+#   namespace and remounts it MS_SLAVE, which turns OFF propagation towards
+#   the host. MountFlags=shared does not fix it — systemd.exec(5): "Setting
+#   this option to shared does not reestablish propagation in that case."
+#   Measured on a systemd host: a unit with only PrivateTmp=yes has root
+#   "shared:21 master:1" (a slave of the host's "shared:1"), and ProtectSystem=
+#   strict/full behave the same. In that namespace the FUSE mounts never reach
+#   dockerd: the container's bind source is an EMPTY directory — a silent,
+#   correct-looking data-shape failure for every external-storage sandbox on a
+#   hardened node (mount ok, bind ok, no error). So hardening that cannot
+#   silently break external storage stops at NoNewPrivileges= and the
+#   capability set below; neither creates a mount namespace. Do NOT reintroduce
+#   ProtectSystem/ProtectHome/PrivateTmp/ReadWritePaths without first proving
+#   end-to-end that a sandbox's external-storage bind is still non-empty.
+# Minimal capability set — each entry justified:
+#   CAP_NET_ADMIN        iptables/nftables rule programming (netrules) and
+#                        sandbox bridge/netns plumbing.
+#   CAP_NET_BIND_SERVICE host binds below 1024 when L4/SSH listen overrides
+#                        are configured (defaults stay high-ported).
+#   CAP_SYS_ADMIN        mount/umount of FUSE + bind volumes and network
+#                        namespace setup for sandboxes.
+#   CAP_SYS_CHROOT       Firecracker jailer / isolate chroot into their
+#                        per-VM / per-group roots.
+#   CAP_CHOWN            chown sandbox artifacts to the jailer uid/gid
+#                        (os.Chown in the firecracker driver; SB_JAILER_UID/GID
+#                        default 1000). Without it the chown is EPERM and
+#                        jailed VMs fail to boot.
+#   CAP_MKNOD            the Firecracker jailer mknods /dev/kvm and
+#                        /dev/net/tun inside each chroot.
+#   CAP_DAC_OVERRIDE     write sandbox artifacts regardless of the modes the
+#                        jailer/isolate trees carry.
+#   CAP_SETUID/CAP_SETGID jailer privilege drop to jailer_uid/jailer_gid.
+#   CAP_SETPCAP          jailer capability bounding while dropping privs.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_CHOWN CAP_MKNOD CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_SETPCAP
 EOF
 }
 
@@ -1029,16 +1199,19 @@ EnvironmentFile=/etc/sandboxd/sandboxd.env
 ExecStartPre=/bin/mkdir -p /var/lib/sandboxd/mounts /run/sandboxd
 ExecStartPre=/bin/chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd
 ExecStart=$INSTALL_PREFIX/sandboxd
-# MountFlags=shared lets bind-mounts created by sandboxd (FUSE mounts under
-# /var/lib/sandboxd/mounts/<id>/) propagate into the Docker daemon's view
-# so containers actually see the storage. Without this some configurations
-# leave the daemon with a private mount namespace and the bind appears empty.
+# MountFlags=shared keeps the unit's mount namespace in the host's shared
+# propagation group so bind-mounts sandboxd creates (FUSE mounts under
+# /var/lib/sandboxd/mounts/<id>/) propagate into dockerd's view and containers
+# actually see the storage. This ONLY holds while the unit carries no
+# file-system-namespacing directive — see the Hardening block below for why
+# those would silently break it.
 MountFlags=shared
 Restart=always
 RestartSec=5
 TimeoutStartSec=60
 TimeoutStopSec=30
 KillMode=control-group
+$(systemd_hardening_block)
 
 [Install]
 WantedBy=multi-user.target
@@ -1458,7 +1631,14 @@ PY
 	systemctl restart docker
 }
 
-write_local_environment() {
+# Body runs in a subshell so the umask below doesn't leak to later writes. Note
+# that the launchd plist DOES carry SB_PAT_TOKEN in EnvironmentVariables (unlike
+# the local systemd unit, which reads it from the 0600 env file) — hence the
+# explicit 0600 in write_launchd_plist.
+write_local_environment() (
+	# Secret-bearing env file (SB_PAT_TOKEN): create it 0600 from the first
+	# byte so it never has a world-readable window before the chmod at the end.
+	umask 077
 	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	cat > /etc/sandboxd/sandboxd.env <<EOF
@@ -1488,7 +1668,7 @@ SB_L4_TLS_LISTEN=
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
-}
+)
 
 write_local_systemd_unit() {
 	cat > /etc/systemd/system/sandboxd.service <<EOF
@@ -1512,6 +1692,7 @@ RestartSec=5
 TimeoutStartSec=60
 TimeoutStopSec=30
 KillMode=control-group
+$(systemd_hardening_block)
 
 [Install]
 WantedBy=multi-user.target
@@ -1579,6 +1760,10 @@ write_launchd_plist() {
 </dict>
 </plist>
 EOF
+	# The plist embeds SB_PAT_TOKEN in EnvironmentVariables: 0600, not the
+	# default, so it is not world-readable. launchd only requires it be
+	# root-owned and not group/other-writable.
+	chmod 0600 "$plist_path"
 }
 
 if [[ "$LOCAL_MODE" == "true" ]]; then
@@ -1607,8 +1792,8 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		systemctl enable --now sandboxd sandboxd-healthcheck.timer
 	fi
 	echo "AerolVM installed (local mode)"
-	echo "PAT token: $PAT_TOKEN"
-	echo "Use header: Authorization: Bearer <PAT token>"
+	echo "PAT token: stored in /etc/sandboxd/sandboxd.env — view with: sudo cat /etc/sandboxd/sandboxd.env"
+	echo "Use header: Authorization: Bearer <value of the token in sandboxd.env>"
 	echo "API URL: http://127.0.0.1:21212"
 	echo "Health URL: http://127.0.0.1:21212/health"
 	if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -1661,8 +1846,8 @@ systemctl daemon-reload
 systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
 
 echo "AerolVM installed"
-echo "PAT token: $PAT_TOKEN"
-echo "Use header: Authorization: Bearer <PAT token>"
+echo "PAT token: stored in /etc/sandboxd/sandboxd.env — view with: sudo cat /etc/sandboxd/sandboxd.env"
+echo "Use header: Authorization: Bearer <value of the token in sandboxd.env>"
 if [[ -n "$DOMAIN" ]]; then
 	echo "API URL: https://$DOMAIN"
 	echo "Health URL: https://$DOMAIN/health"

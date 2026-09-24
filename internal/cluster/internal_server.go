@@ -63,21 +63,22 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 		if applyErr := applyHandler(r.Context(), body); applyErr != nil {
 			if errors.Is(applyErr, ErrNotLeader) {
 				// 503 mirrors the existing public-API leader-forward semantics:
-				// the forwarder retries against a refreshed leader URL.
-				http.Error(w, applyErr.Error(), http.StatusServiceUnavailable)
+				// the forwarder retries a bounded number of times against a
+				// refreshed leader URL.
+				writeInternalError(w, http.StatusServiceUnavailable, applyErr)
 				return
 			}
 			if errors.Is(applyErr, ErrCreateBackpressure) {
 				w.Header().Set("Retry-After", fmt.Sprint(CreateBackpressureRetryAfterSeconds))
-				http.Error(w, applyErr.Error(), http.StatusTooManyRequests)
+				writeInternalError(w, http.StatusTooManyRequests, applyErr)
 				return
 			}
 			if errors.Is(applyErr, ErrCapacityExceeded) || errors.Is(applyErr, ErrNoPlacementTarget) {
 				w.Header().Set("Retry-After", fmt.Sprint(CapacityRetryAfterSeconds))
-				http.Error(w, applyErr.Error(), http.StatusServiceUnavailable)
+				writeInternalError(w, http.StatusServiceUnavailable, applyErr)
 				return
 			}
-			http.Error(w, applyErr.Error(), http.StatusInternalServerError)
+			writeInternalError(w, http.StatusInternalServerError, applyErr)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)

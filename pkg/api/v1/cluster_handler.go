@@ -736,12 +736,25 @@ func (h *handlers) clusterDestroyWrap(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		if err := c.DeletePlacement(commitCtx, id); err != nil {
 			// Local destroy already succeeded; surface a warning but don't
-			// fail the response — reconcile catches ghost rows.
+			// fail the response. The FSM may still hold a Placed row — reconcile
+			// does NOT catch these ghost rows before the owner watcher can
+			// resurrect the sandbox from one, so tombstone the id here to keep
+			// it dead. (A successful DeletePlacement plants its own tombstone.)
+			if dd, ok := c.(deliberateDeleter); ok {
+				dd.MarkDeliberatelyDeleted(id)
+			}
 			h.deps.Logger.Warn("cluster: DeletePlacement after destroy failed",
 				"sandbox_id", id, "err", err)
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// deliberateDeleter is the optional capability to tombstone a deliberately
+// destroyed sandbox id so the owner watcher cannot recreate it from a
+// leftover Placed row. Implemented by *cluster.Cluster.
+type deliberateDeleter interface {
+	MarkDeliberatelyDeleted(sandboxID string)
 }
 
 // memberView extends cluster.Member with the FSM-derived drain bit so the

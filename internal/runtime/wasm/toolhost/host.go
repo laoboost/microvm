@@ -10,6 +10,16 @@ import (
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
+// hostExecDefault is the process-wide default for host-exec routes. Production
+// leaves it false: the wasm runtime has no container or process jail, so every
+// route that would spawn a host process (exec stream, code-run, sessions/daytona
+// shell create and exec) stays registered but fails closed with 501. Tests opt
+// in through EnableHostExecForTest so the enabled path is actually exercised.
+var hostExecDefault = false
+
+// hostExecDisabledMsg is the fail-closed error body for host-exec routes.
+const hostExecDisabledMsg = "host process execution is disabled: wasm runtime has no process jail"
+
 // Host serves toolbox HTTP routes against a sandbox workdir on the host.
 type Host struct {
 	sandboxID string
@@ -19,6 +29,10 @@ type Host struct {
 	stateKV   StateKV
 	sessions  *sessions.Manager
 	daytona   *daytonaCompat
+	// hostExecEnabled is the per-host fail-closed gate for host-process routes.
+	// It is baked in at New from Config.HostExecEnabled (production: false) or
+	// hostExecDefault (tests).
+	hostExecEnabled bool
 }
 
 // Config wires a toolbox host for one sandbox.
@@ -29,17 +43,22 @@ type Config struct {
 	Exec      Executor
 	StateKV   StateKV
 	Sessions  *sessions.Manager
+	// HostExecEnabled turns on the routes that spawn a real host process. The
+	// production daemon leaves it false (fail-closed: no jail); it is the
+	// injectable counterpart to hostExecDefault.
+	HostExecEnabled bool
 }
 
 // New constructs a toolbox host.
 func New(cfg Config) *Host {
 	h := &Host{
-		sandboxID: cfg.SandboxID,
-		workDir:   cfg.WorkDir,
-		authToken: cfg.AuthToken,
-		exec:      cfg.Exec,
-		stateKV:   cfg.StateKV,
-		sessions:  cfg.Sessions,
+		sandboxID:       cfg.SandboxID,
+		workDir:         cfg.WorkDir,
+		authToken:       cfg.AuthToken,
+		exec:            cfg.Exec,
+		stateKV:         cfg.StateKV,
+		sessions:        cfg.Sessions,
+		hostExecEnabled: cfg.HostExecEnabled || hostExecDefault,
 	}
 	if h.sessions != nil {
 		h.daytona = newDaytonaCompat()

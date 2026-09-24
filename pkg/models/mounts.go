@@ -142,6 +142,16 @@ const (
 	MaxCredentialBytes = 4096
 )
 
+// awsINICredentialKeys are the credential values the s3 adapter splices into a
+// line-oriented AWS shared-credentials INI file (buildAWSCredentialsFile in
+// pkg/mounts/adapters). Only these must reject embedded newlines; other
+// credential payloads (rclone_conf, private_key_pem) are multi-line by nature.
+var awsINICredentialKeys = map[string]struct{}{
+	"access_key_id":     {},
+	"secret_access_key": {},
+	"session_token":     {},
+}
+
 // sensitiveTargets are paths the daemon refuses to let users override with a
 // mount. Mounting any of these would either break the toolbox / shell or
 // allow shadowing system files.
@@ -189,6 +199,12 @@ func (m *MountSpec) Validate(toolboxMountPath string) error {
 	if strings.Contains(target, "..") {
 		return fmt.Errorf("target must not contain ..: %q", target)
 	}
+	// Docker binds are colon-joined "src:dst[:opts]" with option lists split
+	// on commas — a ':' or ',' here would inject bind options (e.g. Target
+	// "/data:rshared" becomes an rshared-propagation mount).
+	if strings.ContainsAny(target, ":,") {
+		return fmt.Errorf("target must not contain ':' or ',': %q", target)
+	}
 	if _, blocked := sensitiveTargets[cleaned]; blocked {
 		return fmt.Errorf("target %q is reserved", cleaned)
 	}
@@ -208,8 +224,16 @@ func (m *MountSpec) Validate(toolboxMountPath string) error {
 	}
 	totalBytes := 0
 	for k, v := range m.Credentials {
-		if strings.ContainsAny(k, "\n\x00") || strings.ContainsAny(v, "\x00") {
+		if strings.ContainsAny(k, "\n\x00") || strings.ContainsRune(v, '\x00') {
 			return errors.New("credentials must not contain null bytes or newlines in keys")
+		}
+		// Newlines are only dangerous for values spliced line-by-line into the
+		// AWS shared-credentials INI (buildAWSCredentialsFile); there a value
+		// like "secret\n[evil]" injects a new profile/line. rclone_conf and
+		// private_key_pem are whole multi-line files by design and never enter
+		// that file, so they must be allowed to carry newlines.
+		if _, spliced := awsINICredentialKeys[k]; spliced && strings.ContainsAny(v, "\n\r") {
+			return errors.New("credentials must not contain newlines in values written to the AWS credentials file")
 		}
 		totalBytes += len(k) + len(v)
 	}
@@ -242,9 +266,8 @@ func validateSource(t MountType, source string) error {
 			return fmt.Errorf("nfs source must look like host:/path: %q", source)
 		}
 	case MountTypeSSHFS:
-		// Format: user@host:/path
-		if !strings.Contains(source, "@") || !strings.Contains(source, ":") {
-			return fmt.Errorf("sshfs source must look like user@host:/path: %q", source)
+		if err := ValidateSSHFSSource(source); err != nil {
+			return err
 		}
 	case MountTypeRclone:
 		// Format: remote:path (rclone's own syntax). Refuse a bare local path.
@@ -253,6 +276,48 @@ func validateSource(t MountType, source string) error {
 		}
 	}
 	return nil
+}
+
+// ValidateSSHFSSource enforces the strict user@host:/path grammar sshfs
+// expects. The source is handed to ssh(1) as root: the host must be a plain
+// [A-Za-z0-9._-]+ name that cannot be parsed as an ssh option (no leading
+// '-', e.g. "-oProxyCommand=..."), and no whitespace is allowed anywhere
+// (argv/option injection such as "@-oProxyCommand=sh -c 'x':/").
+//
+// Exported so the sshfs adapter (pkg/mounts/adapters) re-applies the exact
+// same grammar as defense-in-depth rather than keeping a second copy that can
+// drift from this one.
+func ValidateSSHFSSource(source string) error {
+	if strings.ContainsAny(source, " \t\n\r") {
+		return fmt.Errorf("sshfs source must not contain whitespace: %q", source)
+	}
+	user, rest, ok := strings.Cut(source, "@")
+	if !ok || !isSafeSSHFSName(user) {
+		return fmt.Errorf("sshfs source must look like user@host:/path: %q", source)
+	}
+	host, remotePath, ok := strings.Cut(rest, ":")
+	if !ok || !isSafeSSHFSName(host) || !strings.HasPrefix(remotePath, "/") {
+		return fmt.Errorf("sshfs source must look like user@host:/path: %q", source)
+	}
+	return nil
+}
+
+// isSafeSSHFSName matches the only charset accepted for the user and host
+// components of an sshfs source; it rejects flag-like names and anything
+// that could break the user@host:/path shape.
+func isSafeSSHFSName(s string) bool {
+	if s == "" || strings.HasPrefix(s, "-") {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // Redact strips credentials, returning the user-safe view.

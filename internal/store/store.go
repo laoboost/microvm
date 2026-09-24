@@ -3901,7 +3901,10 @@ func isSQLiteUniqueConstraint(err error) bool {
 }
 
 func isSandboxNameConflict(err error, name string) bool {
-	if strings.Contains(err.Error(), ErrSandboxNameConflict.Error()) {
+	// Classify by error IDENTITY (C6f): a sentinel that crossed a node or
+	// wrapper boundary must still errors.Is-match here. Raw SQLite unique
+	// constraints classify via the driver error shape below.
+	if errors.Is(err, ErrSandboxNameConflict) {
 		return true
 	}
 	return strings.TrimSpace(name) != "" && isSQLiteUniqueConstraint(err)
@@ -3911,7 +3914,7 @@ func isSandboxIDConflict(err error, id string) bool {
 	if strings.TrimSpace(id) == "" {
 		return false
 	}
-	if strings.Contains(err.Error(), models.ErrSandboxExists.Error()) {
+	if errors.Is(err, models.ErrSandboxExists) {
 		return true
 	}
 	return isSQLiteUniqueConstraint(err)

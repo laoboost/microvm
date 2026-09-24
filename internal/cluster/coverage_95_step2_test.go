@@ -6,7 +6,6 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -22,7 +21,8 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// failPutRecoveryStore forces storePlacementLocked error paths through Put.
+// failPutRecoveryStore forces the recovery Put fallback path: every Put
+// fails as if local I/O broke, and the FSM must keep applying deterministically.
 type failPutRecoveryStore struct{}
 
 func (failPutRecoveryStore) Put(string, placementRecovery) (string, error) {
@@ -229,14 +229,22 @@ func TestFSMApplyUncoveredBranchesStep2(t *testing.T) {
 	}
 }
 
-func TestFSMStorePlacementRecoveryPutFailure(t *testing.T) {
+// TestFSMStorePlacementRecoveryPutFailureFallsBackInline pins the C6a
+// fallback contract: a failing recovery Put must not error the apply — the
+// recovery payload is kept inline and the placement is stored like any other
+// replica would store it.
+func TestFSMStorePlacementRecoveryPutFailureFallsBackInline(t *testing.T) {
 	fsm := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
 	got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-fail", OwnerNodeID: "a",
 		Spec: &models.CreateSandboxRequest{Image: "alpine"},
 	})
-	if got == nil || !strings.Contains(fmt.Sprint(got), "forced put failure") {
-		t.Fatalf("storePlacement Put failure = %v", got)
+	if got != nil {
+		t.Fatalf("storePlacement Put failure = %v, want nil (inline fallback)", got)
+	}
+	p, ok := fsm.get("sb-fail")
+	if !ok || p.Spec == nil || p.Spec.Image != "alpine" {
+		t.Fatalf("placement after Put fallback = %+v ok=%v, want hydrated spec", p, ok)
 	}
 }
 

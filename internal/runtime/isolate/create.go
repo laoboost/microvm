@@ -81,5 +81,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	d.mu.Unlock()
 	d.touchGroup(groupKey)
-	return state, nil
+	// Hand back a copy: the byID record stays owned by d.mu (Stop and
+	// markGroupMembersStopped write rec.state.Status under the lock), so a
+	// shared pointer would let callers race on the struct fields.
+	c := *state
+	return &c, nil
 }

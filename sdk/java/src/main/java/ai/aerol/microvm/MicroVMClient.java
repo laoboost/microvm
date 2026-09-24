@@ -67,6 +67,7 @@ public class MicroVMClient {
     static final String AUTH_REQUIRED_ERROR_MESSAGE = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
     private static final int STREAM_PREFIX_STDOUT = 0x01;
     private static final int STREAM_PREFIX_STDERR = 0x02;
+    private static final int MAX_REDIRECTS = 5;
 
     private static final java.util.Map<String, String> PATH_PREFIXES = java.util.Map.of(
         "v1", Paths.PATH_PREFIX
@@ -104,7 +105,19 @@ public class MicroVMClient {
             throw new MicroVMException("unsupported apiVersion: " + this.apiVersion);
         }
         this.versionPrefix = prefix;
-        this.httpClient = httpClient != null ? httpClient : effectiveConfig.httpClient != null ? effectiveConfig.httpClient : HttpClient.newHttpClient();
+        HttpClient resolvedClient = httpClient != null
+            ? httpClient
+            : effectiveConfig.httpClient != null
+                ? effectiveConfig.httpClient
+                : HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build();
+        if (resolvedClient.followRedirects() != HttpClient.Redirect.NEVER) {
+            throw new MicroVMException(
+                "MicroVMConfig.setHttpClient requires HttpClient.Redirect.NEVER: a redirect-following client "
+                    + "replays Authorization and X-Registry-* credentials across origins inside the JDK, before "
+                    + "the SDK's redirect policy can strip them"
+            );
+        }
+        this.httpClient = resolvedClient;
         this.webSocketConnector = webSocketConnector != null ? webSocketConnector : new JavaNetWebSocketConnector(this.httpClient);
         this.retryConfig = effectiveConfig.retry != null ? effectiveConfig.retry : new ai.aerol.microvm.model.RetryConfig();
 
@@ -157,8 +170,8 @@ public class MicroVMClient {
     /**
      * Build an Image and optionally push the result to a remote registry.
      * When {@code options.push} is set, push credentials are forwarded to the
-     * daemon as a one-shot {@code X-Registry-Auth} header on the underlying
-     * push call and are never persisted server-side.
+     * daemon in the {@code push} object of the {@code POST /v1/images/build}
+     * request body and are never persisted server-side.
      */
     public BuildImageResult buildImage(Image image, BuildImageOptions options) {
         if (image == null) {
@@ -335,11 +348,11 @@ public class MicroVMClient {
     }
 
     public Template getTemplate(String templateId) {
-        return doJson("GET", versioned("/templates/" + templateId), null, Template.class);
+        return doJson("GET", versioned("/templates/" + resourcePath(templateId)), null, Template.class);
     }
 
     public void deleteTemplate(String templateId) {
-        doNoContent("DELETE", versioned("/templates/" + templateId), null);
+        doNoContent("DELETE", versioned("/templates/" + resourcePath(templateId)), null);
     }
 
     /**
@@ -363,11 +376,11 @@ public class MicroVMClient {
     }
 
     public WasmModule getWasmModule(String moduleId) {
-        return doJson("GET", versioned("/wasm-modules/" + moduleId), null, WasmModule.class);
+        return doJson("GET", versioned("/wasm-modules/" + resourcePath(moduleId)), null, WasmModule.class);
     }
 
     public void deleteWasmModule(String moduleId) {
-        doNoContent("DELETE", versioned("/wasm-modules/" + moduleId), null);
+        doNoContent("DELETE", versioned("/wasm-modules/" + resourcePath(moduleId)), null);
     }
 
     /**
@@ -419,7 +432,7 @@ public class MicroVMClient {
      * delete+recreate today).
      */
     public Template rebuildTemplate(String templateId) {
-        return doJson("POST", versioned("/templates/" + templateId + "/rebuild"), null, Template.class);
+        return doJson("POST", versioned("/templates/" + resourcePath(templateId) + "/rebuild"), null, Template.class);
     }
 
     public Sandbox resize(String sandboxId, ResizeOptions options) {
@@ -940,19 +953,8 @@ public class MicroVMClient {
         Exception lastException = null;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
-            HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path)).method(method, bodyPublisher);
-            if (contentType != null) {
-                builder.header("Content-Type", contentType);
-            }
-            if (extraHeaders != null) {
-                for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
-                    builder.header(entry.getKey(), entry.getValue());
-                }
-            }
-            builder.header("Authorization", authorizationHeaderValue());
-
             try {
-                HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+                HttpResponse<byte[]> response = sendFollowingRedirects(method, resolve(path), bodyPublisher, contentType, extraHeaders);
                 int status = response.statusCode();
                 if ((status == 429 || status == 502 || status == 503 || status == 504) && attempt < maxRetries) {
                     // Fall through to retry logic
@@ -984,6 +986,144 @@ public class MicroVMClient {
             throw new MicroVMException("request failed after " + maxRetries + " retries", lastException);
         }
         throw new MicroVMException("request failed after " + maxRetries + " retries");
+    }
+
+    /**
+     * Sends one request, following redirects manually (up to
+     * {@value #MAX_REDIRECTS} hops) with a hardened policy: a redirect to a
+     * different scheme/host/port never carries {@code Authorization} or the
+     * {@code X-Registry-*} credentials, and a 307/308 that would replay a
+     * request body cross-origin is refused instead of followed.
+     *
+     * <p>The transport must not follow redirects itself: it would replay those
+     * credentials (and a 307/308 body) with no origin check, and this method
+     * would only ever see the final response. The client is therefore rejected
+     * at construction unless its policy is {@link HttpClient.Redirect#NEVER};
+     * {@link #ensureTransportDidNotRedirect} is a second, post-send guard for a
+     * transport that redirected anyway.
+     */
+    private HttpResponse<byte[]> sendFollowingRedirects(
+        String method,
+        URI uri,
+        HttpRequest.BodyPublisher bodyPublisher,
+        String contentType,
+        Map<String, String> extraHeaders
+    ) throws IOException, InterruptedException {
+        URI origin = uri;
+        String currentMethod = method;
+        URI currentURI = uri;
+        HttpRequest.BodyPublisher currentBody = bodyPublisher;
+        String currentContentType = contentType;
+        Map<String, String> currentHeaders = extraHeaders;
+
+        for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
+            boolean crossOrigin = isCrossOrigin(origin, currentURI);
+            HttpRequest.Builder builder = HttpRequest.newBuilder(currentURI).method(currentMethod, currentBody);
+            if (currentContentType != null) {
+                builder.header("Content-Type", currentContentType);
+            }
+            if (currentHeaders != null) {
+                for (Map.Entry<String, String> entry : currentHeaders.entrySet()) {
+                    builder.header(entry.getKey(), entry.getValue());
+                }
+            }
+            if (!crossOrigin) {
+                builder.header("Authorization", authorizationHeaderValue());
+            }
+
+            HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+            ensureTransportDidNotRedirect(response, currentURI);
+            int status = response.statusCode();
+            if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) {
+                return response;
+            }
+            String location = response.headers().firstValue("Location").orElse(null);
+            if (location == null) {
+                return response;
+            }
+            URI next = currentURI.resolve(location);
+            boolean nextCrossOrigin = isCrossOrigin(origin, next);
+            if (nextCrossOrigin && (status == 307 || status == 308) && hasRequestBody(currentBody)) {
+                throw new MicroVMException("refusing to follow cross-origin redirect with a request body");
+            }
+            if (status == 303 || ((status == 301 || status == 302)
+                && !"GET".equals(currentMethod) && !"HEAD".equals(currentMethod))) {
+                currentMethod = "GET";
+                currentBody = HttpRequest.BodyPublishers.noBody();
+                currentContentType = null;
+            }
+            if (nextCrossOrigin) {
+                currentHeaders = withoutCredentialHeaders(currentHeaders);
+            }
+            currentURI = next;
+        }
+        throw new MicroVMException("stopped after " + MAX_REDIRECTS + " redirects");
+    }
+
+    private static boolean hasRequestBody(HttpRequest.BodyPublisher bodyPublisher) {
+        return bodyPublisher != null && bodyPublisher.contentLength() != 0;
+    }
+
+    /**
+     * Fails closed if the transport itself followed a redirect: the JDK would
+     * have replayed {@code Authorization} / {@code X-Registry-*} (and any
+     * 307/308 body) with no origin check, and this method's manual policy never
+     * ran. The client is already required to be
+     * {@link HttpClient.Redirect#NEVER}; this guards a transport that reports
+     * that policy yet still redirects.
+     */
+    private static void ensureTransportDidNotRedirect(HttpResponse<?> response, URI requested) {
+        URI received = response.uri();
+        HttpRequest sentRequest = response.request();
+        URI sent = sentRequest == null ? null : sentRequest.uri();
+        if (sameURI(requested, received) && sameURI(requested, sent)) {
+            return;
+        }
+        throw new MicroVMException(
+            "the transport followed an HTTP redirect; MicroVMConfig.setHttpClient requires "
+                + "HttpClient.Redirect.NEVER so the SDK can strip credentials on cross-origin hops"
+        );
+    }
+
+    private static boolean sameURI(URI expected, URI actual) {
+        if (actual == null || expected.getHost() == null || actual.getHost() == null) {
+            return false;
+        }
+        return expected.getScheme() != null && expected.getScheme().equalsIgnoreCase(actual.getScheme())
+            && expected.getHost().equalsIgnoreCase(actual.getHost())
+            && effectivePort(expected) == effectivePort(actual)
+            && expected.getRawPath().equals(actual.getRawPath());
+    }
+
+    // isCrossOrigin reports whether two URIs differ in scheme, host, or port.
+    private static boolean isCrossOrigin(URI a, URI b) {
+        String schemeA = a.getScheme() == null ? "" : a.getScheme().toLowerCase();
+        String schemeB = b.getScheme() == null ? "" : b.getScheme().toLowerCase();
+        String hostA = a.getHost() == null ? "" : a.getHost().toLowerCase();
+        String hostB = b.getHost() == null ? "" : b.getHost().toLowerCase();
+        return !schemeA.equals(schemeB) || !hostA.equals(hostB) || effectivePort(a) != effectivePort(b);
+    }
+
+    private static int effectivePort(URI uri) {
+        if (uri.getPort() != -1) {
+            return uri.getPort();
+        }
+        return "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
+    }
+
+    private static Map<String, String> withoutCredentialHeaders(Map<String, String> headers) {
+        if (headers == null) {
+            return null;
+        }
+        Map<String, String> filtered = new HashMap<String, String>();
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            String key = entry.getKey();
+            if ("X-Registry-Token".equalsIgnoreCase(key) || "X-Registry-Username".equalsIgnoreCase(key)) {
+                continue;
+            }
+            filtered.put(key, entry.getValue());
+        }
+        return filtered;
     }
 
     private void ensureSuccess(HttpResponse<byte[]> response) {
@@ -1026,11 +1166,20 @@ public class MicroVMClient {
     }
 
     private String sandboxPath(String sandboxId) {
-        return versioned("/sandboxes/" + encodePathSegment(sandboxId));
+        return versioned("/sandboxes/" + resourcePath(sandboxId));
     }
 
     private static String normalizeUrl(String value) {
         return value.replaceAll("/+$", "");
+    }
+
+    /**
+     * resourcePath percent-escapes a caller-supplied ID so it always stays a
+     * single URL path segment. Without this, an id like "x/../admin"
+     * traverses out of its route when concatenated into a request path.
+     */
+    private static String resourcePath(String id) {
+        return encodePathSegment(id);
     }
 
     private static String encodePathSegment(String value) {
@@ -1073,6 +1222,10 @@ public class MicroVMClient {
     }
 
     private static byte[] buildMultipartBody(String boundary, String targetPath, byte[] data) {
+        // targetPath and its basename are spliced raw into MIME headers/parts;
+        // CR/LF or quotes there enable part/header injection.
+        validateMultipartText("targetPath", targetPath);
+        validateMultipartText("filename", baseName(targetPath));
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         try {
             writePart(output, boundary, "path", null, "text/plain; charset=UTF-8", targetPath.getBytes(StandardCharsets.UTF_8));
@@ -1081,6 +1234,20 @@ public class MicroVMClient {
             return output.toByteArray();
         } catch (IOException ex) {
             throw new MicroVMException("failed to build multipart request", ex);
+        }
+    }
+
+    private static void validateMultipartText(String label, String value) {
+        if (value == null) {
+            return;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (ch == '\r' || ch == '\n' || ch == '"') {
+                throw new MicroVMException(
+                    label + " must not contain CR, LF, or quote characters"
+                );
+            }
         }
     }
 

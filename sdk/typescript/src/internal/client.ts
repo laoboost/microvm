@@ -385,14 +385,14 @@ export class APIClient {
   readonly baseURL: string;
   readonly apiVersion: APIVersion;
 
-  private readonly patToken: string;
+  #patToken: string;
   private readonly fetchFn: FetchLike;
   private readonly versionPrefix: string;
   private readonly retryConfig: Required<RetryConfig>;
 
   constructor(config: APIClientConfig) {
     this.baseURL = stripTrailingSlashes(config.baseURL);
-    this.patToken = config.patToken ?? "";
+    this.#patToken = config.patToken ?? "";
     this.fetchFn = config.fetch ?? fetch;
     this.apiVersion = config.apiVersion ?? DEFAULT_API_VERSION;
     this.versionPrefix = PATH_PREFIXES[this.apiVersion];
@@ -496,22 +496,22 @@ export class APIClient {
   }
 
   async get(id: string): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("GET", `${this.versionPrefix}/sandboxes/${id}`);
+    const response = await this.doJSON<ApiSandbox>("GET", `${this.versionPrefix}/sandboxes/${resourcePath(id)}`);
     return this.wrap(response);
   }
 
   async start(id: string): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${id}/start`);
+    const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/start`);
     return this.wrap(response);
   }
 
   async stop(id: string): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${id}/stop`);
+    const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/stop`);
     return this.wrap(response);
   }
 
 	async createSnapshot(id: string, name: string): Promise<SandboxSnapshot> {
-		const response = await this.doJSON<ApiSandboxSnapshot>("POST", `${this.versionPrefix}/sandboxes/${id}/snapshot`, { name });
+		const response = await this.doJSON<ApiSandboxSnapshot>("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/snapshot`, { name });
 		return fromApiSandboxSnapshot(response);
 	}
 
@@ -557,65 +557,65 @@ export class APIClient {
   }
 
   async destroy(id: string): Promise<void> {
-    await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}`);
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${resourcePath(id)}`);
   }
 
   async resize(id: string, options: ResizeOptions): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${id}/resize`, toApiResizeOptions(options));
+    const response = await this.doJSON<ApiSandbox>("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/resize`, toApiResizeOptions(options));
     return this.wrap(response);
   }
 
   async updateLifecycle(id: string, lifecycle: Lifecycle): Promise<SandboxResource> {
-    const response = await this.doJSON<ApiSandbox>("PUT", `${this.versionPrefix}/sandboxes/${id}/lifecycle`, toApiLifecycle(lifecycle));
+    const response = await this.doJSON<ApiSandbox>("PUT", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/lifecycle`, toApiLifecycle(lifecycle));
     return this.wrap(response);
   }
 
   async exec(id: string, request: ExecRequest): Promise<ExecResult> {
-    const response = await this.doJSON<ApiExecResult>("POST", `${this.versionPrefix}/sandboxes/${id}/toolbox/process/execute`, toApiExecRequest(request));
+    const response = await this.doJSON<ApiExecResult>("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/toolbox/process/execute`, toApiExecRequest(request));
     return fromApiExecResult(response);
   }
 
   execStream(id: string, options: ExecStreamOptions): ExecStreamHandle {
-    return openExecStream(this.baseURL, this.versionPrefix, this.patToken, id, options);
+    return openExecStream(this.baseURL, this.versionPrefix, this.#patToken, id, options);
   }
 
   async createSession(id: string, options: CreateSessionOptions): Promise<Session> {
-    const response = await this.doJSON<ApiSession>("POST", `${this.versionPrefix}/sandboxes/${id}/sessions`, toApiCreateSessionOptions(options));
+    const response = await this.doJSON<ApiSession>("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/sessions`, toApiCreateSessionOptions(options));
     return fromApiSession(response);
   }
 
   async listSessions(id: string): Promise<Session[]> {
-    const response = await this.doJSON<ApiSessionList>("GET", `${this.versionPrefix}/sandboxes/${id}/sessions`);
+    const response = await this.doJSON<ApiSessionList>("GET", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/sessions`);
     return response.sessions.map(fromApiSession);
   }
 
   async getSession(id: string, sessionID: string): Promise<Session> {
-    const response = await this.doJSON<ApiSession>("GET", `${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}`);
+    const response = await this.doJSON<ApiSession>("GET", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/sessions/${resourcePath(sessionID)}`);
     return fromApiSession(response);
   }
 
   async deleteSession(id: string, sessionID: string): Promise<void> {
-    await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}`);
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/sessions/${resourcePath(sessionID)}`);
   }
 
   async signalSession(id: string, sessionID: string, signal: string): Promise<void> {
-    await this.doJSON<void>("POST", `${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}/signal`, { signal });
+    await this.doJSON<void>("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/sessions/${resourcePath(sessionID)}/signal`, { signal });
   }
 
   async resizeSession(id: string, sessionID: string, cols: number, rows: number): Promise<void> {
-    await this.doJSON<void>("POST", `${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}/resize`, { cols, rows });
+    await this.doJSON<void>("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/sessions/${resourcePath(sessionID)}/resize`, { cols, rows });
   }
 
   async sessionLog(id: string, sessionID: string): Promise<Uint8Array> {
-    return this.doBytes(`${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}/log`);
+    return this.doBytes(`${this.versionPrefix}/sandboxes/${resourcePath(id)}/sessions/${resourcePath(sessionID)}/log`);
   }
 
   async sessionRecording(id: string, sessionID: string): Promise<Uint8Array> {
-    return this.doBytes(`${this.versionPrefix}/sandboxes/${id}/sessions/${sessionID}/recording`);
+    return this.doBytes(`${this.versionPrefix}/sandboxes/${resourcePath(id)}/sessions/${resourcePath(sessionID)}/recording`);
   }
 
   attachSession(id: string, sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
-    return openSessionAttach(this.baseURL, this.versionPrefix, this.patToken, id, sessionID, options);
+    return openSessionAttach(this.baseURL, this.versionPrefix, this.#patToken, id, sessionID, options);
   }
 
   async uploadFile(id: string, targetPath: string, data: BinaryLike): Promise<void> {
@@ -623,14 +623,14 @@ export class APIClient {
     form.set("path", targetPath);
     form.set("file", toBlob(data), basename(targetPath));
 
-    const response = await this.request("POST", `${this.versionPrefix}/sandboxes/${id}/toolbox/files/upload`, { body: form });
+    const response = await this.request("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/toolbox/files/upload`, { body: form });
     if (!response.ok) {
       throw await decodeError(response);
     }
   }
 
   async downloadFile(id: string, targetPath: string): Promise<Uint8Array> {
-    const response = await this.request("GET", `${this.versionPrefix}/sandboxes/${id}/toolbox/files/download?path=${encodeURIComponent(targetPath)}`);
+    const response = await this.request("GET", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/toolbox/files/download?path=${encodeURIComponent(targetPath)}`);
     if (!response.ok) {
       throw await decodeError(response);
     }
@@ -654,14 +654,14 @@ export class APIClient {
     const body = options.protocol ? { protocol: options.protocol } : undefined;
     const response = await this.doJSON<ApiExposePortResponse>(
       "POST",
-      `${this.versionPrefix}/sandboxes/${id}/ports/${port}`,
+      `${this.versionPrefix}/sandboxes/${resourcePath(id)}/ports/${port}`,
       body,
     );
     return fromApiExposePortResponse(response);
   }
 
   async unexposePort(id: string, port: number): Promise<void> {
-    await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${id}/ports/${port}`);
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/ports/${port}`);
   }
 
   /**
@@ -732,27 +732,27 @@ export class APIClient {
   }
 
   async mounts(id: string): Promise<MountSpecRedacted[]> {
-    const response = await this.doJSON<ApiMountList>("GET", `${this.versionPrefix}/sandboxes/${id}/mounts`);
+    const response = await this.doJSON<ApiMountList>("GET", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/mounts`);
     return response.mounts.map(fromApiMountSpecRedacted);
   }
 
   async cloneGeneration(id: string): Promise<CloneGeneration> {
     const response = await this.doJSON<ApiCloneGeneration>(
       "GET",
-      `${this.versionPrefix}/sandboxes/${id}/toolbox/clone-generation`,
+      `${this.versionPrefix}/sandboxes/${resourcePath(id)}/toolbox/clone-generation`,
     );
     return fromApiCloneGeneration(response);
   }
 
   async getNetworkUsage(id: string): Promise<NetworkUsage> {
-    const response = await this.doJSON<ApiNetworkUsage>("GET", `${this.versionPrefix}/sandboxes/${id}/network/usage`);
+    const response = await this.doJSON<ApiNetworkUsage>("GET", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/network/usage`);
     return fromApiNetworkUsage(response);
   }
 
   async setNetworkLimits(id: string, options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
     const response = await this.doJSON<ApiNetworkUsage>(
       "PATCH",
-      `${this.versionPrefix}/sandboxes/${id}/network/limits`,
+      `${this.versionPrefix}/sandboxes/${resourcePath(id)}/network/limits`,
       toApiSetNetworkLimitsOptions(options),
     );
     return fromApiNetworkUsage(response);
@@ -775,12 +775,12 @@ export class APIClient {
   }
 
   async getTemplate(id: string): Promise<Template> {
-    const response = await this.doJSON<ApiTemplate>("GET", `${this.versionPrefix}/templates/${id}`);
+    const response = await this.doJSON<ApiTemplate>("GET", `${this.versionPrefix}/templates/${resourcePath(id)}`);
     return fromApiTemplate(response);
   }
 
   async deleteTemplate(id: string): Promise<void> {
-    await this.doJSON<void>("DELETE", `${this.versionPrefix}/templates/${id}`);
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/templates/${resourcePath(id)}`);
   }
 
   async createWasmModule(options: CreateWasmModuleOptions): Promise<WasmModule> {
@@ -798,12 +798,12 @@ export class APIClient {
   }
 
   async getWasmModule(id: string): Promise<WasmModule> {
-    const response = await this.doJSON<ApiWasmModule>("GET", `${this.versionPrefix}/wasm-modules/${id}`);
+    const response = await this.doJSON<ApiWasmModule>("GET", `${this.versionPrefix}/wasm-modules/${resourcePath(id)}`);
     return fromApiWasmModule(response);
   }
 
   async deleteWasmModule(id: string): Promise<void> {
-    await this.doJSON<void>("DELETE", `${this.versionPrefix}/wasm-modules/${id}`);
+    await this.doJSON<void>("DELETE", `${this.versionPrefix}/wasm-modules/${resourcePath(id)}`);
   }
 
   async pushWasmModule(options: PushWasmModuleOptions): Promise<PushWasmModuleResult> {
@@ -831,7 +831,7 @@ export class APIClient {
   }
 
   async rebuildTemplate(id: string): Promise<Template> {
-    const response = await this.doJSON<ApiTemplate>("POST", `${this.versionPrefix}/templates/${id}/rebuild`);
+    const response = await this.doJSON<ApiTemplate>("POST", `${this.versionPrefix}/templates/${resourcePath(id)}/rebuild`);
     return fromApiTemplate(response);
   }
 
@@ -879,8 +879,8 @@ export class APIClient {
    */
   private async request(method: string, path: string, init: RequestInit = {}): Promise<Response> {
     const headers = new Headers(init.headers);
-    if (this.patToken !== "") {
-      headers.set("Authorization", `Bearer ${this.patToken}`);
+    if (this.#patToken !== "") {
+      headers.set("Authorization", `Bearer ${this.#patToken}`);
     }
 
     const url = `${this.baseURL}${path}`;
@@ -890,7 +890,7 @@ export class APIClient {
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const response = await this.fetchFn(url, requestInit);
+        const response = await this.sendWithSafeRedirects(url, requestInit);
 
         // Retry on transient HTTP status codes.
         if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxRetries) {
@@ -915,6 +915,96 @@ export class APIClient {
 
     // Should be unreachable — the loop always throws or returns.
     throw lastError;
+  }
+
+  /**
+   * fetch() with a hardened redirect policy. Cross-origin redirects (scheme,
+   * host, or port change) never carry Authorization or X-Registry-*, and a
+   * 307/308 that would replay a request body to another origin is refused —
+   * 3xx targets may be attacker-controlled. Same-origin redirects keep
+   * headers and bodies as before.
+   *
+   * Outside a browser auto-following is disabled (`redirect: "manual"`) so the
+   * policy cannot be bypassed by the runtime's fetch implementation. In a
+   * browser that is impossible: fetch reports a manual cross-origin redirect as
+   * an opaque-redirect response whose status and Location header are hidden,
+   * which would turn every legitimate 3xx (e.g. an HTTP→HTTPS hop in front of
+   * the daemon) into a body-less TypeError. There the browser's own redirect
+   * handling is used instead — the Fetch spec strips Authorization on a
+   * cross-origin redirect and enforces CORS — and an opaque redirect that still
+   * surfaces is reported as {@link OpaqueRedirectError} rather than swallowed.
+   */
+  private async sendWithSafeRedirects(url: string, init: RequestInit): Promise<Response> {
+    const redirectStatuses = new Set([301, 302, 303, 307, 308]);
+    const maxRedirects = 5;
+    let currentURL = url;
+    let currentInit: RequestInit = { ...init, redirect: isBrowserRuntime() ? "follow" : "manual" };
+
+    for (let hop = 0; hop <= maxRedirects; hop++) {
+      const response = await this.fetchFn(currentURL, currentInit);
+      if (response.type === "opaqueredirect") {
+        throw new OpaqueRedirectError(currentURL);
+      }
+      if (!redirectStatuses.has(response.status)) {
+        return response;
+      }
+      const location = response.headers.get("location");
+      if (location === null) {
+        return response;
+      }
+      const nextURL = new URL(location, currentURL);
+      const headers = new Headers(currentInit.headers);
+      let body = currentInit.body;
+      let method = currentInit.method ?? "GET";
+
+      if (!isSameOrigin(url, nextURL)) {
+        headers.delete("Authorization");
+        headers.delete("X-Registry-Token");
+        headers.delete("X-Registry-Username");
+      }
+      if (response.status === 303 || ((response.status === 301 || response.status === 302) && method !== "GET" && method !== "HEAD")) {
+        method = "GET";
+        body = undefined;
+        headers.delete("Content-Type");
+        headers.delete("Content-Length");
+      }
+      if ((response.status === 307 || response.status === 308) && body !== undefined && !isSameOrigin(url, nextURL)) {
+        throw new Error(`refusing to follow cross-origin redirect with a request body: ${nextURL.origin}`);
+      }
+
+      currentURL = nextURL.toString();
+      currentInit = { ...currentInit, method, headers, body };
+    }
+    throw new Error(`stopped after ${maxRedirects} redirects`);
+  }
+}
+
+// isSameOrigin reports whether two URLs share scheme, host, and port.
+function isSameOrigin(a: string, b: string | URL): boolean {
+  const left = new URL(a);
+  const right = new URL(b);
+  return left.protocol === right.protocol && left.hostname === right.hostname && left.port === right.port;
+}
+
+// isBrowserRuntime reports whether the SDK is running outside Node. Browsers
+// have no `process`, and the two runtime-dependent behaviours (redirect
+// handling, WebSocket auth) differ there.
+function isBrowserRuntime(): boolean {
+  return typeof process === "undefined" || process.versions?.node === undefined;
+}
+
+// OpaqueRedirectError is raised when the fetch runtime hands back an
+// opaque-redirect response: the 3xx target is unreadable, so the SDK cannot
+// verify the origin before credentials would ride along. It is named (rather
+// than a bare TypeError from a body-less response) so callers can act on it.
+export class OpaqueRedirectError extends Error {
+  constructor(url: string) {
+    super(
+      `the fetch runtime returned an opaque redirect for ${url}; the SDK cannot inspect the 3xx target to ` +
+        `strip credentials. Point apiUrl at the daemon's final origin, or run where redirect Location is ` +
+        `readable (Node.js).`,
+    );
+    this.name = "OpaqueRedirectError";
   }
 }
 
@@ -1092,8 +1182,17 @@ export class SandboxResource implements Sandbox {
     return this.client.setNetworkLimits(this.id, options);
   }
 
-  toJSON(): Sandbox {
-    return cloneSandbox(this);
+  toJSON(options?: { includeSecrets?: boolean } | string): Sandbox {
+    const includeSecrets = typeof options === "object" && options?.includeSecrets === true;
+    const clone = cloneSandbox(this);
+    if (!includeSecrets) {
+      delete clone.sshPrivateKey;
+    }
+    return clone;
+  }
+
+  [Symbol.for("nodejs.util.inspect.custom")](): unknown {
+    return this.toJSON();
   }
 
   private apply(sandbox: Sandbox): void {
@@ -1476,8 +1575,11 @@ function buildTagQuery(tags: Record<string, string> | undefined): string {
 }
 
 function cloneSandbox(sandbox: Sandbox): Sandbox {
+  // `client` is an implementation detail of SandboxResource and holds the
+  // PAT — it must never ride along in a serialized sandbox.
+  const { client: _client, ...fields } = sandbox as Sandbox & { client?: unknown };
   return {
-    ...sandbox,
+    ...fields,
     env: sandbox.env ? { ...sandbox.env } : undefined,
     exposedPorts: sandbox.exposedPorts?.map((port) => ({ ...port })),
     containerCommand: sandbox.containerCommand ? [...sandbox.containerCommand] : undefined,
@@ -1499,6 +1601,13 @@ function toBlob(data: BinaryLike): Blob {
   return new Blob([Uint8Array.from(data)]);
 }
 
+// resourcePath percent-escapes a caller-supplied ID so it always stays a
+// single URL path segment. Without this, an id like "x/../admin" traverses
+// out of its route when spliced into a request path.
+function resourcePath(id: string): string {
+  return encodeURIComponent(id);
+}
+
 async function decodeError(response: Response): Promise<Error> {
   try {
     const payload = (await response.json()) as { error?: string };
@@ -1513,6 +1622,22 @@ async function decodeError(response: Response): Promise<Error> {
 
 const STREAM_PREFIX_STDOUT = 0x01;
 const STREAM_PREFIX_STDERR = 0x02;
+
+// MAX_WS_MESSAGE_BYTES caps a single WebSocket message the SDK hands to a
+// caller, matching the Go and Java SDKs. The runtime assembles the whole
+// message before the "message" event fires, so this does not bound transport
+// memory — it does keep an abusive peer from driving an unbounded callback
+// payload.
+const MAX_WS_MESSAGE_BYTES = 32 * 1024 * 1024;
+
+// oversizedWSMessage returns a rejection message when a message exceeds the
+// cap, or undefined to accept it.
+function oversizedWSMessage(size: number): string | undefined {
+  if (size <= MAX_WS_MESSAGE_BYTES) {
+    return undefined;
+  }
+  return `websocket message of ${size} bytes exceeds the ${MAX_WS_MESSAGE_BYTES}-byte limit`;
+}
 
 // Pull whatever diagnostic detail the runtime gave us off a WebSocket "error"
 // event. Node 22's native WebSocket fires an ErrorEvent with `.error` /
@@ -1544,6 +1669,41 @@ function toWebSocketBinaryFrame(data: Uint8Array | string): Uint8Array<ArrayBuff
   return frame;
 }
 
+// useSubprotocolAuth decides how the WebSocket handshake carries the PAT. The
+// header form is preferred (Node's WebSocket accepts an init object with
+// headers, so the token never appears in the URL or subprotocol), but the
+// WHATWG WebSocket constructor only takes a subprotocol list: in a browser the
+// init object is stringified to "[object Object]" as a protocol token and the
+// constructor throws. So outside Node the subprotocol form is selected
+// automatically. An explicit `authViaSubprotocol` always wins, which keeps the
+// flag authoritative for callers who know their runtime.
+export function useSubprotocolAuth(authViaSubprotocol: boolean | undefined, browser: boolean): boolean {
+  if (authViaSubprotocol !== undefined) {
+    return authViaSubprotocol;
+  }
+  return browser;
+}
+
+// openAuthenticatedWebSocket dials a streaming WebSocket with the PAT on the
+// Authorization header, or as `Sec-WebSocket-Protocol` (`sandbox.bearer,
+// <token>`) in the subprotocol mode selected by {@link useSubprotocolAuth}.
+// The subprotocol is visible to the page and to intermediaries, which is why
+// it is only used when headers are unavailable (browsers) or explicitly asked
+// for.
+function openAuthenticatedWebSocket(
+  wsCtor: typeof WebSocket,
+  wsURL: string,
+  patToken: string,
+  authViaSubprotocol: boolean | undefined,
+): WebSocket {
+  if (useSubprotocolAuth(authViaSubprotocol, isBrowserRuntime())) {
+    return new wsCtor(wsURL, ["sandbox.bearer", patToken]);
+  }
+  return new (wsCtor as unknown as new (url: string, init?: unknown) => WebSocket)(wsURL, {
+    headers: { Authorization: `Bearer ${patToken}` },
+  });
+}
+
 function openExecStream(baseURL: string, versionPrefix: string, patToken: string, sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
   const wsURL = baseURL.replace(/^http/, "ws") + `${versionPrefix}/sandboxes/${encodeURIComponent(sandboxID)}/toolbox/process/exec/stream`;
 
@@ -1552,10 +1712,9 @@ function openExecStream(baseURL: string, versionPrefix: string, patToken: string
     throw new Error("WebSocket is not available in this runtime — Node 22+ or a browser is required");
   }
 
-  // Browsers cannot attach Authorization headers to WebSocket handshakes,
-  // so sandboxd accepts the PAT via `Sec-WebSocket-Protocol` as
-  // `sandbox.bearer, <token>`.
-  const ws = new WS(wsURL, ["sandbox.bearer", patToken]);
+  // Auth rides the Authorization header by default (see
+  // openAuthenticatedWebSocket for the browser subprotocol fallback).
+  const ws = openAuthenticatedWebSocket(WS, wsURL, patToken, options.authViaSubprotocol);
   ws.binaryType = "arraybuffer";
 
   // Captured by the "error" listener and consumed by "close" so we report the
@@ -1595,6 +1754,12 @@ function openExecStream(baseURL: string, versionPrefix: string, patToken: string
 
   ws.addEventListener("message", (event: MessageEvent) => {
     if (typeof event.data === "string") {
+      const oversized = oversizedWSMessage(event.data.length);
+      if (oversized !== undefined) {
+        failWith(oversized);
+        ws.close();
+        return;
+      }
       try {
         const msg = JSON.parse(event.data) as { type: string; code?: number; signal?: string; message?: string };
         if (msg.type === "exit") {
@@ -1612,6 +1777,12 @@ function openExecStream(baseURL: string, versionPrefix: string, patToken: string
     }
     const buf = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : new Uint8Array((event.data as Uint8Array).buffer);
     if (buf.length === 0) return;
+    const oversized = oversizedWSMessage(buf.length);
+    if (oversized !== undefined) {
+      failWith(oversized);
+      ws.close();
+      return;
+    }
     const stream = buf[0];
     const payload = buf.subarray(1);
     if (stream === STREAM_PREFIX_STDOUT) {
@@ -1671,7 +1842,7 @@ function openSessionAttach(
     throw new Error("WebSocket is not available in this runtime — Node 22+ or a browser is required");
   }
 
-  const ws = new WS(wsURL, ["sandbox.bearer", patToken]);
+  const ws = openAuthenticatedWebSocket(WS, wsURL, patToken, options.authViaSubprotocol);
   ws.binaryType = "arraybuffer";
 
   let exitResolve: ((info: ExecExitInfo) => void) | undefined;
@@ -1703,6 +1874,12 @@ function openSessionAttach(
 
   ws.addEventListener("message", (event: MessageEvent) => {
     if (typeof event.data === "string") {
+      const oversized = oversizedWSMessage(event.data.length);
+      if (oversized !== undefined) {
+        failWith(oversized);
+        ws.close();
+        return;
+      }
       try {
         const msg = JSON.parse(event.data) as { type: string; code?: number; signal?: string; message?: string };
         if (msg.type === "exit") {
@@ -1721,6 +1898,12 @@ function openSessionAttach(
 
     const buf = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : new Uint8Array((event.data as Uint8Array).buffer);
     if (buf.length === 0) {
+      return;
+    }
+    const oversized = oversizedWSMessage(buf.length);
+    if (oversized !== undefined) {
+      failWith(oversized);
+      ws.close();
       return;
     }
     const stream = buf[0];

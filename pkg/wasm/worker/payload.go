@@ -18,6 +18,12 @@ type instantiatePayload struct {
 
 type invokePayload struct {
 	Export string `json:"export"`
+	// Background marks the long-lived guest entry (the HTTP serve loop, whose
+	// _start never returns). The worker must not wrap such a call in the caps
+	// wall timeout — the serve outlives any single request and is bounded by the
+	// sandbox lifecycle instead. One-shot invokes leave this false and stay
+	// wall-bounded against a CPU-bound guest.
+	Background bool `json:"background,omitempty"`
 }
 
 type execPayload struct {

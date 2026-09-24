@@ -4,16 +4,26 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
 type fakeSpawner struct {
+	mu     sync.Mutex
 	warmed []string
 }
 
 func (f *fakeSpawner) Warm(_ context.Context, slotID, socketPath, modulePath string, _ int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.warmed = append(f.warmed, slotID+":"+modulePath)
 	return nil
+}
+
+func (f *fakeSpawner) warmedSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.warmed...)
 }
 
 func (f *fakeSpawner) Shutdown(string) error { return nil }
@@ -80,7 +90,7 @@ func TestPoolWarmOne(t *testing.T) {
 	if slot.WorkerKey == "" || slot.SocketPath == "" {
 		t.Fatalf("slot incomplete: %+v", slot)
 	}
-	if len(spawner.warmed) != 1 {
-		t.Fatalf("warmed = %v", spawner.warmed)
+	if len(spawner.warmedSnapshot()) != 1 {
+		t.Fatalf("warmed = %v", spawner.warmedSnapshot())
 	}
 }

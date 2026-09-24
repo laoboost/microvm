@@ -13,26 +13,48 @@ pub enum MountType {
     Rclone,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RegistryAuth {
     pub server: String,
     pub username: String,
     pub password: String,
 }
 
+impl std::fmt::Debug for RegistryAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryAuth")
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
 /// Per-request push directive for `Client::build_image_with_options`.
-/// Credentials are forwarded to the daemon as a one-shot `X-Registry-Auth`
-/// header on the underlying push call and are never persisted server-side.
-#[derive(Debug, Clone, Default)]
+/// Credentials are forwarded to the daemon in the `push` object of the
+/// `POST /v1/images/build` request body and are never persisted server-side.
+#[derive(Clone, Default)]
 pub struct BuildImagePushOptions {
     /// Destination repository, e.g. `"ghcr.io/my-org/my-image"`.
     pub registry: String,
     /// Destination tag. The daemon defaults to `"latest"` when empty.
     pub tag: Option<String>,
-    /// Registry serveraddress, e.g. `"ghcr.io"`. Sent inside `X-Registry-Auth`.
+    /// Registry serveraddress, e.g. `"ghcr.io"`. Sent inside the push body.
     pub server: Option<String>,
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for BuildImagePushOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildImagePushOptions")
+            .field("registry", &self.registry)
+            .field("tag", &self.tag)
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,7 +108,7 @@ pub struct RegisterSnapshotOptions {
     pub disk_gb: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct MountSpec {
     #[serde(rename = "type")]
     pub mount_type: MountType,
@@ -98,6 +120,19 @@ pub struct MountSpec {
     pub credentials: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "read_only", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+}
+
+impl std::fmt::Debug for MountSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MountSpec")
+            .field("mount_type", &self.mount_type)
+            .field("target", &self.target)
+            .field("source", &self.source)
+            .field("options", &self.options)
+            .field("credentials", &self.credentials.as_ref().map(|_| "***"))
+            .field("read_only", &self.read_only)
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -570,12 +605,24 @@ pub struct Sandbox {
     pub tenant_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CreateSandboxResponse {
     #[serde(flatten)]
     pub sandbox: Sandbox,
     #[serde(rename = "ssh_private_key", skip_serializing_if = "Option::is_none")]
     pub ssh_private_key: Option<String>,
+}
+
+impl std::fmt::Debug for CreateSandboxResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateSandboxResponse")
+            .field("sandbox", &self.sandbox)
+            .field(
+                "ssh_private_key",
+                &self.ssh_private_key.as_ref().map(|_| "***"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -865,7 +912,7 @@ pub struct CreateWasmModuleOptions {
 /// Input for [`Client::push_wasm_module`]: a BYO compiled core-wasip1 upload.
 /// The daemon validates and forwards the bytes to the registry under your own
 /// credentials; it never stores them.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PushWasmModuleOptions {
     /// Target repository path, e.g. `tenant/my-app`.
     pub name: String,
@@ -877,6 +924,18 @@ pub struct PushWasmModuleOptions {
     pub registry_username: String,
     /// Registry token (your AOCR PAT). Required.
     pub registry_token: String,
+}
+
+impl std::fmt::Debug for PushWasmModuleOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushWasmModuleOptions")
+            .field("name", &self.name)
+            .field("tag", &self.tag)
+            .field("module", &self.module)
+            .field("registry_username", &self.registry_username)
+            .field("registry_token", &"***")
+            .finish()
+    }
 }
 
 /// Result of [`Client::push_wasm_module`].
@@ -926,9 +985,19 @@ impl Default for RetryConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct ClientConfig {
     pub api_url: Option<String>,
     pub pat_token: Option<String>,
     pub retry: Option<RetryConfig>,
+}
+
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("api_url", &self.api_url)
+            .field("pat_token", &self.pat_token.as_ref().map(|_| "***"))
+            .field("retry", &self.retry)
+            .finish()
+    }
 }

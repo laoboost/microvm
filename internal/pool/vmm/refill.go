@@ -324,34 +324,32 @@ func (p *Pool) spawnOne(parentCtx context.Context, tpl TemplateWarmInput, spawne
 		return
 	}
 
+	// Park the handle BEFORE RecordLoaded so AcquireWithHandle can never
+	// claim a 'loaded' row whose handle is not yet in the map. The row is
+	// unclaimable ('spawning') until RecordLoaded commits, and by then the
+	// handle is already registered — the inter-statement window that let an
+	// Acquire hit the orphan path and cold-spawn past a warm VMM is gone.
+	p.registerHandle(slotID, handle)
+
 	// Promote the row to 'loaded' with the artifact references the
 	// Acquire path needs. Use the parent context, not spawnCtx — the
 	// spawn already succeeded; we don't want a slow SQLite write to
 	// race the spawn timeout we just released.
 	if err := p.RecordLoaded(parentCtx, slotID, handle.APISocket(), handle.RunDir(), tpl.VsockCID, time.Now().UTC()); err != nil {
 		recordSpawnOutcome(spawnOutcomeRecordError)
-		// Loaded-record failed but the VMM process is up. Tear it
-		// down — leaving a process whose row says 'spawning' would
-		// confuse the GC sweep (and worse, the next Acquire is
-		// blocked from picking it because the row never moves to
-		// 'loaded').
+		// Loaded-record failed but the VMM process is up. Reclaim the
+		// just-registered handle and tear the process down — leaving a
+		// process whose row says 'spawning' would confuse the GC sweep
+		// (and worse, the next Acquire is blocked from picking it
+		// because the row never moves to 'loaded').
 		p.logger.Warn("vmm pool: record loaded failed",
 			"slot_id", slotID, "error", err)
+		p.takeHandle(slotID)
 		_ = handle.Shutdown(context.Background(), 3*time.Second)
 		_ = p.RecordFailed(parentCtx, slotID, "record loaded failed: "+err.Error(), time.Now().UTC())
 		return
 	}
 	recordSpawnOutcome(spawnOutcomeSuccess)
-
-	// Park the handle alongside the row so AcquireWithHandle can
-	// retrieve it. Order matters: register AFTER RecordLoaded so the
-	// Acquire path's row-level state ('loaded') and the in-memory
-	// map both flip in the same instant (modulo the brief
-	// inter-statement window). If we registered first, an Acquire
-	// racing between RecordLoaded and registerHandle would see the
-	// row as still 'spawning' and skip the slot — harmless but
-	// wasteful.
-	p.registerHandle(slotID, handle)
 
 	p.logger.Info("vmm pool: slot loaded",
 		"template_id", tpl.TemplateID, "slot_id", slotID,

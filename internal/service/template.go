@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -170,6 +171,12 @@ func (s *Service) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 			return nil, fmt.Errorf("generate template id: %w", err)
 		}
 		id = generated
+	}
+	// The id becomes filepath.Join(FirecrackerTemplatesDir, id) in
+	// kickTemplateBuild — reject traversal / separators before any row or
+	// directory work.
+	if !TemplateIDValid(id) {
+		return nil, fmt.Errorf("invalid template id %q", id)
 	}
 
 	now := time.Now().UTC()
@@ -407,6 +414,10 @@ func writeTemplateManifest(path string, m templateManifest) error {
 // wrote, so a freshly-created template reads as PENDING until the
 // goroutine flips it.
 func (s *Service) GetTemplate(ctx context.Context, id string) (*models.Template, error) {
+	// No TemplateIDValid gate here: this is a READ. A row that predates the
+	// create-time validation (e.g. an id containing '.') must stay readable —
+	// otherwise it becomes an unreachable orphan. The id only reaches the
+	// store; no path is derived from it on this path.
 	return s.store.GetTemplate(ctx, id)
 }
 
@@ -427,6 +438,11 @@ func (s *Service) ListTemplates(ctx context.Context) ([]*models.Template, error)
 // goroutine would leave the goroutine writing to a directory the
 // operator believed was gone.
 func (s *Service) DeleteTemplate(ctx context.Context, id string) error {
+	// No TemplateIDValid gate: a row that predates the create-time validation
+	// must stay deletable, and every filesystem path below comes from the
+	// stored row (template.RootfsPath), not from the caller-supplied id — so an
+	// unknown/traversal id simply misses in the store and returns ErrNotFound
+	// before any filesystem work.
 	template, err := s.store.GetTemplate(ctx, id)
 	if err != nil {
 		return err
@@ -572,4 +588,20 @@ func generateTemplateID() (string, error) {
 		return "", err
 	}
 	return "tpl-" + hex.EncodeToString(buf), nil
+}
+
+// templateIDPattern matches every template id the service is willing to join
+// into FirecrackerTemplatesDir. Same charset/length rule as
+// pkg/mounts.ValidateSandboxID — separators, "..", whitespace and NUL are
+// rejected so a caller-supplied id cannot traverse out of the templates dir.
+var templateIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// TemplateIDValid reports whether id is safe to use as a single path segment
+// under FirecrackerTemplatesDir. It is a CREATE/WRITE-ONLY boundary check
+// (CreateTemplate): reads (GetTemplate, DeleteTemplate, RequestTemplateRebuild)
+// deliberately skip it so a row that predates the validation stays reachable
+// and deletable, and those paths derive filesystem locations from the stored
+// row rather than from the caller's id.
+func TemplateIDValid(id string) bool {
+	return templateIDPattern.MatchString(id)
 }

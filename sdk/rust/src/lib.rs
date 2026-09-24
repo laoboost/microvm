@@ -1,3 +1,22 @@
+//! A Rust client for the Aerol.ai MicroVM sandbox API.
+//!
+//! # Redirect policy
+//!
+//! Redirects are followed manually (up to 5 hops) with the same hygiene as the
+//! Go, Python, Java, and TypeScript SDKs:
+//!
+//! - A hop to a different scheme, host, or port drops `Authorization` and the
+//!   `X-Registry-*` credentials. A same-host scheme upgrade (`http://daemon` →
+//!   `https://daemon/...`) is cross-origin, so it is followed without those
+//!   credentials.
+//! - A 307/308 that would replay a request body across origins is refused
+//!   instead of followed.
+//! - 301/302/303 degrade to a body-less GET, matching browser semantics.
+//!
+//! The transport is configured with [`reqwest::redirect::Policy::none`]; the
+//! SDK rewrites the request itself so credentials are stripped *before* they
+//! can leave for another origin.
+
 mod image;
 mod types;
 
@@ -160,7 +179,21 @@ mod api_v1 {
     pub const PATH_PREFIX: &str = "/v1";
 }
 
-#[derive(Clone, Debug)]
+// resource_path percent-escapes a caller-supplied ID so it always stays a
+// single URL path segment ("x/../admin" cannot traverse into other routes).
+fn resource_path(id: &str) -> String {
+    urlencoding::encode(id).into_owned()
+}
+
+fn is_cross_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() != b.scheme()
+        || a.host() != b.host()
+        || a.port_or_known_default() != b.port_or_known_default()
+}
+
+const MAX_REDIRECTS: usize = 5;
+
+#[derive(Clone)]
 pub struct Client {
     api_url: String,
     pat_token: String,
@@ -169,11 +202,36 @@ pub struct Client {
     retry_config: RetryConfig,
 }
 
-#[derive(Clone, Debug)]
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("api_url", &self.api_url)
+            .field("pat_token", &"***")
+            .field("api_version", &self.api_version)
+            .field("inner", &self.inner)
+            .field("retry_config", &self.retry_config)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct Sandbox {
     pub client: Client,
     pub data: SandboxData,
     pub ssh_private_key: Option<String>,
+}
+
+impl fmt::Debug for Sandbox {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sandbox")
+            .field("client", &self.client)
+            .field("data", &self.data)
+            .field(
+                "ssh_private_key",
+                &self.ssh_private_key.as_ref().map(|_| "***"),
+            )
+            .finish()
+    }
 }
 
 pub struct ExecStreamHandle {
@@ -525,7 +583,9 @@ impl Client {
             api_url,
             pat_token,
             api_version,
-            inner: HttpClient::new(),
+            inner: HttpClient::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             retry_config: config.retry.unwrap_or_default(),
         })
     }
@@ -555,9 +615,9 @@ impl Client {
     }
 
     /// Build an `Image` and optionally push the result to a remote registry.
-    /// Push credentials are forwarded to the daemon as a one-shot
-    /// `X-Registry-Auth` header on the underlying push call and are never
-    /// persisted server-side.
+    /// Push credentials are forwarded to the daemon in the `push` object of the
+    /// `POST /v1/images/build` request body and are never persisted
+    /// server-side.
     pub fn build_image_with_options(
         &self,
         image: &Image,
@@ -570,7 +630,7 @@ impl Client {
             push: Option<BuildImagePushBody<'a>>,
         }
 
-        #[derive(Serialize)]
+        #[derive(Serialize, Clone, Copy)]
         struct BuildImagePushBody<'a> {
             registry: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -616,15 +676,24 @@ impl Client {
         };
 
         let path = format!("{}/images/build", self.version_prefix());
-        let response = self
-            .inner
-            .request(Method::POST, self.full_url(&path))
-            .bearer_auth(&self.pat_token)
-            .json(&BuildImageRequest {
-                dockerfile_content: image.dockerfile(),
-                push: push_body,
-            })
-            .send()?;
+        let response = self.send_following_redirects(
+            &self.full_url(&path),
+            Method::POST,
+            true,
+            |hop_method, hop_url, strip_credentials, with_body| {
+                let mut builder = self.inner.request(hop_method.clone(), hop_url);
+                if !strip_credentials {
+                    builder = builder.bearer_auth(&self.pat_token);
+                }
+                if with_body {
+                    builder = builder.json(&BuildImageRequest {
+                        dockerfile_content: image.dockerfile(),
+                        push: push_body,
+                    });
+                }
+                builder
+            },
+        )?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             let _ = response.text();
             return Err(Error::Api(format!(
@@ -674,7 +743,7 @@ impl Client {
     pub fn get(&self, id: &str) -> Result<Sandbox, Error> {
         let raw = self.do_json::<(), SandboxData>(
             Method::GET,
-            &format!("{}/sandboxes/{}", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}", self.version_prefix(), resource_path(id)),
             None,
         )?;
         Ok(Sandbox::new(self.clone(), raw))
@@ -683,7 +752,7 @@ impl Client {
     pub fn start(&self, id: &str) -> Result<Sandbox, Error> {
         let raw = self.do_json::<(), SandboxData>(
             Method::POST,
-            &format!("{}/sandboxes/{}/start", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/start", self.version_prefix(), resource_path(id)),
             None,
         )?;
         Ok(Sandbox::new(self.clone(), raw))
@@ -692,7 +761,7 @@ impl Client {
     pub fn stop(&self, id: &str) -> Result<Sandbox, Error> {
         let raw = self.do_json::<(), SandboxData>(
             Method::POST,
-            &format!("{}/sandboxes/{}/stop", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/stop", self.version_prefix(), resource_path(id)),
             None,
         )?;
         Ok(Sandbox::new(self.clone(), raw))
@@ -706,7 +775,7 @@ impl Client {
 
         self.do_json::<CreateSnapshotRequest<'_>, SandboxSnapshot>(
             Method::POST,
-            &format!("{}/sandboxes/{}/snapshot", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/snapshot", self.version_prefix(), resource_path(id)),
             Some(&CreateSnapshotRequest { name }),
         )
     }
@@ -814,7 +883,7 @@ impl Client {
     pub fn destroy(&self, id: &str) -> Result<(), Error> {
         self.do_json::<(), ()>(
             Method::DELETE,
-            &format!("{}/sandboxes/{}", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}", self.version_prefix(), resource_path(id)),
             None,
         )
     }
@@ -849,7 +918,7 @@ impl Client {
     pub fn get_template(&self, id: &str) -> Result<Template, Error> {
         self.do_json::<(), Template>(
             Method::GET,
-            &format!("{}/templates/{}", self.version_prefix(), id),
+            &format!("{}/templates/{}", self.version_prefix(), resource_path(id)),
             None,
         )
     }
@@ -857,7 +926,7 @@ impl Client {
     pub fn delete_template(&self, id: &str) -> Result<(), Error> {
         self.do_json::<(), ()>(
             Method::DELETE,
-            &format!("{}/templates/{}", self.version_prefix(), id),
+            &format!("{}/templates/{}", self.version_prefix(), resource_path(id)),
             None,
         )
     }
@@ -886,7 +955,7 @@ impl Client {
     pub fn get_wasm_module(&self, id: &str) -> Result<WasmModule, Error> {
         self.do_json::<(), WasmModule>(
             Method::GET,
-            &format!("{}/wasm-modules/{}", self.version_prefix(), id),
+            &format!("{}/wasm-modules/{}", self.version_prefix(), resource_path(id)),
             None,
         )
     }
@@ -894,7 +963,7 @@ impl Client {
     pub fn delete_wasm_module(&self, id: &str) -> Result<(), Error> {
         self.do_json::<(), ()>(
             Method::DELETE,
-            &format!("{}/wasm-modules/{}", self.version_prefix(), id),
+            &format!("{}/wasm-modules/{}", self.version_prefix(), resource_path(id)),
             None,
         )
     }
@@ -925,17 +994,31 @@ impl Client {
             urlencoding::encode(tag),
         );
         let url = self.full_url(&path);
-        let mut builder = self
-            .inner
-            .post(&url)
-            .bearer_auth(&self.pat_token)
-            .header("Content-Type", "application/octet-stream")
-            .header("X-Registry-Token", &opts.registry_token)
-            .body(opts.module);
-        if !opts.registry_username.trim().is_empty() {
-            builder = builder.header("X-Registry-Username", &opts.registry_username);
-        }
-        let response = self.handle_response(builder.send()?)?;
+        let response = self.send_following_redirects(
+            &url,
+            Method::POST,
+            true,
+            |hop_method, hop_url, strip_credentials, with_body| {
+                let mut builder = self.inner.request(hop_method.clone(), hop_url);
+                if with_body {
+                    builder = builder.header("Content-Type", "application/octet-stream");
+                }
+                if !strip_credentials {
+                    builder = builder
+                        .bearer_auth(&self.pat_token)
+                        .header("X-Registry-Token", &opts.registry_token);
+                    if !opts.registry_username.trim().is_empty() {
+                        builder =
+                            builder.header("X-Registry-Username", &opts.registry_username);
+                    }
+                }
+                if with_body {
+                    builder = builder.body(opts.module.clone());
+                }
+                builder
+            },
+        )?;
+        let response = self.handle_response(response)?;
         response.json().map_err(Error::Reqwest)
     }
 
@@ -952,7 +1035,7 @@ impl Client {
     pub fn rebuild_template(&self, id: &str) -> Result<Template, Error> {
         self.do_json::<(), Template>(
             Method::POST,
-            &format!("{}/templates/{}/rebuild", self.version_prefix(), id),
+            &format!("{}/templates/{}/rebuild", self.version_prefix(), resource_path(id)),
             None,
         )
     }
@@ -960,7 +1043,7 @@ impl Client {
     pub fn resize(&self, id: &str, opts: ResizeOptions) -> Result<Sandbox, Error> {
         let raw = self.do_json::<ResizeOptions, SandboxData>(
             Method::POST,
-            &format!("{}/sandboxes/{}/resize", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/resize", self.version_prefix(), resource_path(id)),
             Some(&opts),
         )?;
         Ok(Sandbox::new(self.clone(), raw))
@@ -969,7 +1052,7 @@ impl Client {
     pub fn update_lifecycle(&self, id: &str, lifecycle: Lifecycle) -> Result<Sandbox, Error> {
         let raw = self.do_json::<Lifecycle, SandboxData>(
             Method::PUT,
-            &format!("{}/sandboxes/{}/lifecycle", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/lifecycle", self.version_prefix(), resource_path(id)),
             Some(&lifecycle),
         )?;
         Ok(Sandbox::new(self.clone(), raw))
@@ -996,7 +1079,7 @@ impl Client {
 
         let raw = self.do_json::<(), MountList>(
             Method::GET,
-            &format!("{}/sandboxes/{}/mounts", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/mounts", self.version_prefix(), resource_path(id)),
             None,
         )?;
         Ok(raw.mounts)
@@ -1012,7 +1095,7 @@ impl Client {
             &format!(
                 "{}/sandboxes/{}/toolbox/clone-generation",
                 self.version_prefix(),
-                id
+                resource_path(id)
             ),
             None,
         )
@@ -1021,7 +1104,7 @@ impl Client {
     pub fn get_network_usage(&self, id: &str) -> Result<NetworkUsage, Error> {
         self.do_json::<(), NetworkUsage>(
             Method::GET,
-            &format!("{}/sandboxes/{}/network/usage", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/network/usage", self.version_prefix(), resource_path(id)),
             None,
         )
     }
@@ -1033,7 +1116,7 @@ impl Client {
     ) -> Result<NetworkUsage, Error> {
         self.do_json::<SetNetworkLimitsOptions, NetworkUsage>(
             Method::PATCH,
-            &format!("{}/sandboxes/{}/network/limits", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/network/limits", self.version_prefix(), resource_path(id)),
             Some(&opts),
         )
     }
@@ -1044,7 +1127,7 @@ impl Client {
             &format!(
                 "{}/sandboxes/{}/toolbox/process/execute",
                 self.version_prefix(),
-                id
+                resource_path(id)
             ),
             Some(&request),
         )
@@ -1053,7 +1136,7 @@ impl Client {
     pub fn create_session(&self, id: &str, opts: CreateSessionOptions) -> Result<Session, Error> {
         self.do_json::<CreateSessionOptions, Session>(
             Method::POST,
-            &format!("{}/sandboxes/{}/sessions", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/sessions", self.version_prefix(), resource_path(id)),
             Some(&opts),
         )
     }
@@ -1061,7 +1144,7 @@ impl Client {
     pub fn list_sessions(&self, id: &str) -> Result<Vec<Session>, Error> {
         let raw = self.do_json::<(), SessionList>(
             Method::GET,
-            &format!("{}/sandboxes/{}/sessions", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/sessions", self.version_prefix(), resource_path(id)),
             None,
         )?;
         Ok(raw.sessions)
@@ -1073,8 +1156,8 @@ impl Client {
             &format!(
                 "{}/sandboxes/{}/sessions/{}",
                 self.version_prefix(),
-                id,
-                session_id
+                resource_path(id),
+                resource_path(session_id)
             ),
             None,
         )
@@ -1086,8 +1169,8 @@ impl Client {
             &format!(
                 "{}/sandboxes/{}/sessions/{}",
                 self.version_prefix(),
-                id,
-                session_id
+                resource_path(id),
+                resource_path(session_id)
             ),
             None,
         )
@@ -1099,8 +1182,8 @@ impl Client {
             &format!(
                 "{}/sandboxes/{}/sessions/{}/signal",
                 self.version_prefix(),
-                id,
-                session_id
+                resource_path(id),
+                resource_path(session_id)
             ),
             Some(&SessionSignalRequest {
                 signal: signal.to_string(),
@@ -1120,8 +1203,8 @@ impl Client {
             &format!(
                 "{}/sandboxes/{}/sessions/{}/resize",
                 self.version_prefix(),
-                id,
-                session_id
+                resource_path(id),
+                resource_path(session_id)
             ),
             Some(&SessionResizeRequest { cols, rows }),
         )
@@ -1131,14 +1214,21 @@ impl Client {
         let url = self.full_url(&format!(
             "{}/sandboxes/{}/sessions/{}/log",
             self.version_prefix(),
-            id,
-            session_id
+            resource_path(id),
+            resource_path(session_id)
         ));
-        let response = self
-            .inner
-            .request(Method::GET, &url)
-            .bearer_auth(&self.pat_token)
-            .send()?;
+        let response = self.send_following_redirects(
+            &url,
+            Method::GET,
+            false,
+            |hop_method, hop_url, strip_credentials, _with_body| {
+                let mut builder = self.inner.request(hop_method.clone(), hop_url);
+                if !strip_credentials {
+                    builder = builder.bearer_auth(&self.pat_token);
+                }
+                builder
+            },
+        )?;
         self.handle_response(response)?
             .bytes()
             .map_err(Error::Reqwest)
@@ -1149,14 +1239,21 @@ impl Client {
         let url = self.full_url(&format!(
             "{}/sandboxes/{}/sessions/{}/recording",
             self.version_prefix(),
-            id,
-            session_id
+            resource_path(id),
+            resource_path(session_id)
         ));
-        let response = self
-            .inner
-            .request(Method::GET, &url)
-            .bearer_auth(&self.pat_token)
-            .send()?;
+        let response = self.send_following_redirects(
+            &url,
+            Method::GET,
+            false,
+            |hop_method, hop_url, strip_credentials, _with_body| {
+                let mut builder = self.inner.request(hop_method.clone(), hop_url);
+                if !strip_credentials {
+                    builder = builder.bearer_auth(&self.pat_token);
+                }
+                builder
+            },
+        )?;
         self.handle_response(response)?
             .bytes()
             .map_err(Error::Reqwest)
@@ -1242,34 +1339,57 @@ impl Client {
         let file_name = Path::new(target_path)
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("file");
+            .unwrap_or("file")
+            .to_string();
+        let url = self.full_url(&format!(
+            "{}/sandboxes/{}/toolbox/files/upload",
+            self.version_prefix(),
+            resource_path(id)
+        ));
 
-        let form = Form::new()
-            .text("path", target_path.to_string())
-            .part("file", Part::bytes(data).file_name(file_name.to_string()));
-
-        self.do_multipart(
-            &format!(
-                "{}/sandboxes/{}/toolbox/files/upload",
-                self.version_prefix(),
-                id
-            ),
-            form,
-        )
+        let response = self.send_following_redirects(
+            &url,
+            Method::POST,
+            true,
+            |hop_method, hop_url, strip_credentials, with_body| {
+                let mut builder = self.inner.request(hop_method.clone(), hop_url);
+                if !strip_credentials {
+                    builder = builder.bearer_auth(&self.pat_token);
+                }
+                if with_body {
+                    let form = Form::new()
+                        .text("path", target_path.to_string())
+                        .part(
+                            "file",
+                            Part::bytes(data.clone()).file_name(file_name.clone()),
+                        );
+                    builder = builder.multipart(form);
+                }
+                builder
+            },
+        )?;
+        self.handle_response(response).map(|_| ())
     }
 
     pub fn download_file(&self, id: &str, target_path: &str) -> Result<Vec<u8>, Error> {
         let url = self.full_url(&format!(
             "{}/sandboxes/{}/toolbox/files/download?path={}",
             self.version_prefix(),
-            id,
+            resource_path(id),
             urlencoding::encode(target_path)
         ));
-        let response = self
-            .inner
-            .request(Method::GET, &url)
-            .bearer_auth(&self.pat_token)
-            .send()?;
+        let response = self.send_following_redirects(
+            &url,
+            Method::GET,
+            false,
+            |hop_method, hop_url, strip_credentials, _with_body| {
+                let mut builder = self.inner.request(hop_method.clone(), hop_url);
+                if !strip_credentials {
+                    builder = builder.bearer_auth(&self.pat_token);
+                }
+                builder
+            },
+        )?;
         self.handle_response(response)?
             .bytes()
             .map_err(Error::Reqwest)
@@ -1294,7 +1414,7 @@ impl Client {
         };
         let wire = self.do_json::<Value, ExposePortResponseWire>(
             Method::POST,
-            &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port),
+            &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), resource_path(id), port),
             body.as_ref(),
         )?;
         match wire.protocol.as_str() {
@@ -1316,7 +1436,7 @@ impl Client {
     pub fn unexpose_port(&self, id: &str, port: u16) -> Result<(), Error> {
         self.do_json::<(), ()>(
             Method::DELETE,
-            &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port),
+            &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), resource_path(id), port),
             None,
         )
     }
@@ -1343,7 +1463,7 @@ impl Client {
         }
         let wire = self.do_json::<Value, CustomDomainListWire>(
             Method::POST,
-            &format!("{}/sandboxes/{}/custom-domains", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/custom-domains", self.version_prefix(), resource_path(id)),
             Some(&body),
         )?;
         Ok(wire.custom_domains)
@@ -1353,7 +1473,7 @@ impl Client {
     pub fn list_custom_domains(&self, id: &str) -> Result<Vec<CustomDomain>, Error> {
         let wire = self.do_json::<(), CustomDomainListWire>(
             Method::GET,
-            &format!("{}/sandboxes/{}/custom-domains", self.version_prefix(), id),
+            &format!("{}/sandboxes/{}/custom-domains", self.version_prefix(), resource_path(id)),
             None,
         )?;
         Ok(wire.custom_domains)
@@ -1367,7 +1487,7 @@ impl Client {
             &format!(
                 "{}/sandboxes/{}/custom-domains/{}",
                 self.version_prefix(),
-                id,
+                resource_path(id),
                 urlencoding::encode(hostname),
             ),
             None,
@@ -1396,7 +1516,7 @@ impl Client {
             &format!(
                 "{}/sandboxes/{}/custom-domains/dns",
                 self.version_prefix(),
-                id
+                resource_path(id)
             ),
             None,
         )
@@ -1404,6 +1524,90 @@ impl Client {
 
     fn full_url(&self, path: &str) -> String {
         format!("{}{}", self.api_url, path)
+    }
+
+    /// Sends a request built by `build`, following redirects manually (up to
+    /// [`MAX_REDIRECTS`] hops) with the same hygiene as the Go/Java/TypeScript
+    /// SDKs. `build(method, url, strip_credentials, with_body)` reconstructs the
+    /// request for each hop: a hop to a different scheme/host/port drops
+    /// `Authorization` and the `X-Registry-*` credentials, and a 307/308 that
+    /// would replay a request body across origins is refused instead of
+    /// followed. 301/302/303 degrade to a body-less GET.
+    ///
+    /// The transport must not follow redirects itself
+    /// ([`reqwest::redirect::Policy::none`]): it would replay those credentials
+    /// with no origin check, and this method would never see the intermediate
+    /// 3xx.
+    fn send_following_redirects<F>(
+        &self,
+        initial_url: &str,
+        method: Method,
+        has_body: bool,
+        build: F,
+    ) -> Result<reqwest::blocking::Response, Error>
+    where
+        F: Fn(&Method, &str, bool, bool) -> reqwest::blocking::RequestBuilder,
+    {
+        let origin = reqwest::Url::parse(initial_url)
+            .map_err(|err| Error::Api(format!("invalid request URL: {}", err)))?;
+        let mut url = origin.clone();
+        let mut method = method;
+        let mut with_body = has_body;
+
+        for _ in 0..=MAX_REDIRECTS {
+            let cross_origin = is_cross_origin(&origin, &url);
+            let response = build(&method, url.as_str(), cross_origin, with_body).send()?;
+            let status = response.status();
+            let redirect = matches!(
+                status,
+                reqwest::StatusCode::MOVED_PERMANENTLY
+                    | reqwest::StatusCode::FOUND
+                    | reqwest::StatusCode::SEE_OTHER
+                    | reqwest::StatusCode::TEMPORARY_REDIRECT
+                    | reqwest::StatusCode::PERMANENT_REDIRECT
+            );
+            if !redirect {
+                return Ok(response);
+            }
+            let location = match response.headers().get(reqwest::header::LOCATION) {
+                Some(value) => value
+                    .to_str()
+                    .map_err(|_| Error::Api("redirect Location is not a valid URL".to_string()))?
+                    .to_string(),
+                None => return Ok(response),
+            };
+            let next = url
+                .join(&location)
+                .map_err(|err| Error::Api(format!("invalid redirect location: {}", err)))?;
+            if is_cross_origin(&origin, &next)
+                && matches!(
+                    status,
+                    reqwest::StatusCode::TEMPORARY_REDIRECT
+                        | reqwest::StatusCode::PERMANENT_REDIRECT
+                )
+                && with_body
+            {
+                return Err(Error::Api(
+                    "refusing to follow cross-origin redirect with a request body".to_string(),
+                ));
+            }
+            if status == reqwest::StatusCode::SEE_OTHER
+                || (matches!(
+                    status,
+                    reqwest::StatusCode::MOVED_PERMANENTLY | reqwest::StatusCode::FOUND
+                ) && method != Method::GET
+                    && method != Method::HEAD)
+            {
+                method = Method::GET;
+                with_body = false;
+            }
+            url = next;
+        }
+
+        Err(Error::Api(format!(
+            "stopped after {} redirects",
+            MAX_REDIRECTS
+        )))
     }
 
     fn do_json<T: Serialize, U: DeserializeOwned>(
@@ -1419,15 +1623,25 @@ impl Client {
         let mut attempt = 0;
         loop {
             let url = self.full_url(path);
-            let mut builder = self
-                .inner
-                .request(method.clone(), &url)
-                .bearer_auth(&self.pat_token);
-            if let Some(body) = payload {
-                builder = builder.json(body);
-            }
+            let send_result = self.send_following_redirects(
+                &url,
+                method.clone(),
+                payload.is_some(),
+                |hop_method, hop_url, strip_credentials, with_body| {
+                    let mut builder = self.inner.request(hop_method.clone(), hop_url);
+                    if !strip_credentials {
+                        builder = builder.bearer_auth(&self.pat_token);
+                    }
+                    if with_body {
+                        if let Some(body) = payload {
+                            builder = builder.json(body);
+                        }
+                    }
+                    builder
+                },
+            );
 
-            match builder.send() {
+            match send_result {
                 Ok(response) => {
                     let status = response.status();
                     if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -1445,11 +1659,12 @@ impl Client {
                         return response.json().map_err(Error::Reqwest);
                     }
                 }
-                Err(err) => {
+                Err(Error::Reqwest(err)) => {
                     if attempt >= max_retries || !err.is_request() && !err.is_connect() && !err.is_timeout() {
                         return Err(Error::Reqwest(err));
                     }
                 }
+                Err(err) => return Err(err),
             }
 
             let delay_ms = std::cmp::min(base_delay * (1 << attempt), max_delay);
@@ -1459,17 +1674,6 @@ impl Client {
             std::thread::sleep(sleep_duration);
             attempt += 1;
         }
-    }
-
-    fn do_multipart(&self, path: &str, form: Form) -> Result<(), Error> {
-        let url = self.full_url(path);
-        let response = self
-            .inner
-            .post(&url)
-            .bearer_auth(&self.pat_token)
-            .multipart(form)
-            .send()?;
-        self.handle_response(response).map(|_| ())
     }
 
     fn handle_response(
@@ -3671,3 +3875,467 @@ mod tests {
         assert_eq!(dns.target.hostname.as_deref(), Some("ingress.example.com"));
     }
 }
+
+// Security-focused tests: URL path escaping for dynamic IDs (F5), cross-origin
+// redirect hygiene (F3), and Debug redaction for secret-bearing types (F4).
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut header_end = None;
+        let mut content_length = 0usize;
+
+        loop {
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).expect("request should read");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+
+            if header_end.is_none() {
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    header_end = Some(end);
+                    let headers = String::from_utf8_lossy(&buffer[..end]);
+                    for line in headers.lines() {
+                        if let Some((key, value)) = line.split_once(':') {
+                            if key.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(end) = header_end {
+                if buffer.len() >= end + content_length {
+                    break;
+                }
+            }
+        }
+
+        String::from_utf8_lossy(&buffer).to_string()
+    }
+
+    /// Accepts `accepts` connections, records each request line+head+body, and
+    /// answers with a JSON `{"status":"ok"}` document.
+    fn spawn_capture_server(accepts: usize) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            for _ in 0..accepts {
+                let (mut stream, _) = listener.accept().expect("server should accept");
+                let request = read_request(&mut stream);
+                request_tx.send(request).expect("request should be sent");
+                let body = b"{\"status\":\"ok\"}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).ok();
+                stream.write_all(body).ok();
+            }
+        });
+
+        (format!("http://{}", addr), request_rx)
+    }
+
+    /// Accepts `accepts` connections and answers each with `status` pointing at
+    /// `location`. 307/308 preserve method + body on replay; 301/302/303
+    /// degrade to a body-less GET.
+    fn spawn_redirect_server(
+        location: String,
+        accepts: usize,
+        status: u16,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let reason = match status {
+                301 => "Moved Permanently",
+                302 => "Found",
+                303 => "See Other",
+                308 => "Permanent Redirect",
+                _ => "Temporary Redirect",
+            };
+            for _ in 0..accepts {
+                let (mut stream, _) = listener.accept().expect("server should accept");
+                let request = read_request(&mut stream);
+                request_tx.send(request).expect("request should be sent");
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    status, reason, location,
+                );
+                stream.write_all(response.as_bytes()).ok();
+            }
+        });
+
+        (format!("http://{}", addr), request_rx)
+    }
+
+    fn minimal_sandbox_data() -> SandboxData {
+        serde_json::from_value(serde_json::json!({
+            "id": "sb-1",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-1.example.com",
+            "cpu": 2,
+            "memory_mb": 2048,
+            "disk_gb": 20,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T10:00:00Z",
+            "last_active_at": "2026-05-07T10:00:00Z"
+        }))
+        .expect("sandbox data should build")
+    }
+
+    // ---- F4: Debug redaction -------------------------------------------
+
+    #[test]
+    fn client_debug_redacts_pat_token() {
+        let client =
+            Client::new(Some("http://127.0.0.1:21212"), Some("pat-token-secret")).expect("client");
+        let rendered = format!("{:?}", client);
+        assert!(
+            !rendered.contains("pat-token-secret"),
+            "Debug leaked PAT: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn sandbox_debug_redacts_ssh_private_key_and_client_token() {
+        let client =
+            Client::new(Some("http://127.0.0.1:21212"), Some("pat-token-secret")).expect("client");
+        let sandbox = Sandbox::new_with_ssh_private_key(
+            client,
+            minimal_sandbox_data(),
+            Some("PRIVATE-KEY-SECRET".to_string()),
+        );
+        let rendered = format!("{:?}", sandbox);
+        assert!(
+            !rendered.contains("PRIVATE-KEY-SECRET"),
+            "Debug leaked ssh key: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("pat-token-secret"),
+            "Debug leaked PAT via client field: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn credential_structs_debug_redact_secrets() {
+        // Every secret-bearing type is enumerated here so adding one is a
+        // visible prompt to give it a redacting Debug.
+        const SECRET: &str = "PASSWORD-SECRET";
+        let mut credentials = std::collections::HashMap::new();
+        credentials.insert("secret_key".to_string(), SECRET.to_string());
+
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "RegistryAuth",
+                format!(
+                    "{:?}",
+                    RegistryAuth {
+                        server: "ghcr.io".to_string(),
+                        username: "acme".to_string(),
+                        password: SECRET.to_string(),
+                    }
+                ),
+            ),
+            (
+                "BuildImagePushOptions",
+                format!(
+                    "{:?}",
+                    BuildImagePushOptions {
+                        registry: "ghcr.io/acme/app".to_string(),
+                        tag: None,
+                        server: None,
+                        username: "acme".to_string(),
+                        password: SECRET.to_string(),
+                    }
+                ),
+            ),
+            (
+                "PushWasmModuleOptions",
+                format!(
+                    "{:?}",
+                    PushWasmModuleOptions {
+                        name: "mod".to_string(),
+                        tag: "latest".to_string(),
+                        module: vec![1, 2, 3],
+                        registry_username: "acme".to_string(),
+                        registry_token: SECRET.to_string(),
+                    }
+                ),
+            ),
+            (
+                "ClientConfig",
+                format!(
+                    "{:?}",
+                    ClientConfig {
+                        api_url: Some("https://api.example.com".to_string()),
+                        pat_token: Some(SECRET.to_string()),
+                        retry: None,
+                    }
+                ),
+            ),
+            (
+                "Client",
+                format!(
+                    "{:?}",
+                    Client::new(Some("http://127.0.0.1:21212"), Some(SECRET)).expect("client")
+                ),
+            ),
+            (
+                "MountSpec",
+                format!(
+                    "{:?}",
+                    MountSpec {
+                        mount_type: MountType::S3,
+                        target: "/data".to_string(),
+                        source: "bucket".to_string(),
+                        options: None,
+                        credentials: Some(credentials),
+                        read_only: None,
+                    }
+                ),
+            ),
+            (
+                "CreateSandboxResponse",
+                format!(
+                    "{:?}",
+                    CreateSandboxResponse {
+                        sandbox: minimal_sandbox_data(),
+                        ssh_private_key: Some(SECRET.to_string()),
+                    }
+                ),
+            ),
+        ];
+
+        for (label, rendered) in cases {
+            assert!(
+                !rendered.contains(SECRET),
+                "{} Debug leaked a secret: {}",
+                label,
+                rendered
+            );
+        }
+    }
+
+    // ---- F5: percent-escaped resource IDs ------------------------------
+
+    #[test]
+    fn resource_ids_are_percent_escaped_in_paths() {
+        let (url, request_rx) = spawn_capture_server(4);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client");
+
+        // Decoded responses do not matter here — assert on the request lines.
+        let _ = client.get("x/../admin");
+        let _ = client.get_template("x/../admin");
+        let _ = client.delete_wasm_module("x/../admin");
+        let _ = client.get_session("x/../admin", "x/../admin");
+
+        let escaped = "x%2F..%2Fadmin";
+        let expected = [
+            format!("GET /v1/sandboxes/{} HTTP/1.1\r\n", escaped),
+            format!("GET /v1/templates/{} HTTP/1.1\r\n", escaped),
+            format!("DELETE /v1/wasm-modules/{} HTTP/1.1\r\n", escaped),
+            format!(
+                "GET /v1/sandboxes/{}/sessions/{} HTTP/1.1\r\n",
+                escaped, escaped
+            ),
+        ];
+        for want in expected {
+            let request = request_rx.recv().expect("request captured");
+            assert!(
+                request.starts_with(&want),
+                "request path not escaped: got {:?}, want prefix {:?}",
+                request.lines().next(),
+                want.trim_end()
+            );
+        }
+    }
+
+    // ---- F3: cross-origin redirect hygiene ------------------------------
+
+    #[test]
+    fn cross_origin_redirect_is_not_followed_with_registry_credentials() {
+        let (capture_url, capture_rx) = spawn_capture_server(1);
+        let (redirect_url, _redirect_rx) = spawn_redirect_server(capture_url.clone(), 1, 307);
+        let client = Client::new(Some(&redirect_url), Some("pat-token")).expect("client");
+
+        let result = client.push_wasm_module(PushWasmModuleOptions {
+            name: "mod".to_string(),
+            tag: "latest".to_string(),
+            module: b"wasm".to_vec(),
+            registry_username: "registry-user".to_string(),
+            registry_token: "registry-token-secret".to_string(),
+        });
+
+        assert!(
+            capture_rx.try_recv().is_err(),
+            "cross-origin redirect target was contacted (registry credentials would leak)"
+        );
+        assert!(
+            result.is_err(),
+            "cross-origin redirect must be refused, not silently followed"
+        );
+    }
+
+    #[test]
+    fn cross_origin_redirect_does_not_replay_secret_bodies() {
+        const SECRET: &str = "super-secret-push-password";
+
+        let (capture_url, capture_rx) = spawn_capture_server(1);
+        let (redirect_url, _redirect_rx) = spawn_redirect_server(capture_url.clone(), 1, 307);
+        let client = Client::new(Some(&redirect_url), Some("pat-token")).expect("client");
+
+        let image = Image::from_dockerfile("FROM alpine");
+        let result = client.build_image_with_options(
+            &image,
+            &BuildImageOptions {
+                push: Some(BuildImagePushOptions {
+                    registry: "ghcr.io/acme/app".to_string(),
+                    tag: None,
+                    server: None,
+                    username: "acme".to_string(),
+                    password: SECRET.to_string(),
+                }),
+            },
+        );
+
+        if let Ok(request) = capture_rx.try_recv() {
+            assert!(
+                !request.contains(SECRET),
+                "cross-origin redirect replayed request body containing credentials"
+            );
+            panic!("cross-origin redirect target was contacted with a credential-bearing body");
+        }
+        assert!(
+            result.is_err(),
+            "cross-origin 307 with a credential-bearing body must be refused"
+        );
+    }
+
+    /// A 302 that degrades to a body-less GET is safe to follow cross-origin,
+    /// so the SDK does — matching Go/Java/TypeScript — but must strip both
+    /// `Authorization` and the `X-Registry-*` credentials on the hop.
+    #[test]
+    fn cross_origin_302_is_followed_without_credentials() {
+        let (capture_url, capture_rx) = spawn_capture_server(1);
+        let (redirect_url, _redirect_rx) = spawn_redirect_server(capture_url.clone(), 1, 302);
+        let client = Client::new(Some(&redirect_url), Some("pat-token")).expect("client");
+
+        // The capture server answers `{"status":"ok"}`, which is not a valid
+        // PushWasmModuleResponse, so decode may fail — assert on the wire.
+        let _ = client.push_wasm_module(PushWasmModuleOptions {
+            name: "mod".to_string(),
+            tag: "latest".to_string(),
+            module: b"wasm".to_vec(),
+            registry_username: "registry-user".to_string(),
+            registry_token: "registry-token-secret".to_string(),
+        });
+
+        let request = capture_rx
+            .try_recv()
+            .expect("cross-origin 302 should be followed");
+        let lower = request.to_lowercase();
+        assert!(
+            !lower.contains("authorization:"),
+            "cross-origin redirect leaked Authorization: {}",
+            request
+        );
+        assert!(
+            !lower.contains("x-registry-token"),
+            "cross-origin redirect leaked X-Registry-Token: {}",
+            request
+        );
+        assert!(
+            !lower.contains("x-registry-username"),
+            "cross-origin redirect leaked X-Registry-Username: {}",
+            request
+        );
+    }
+
+    #[test]
+    fn same_origin_redirect_is_followed_with_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("server should accept");
+                let request = read_request(&mut stream);
+                request_tx.send(request.clone()).expect("request should be sent");
+                if request.starts_with("GET /health HTTP/1.1") {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 302 Found\r\nLocation: /health2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .ok();
+                } else {
+                    let body = b"{\"status\":\"ok\",\"sandboxes\":1,\"docker\":\"up\",\"caddy\":\"up\",\"version\":\"1\"}";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len(),
+                    );
+                    stream.write_all(response.as_bytes()).ok();
+                    stream.write_all(body).ok();
+                }
+            }
+        });
+
+        let client =
+            Client::new(Some(&format!("http://{}", addr)), Some("pat-token")).expect("client");
+        let health = client
+            .health()
+            .expect("same-origin redirect should be followed");
+        assert_eq!(health.status, "ok");
+
+        let first = request_rx.recv().expect("first request captured");
+        assert!(
+            first.to_lowercase().contains("authorization: bearer pat-token"),
+            "first hop should carry Authorization: {}",
+            first
+        );
+        let second = request_rx.recv().expect("second request captured");
+        assert!(
+            second.starts_with("GET /health2 HTTP/1.1"),
+            "redirect not followed to /health2: {:?}",
+            second.lines().next()
+        );
+        assert!(
+            second.to_lowercase().contains("authorization: bearer pat-token"),
+            "same-origin hop dropped Authorization: {}",
+            second
+        );
+    }
+
+    /// `is_cross_origin` must treat a same-host scheme upgrade as cross-origin
+    /// (like the other SDKs), so credentials are stripped on the hop.
+    #[test]
+    fn same_host_scheme_change_is_cross_origin() {
+        let http = reqwest::Url::parse("http://daemon.example.com/v1/health").expect("url");
+        let https = reqwest::Url::parse("https://daemon.example.com/v1/health").expect("url");
+        assert!(is_cross_origin(&http, &https));
+        assert!(is_cross_origin(&https, &http));
+    }
+}
+

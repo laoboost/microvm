@@ -291,6 +291,11 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 			}
 			s.bindNetworkHook(eng, env.SandboxID)
 			// Honor caps wall timeout (D8) — previously invoked with Background.
+			// The long-lived-serve exemption does not apply here: a shared resident
+			// host rejects the wasip1 listener, so an HTTP serve never runs on one
+			// (expose_port migrates the sandbox to a dedicated cold worker). Keeping
+			// every invoke on this config bounded protects co-tenants from a
+			// CPU-bound guest in the shared process.
 			invokeCtx, cancel := wasmengine.WithInvocationDeadline(ctx, s.capsFor(env.SandboxID))
 			invokeErr := eng.InvokeExport(invokeCtx, env.SandboxID, p.Export)
 			cancel()

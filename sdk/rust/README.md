@@ -8,6 +8,18 @@ A Rust client for the Aerol.ai MicroVM sandbox API.
 cargo add aerolvm-sdk
 ```
 
+## Redirect policy
+
+Redirects are followed manually (up to 5 hops) with the same hygiene as the
+Go, Python, Java, and TypeScript SDKs. A hop to a different scheme, host, or
+port drops `Authorization` and the `X-Registry-*` credentials — a same-host
+scheme upgrade (`http://daemon` → `https://daemon`) is cross-origin, so it is
+followed without those credentials. A 307/308 that would replay a request body
+across origins is refused instead of followed, and 301/302/303 degrade to a
+body-less GET. The underlying transport is configured never to follow
+redirects itself, so the SDK strips credentials before they can leave for
+another origin.
+
 ## Usage
 
 ```rust
@@ -133,3 +145,15 @@ let handle = sandbox.attach_session(&session.id, aerolvm_sdk::SessionAttachOptio
 handle.write_string("echo attached\n")?;
 println!("{:?}", handle.wait()?);
 ```
+
+## Migration notes (0.6.0)
+
+Security release. Behaviour changes to review when upgrading:
+
+- `PushWasmModuleOptions` and `ClientConfig` now redact their secrets in
+  `Debug` output (`registry_token`, `pat_token`), alongside the types that
+  were already redacted.
+- Redirects are now followed manually: a cross-origin hop strips
+  `Authorization` and `X-Registry-*`, a cross-origin 307/308 with a request
+  body is refused, and 301/302/303 degrade to a GET. This replaces the earlier
+  strict "refuse every cross-origin redirect" behaviour.

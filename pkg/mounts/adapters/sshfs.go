@@ -19,13 +19,19 @@ func (SSHFS) Build(sandboxID string, index int, spec models.MountSpec, hostTarge
 	if pem == "" {
 		return Plan{}, errors.New("sshfs requires credentials.private_key_pem")
 	}
-	if err := checkSource("sshfs", spec.Source); err != nil {
+	if err := checkSSHFSSource(spec.Source); err != nil {
 		return Plan{}, err
 	}
 
 	credFile := filepath.Join(credDir, fmt.Sprintf("%s-%d.id", sandboxID, index))
 	opts := "IdentityFile=" + credFile +
-		",StrictHostKeyChecking=accept-new" +
+		// StrictHostKeyChecking=yes, not accept-new: trust-on-first-use is
+		// MITM-able. Operators whose host key is not in the daemon's
+		// known_hosts must supply it via credentials if needed.
+		",StrictHostKeyChecking=yes" +
+		// Pin ProxyCommand to none so neither a crafted source nor an ssh
+		// config can turn the mount into an arbitrary command execution.
+		",ProxyCommand=none" +
 		",ServerAliveInterval=15,ServerAliveCountMax=3" +
 		",reconnect,allow_other,foreground"
 	if spec.ReadOnly {

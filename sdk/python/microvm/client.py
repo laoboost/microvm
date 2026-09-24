@@ -68,9 +68,54 @@ _PATH_PREFIXES: Dict[str, str] = {
     "v1": _V1_PATH_PREFIX,
 }
 
+# Credential headers that must never cross an origin boundary on redirect.
+_SENSITIVE_REDIRECT_HEADERS = ("authorization", "x-registry-username", "x-registry-token")
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    a = urllib.parse.urlsplit(url_a)
+    b = urllib.parse.urlsplit(url_b)
+
+    def norm(parts: Any) -> Any:
+        scheme = (parts.scheme or "").lower()
+        host = (parts.hostname or "").lower()
+        port = parts.port
+        if port is None:
+            port = 443 if scheme == "https" else 80
+        return (scheme, host, port)
+
+    return norm(a) == norm(b)
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Redirect handler that strips credential headers on cross-origin hops.
+
+    urllib's default handler copies *all* request headers (including
+    Authorization and X-Registry-*) onto the redirect target, so any 3xx can
+    exfiltrate the PAT and registry credentials to an attacker-chosen host.
+    Same-origin redirects keep their headers.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None and not _same_origin(req.full_url, newurl):
+            for mapping in (new_req.headers, new_req.unredirected_hdrs):
+                for key in [k for k in list(mapping) if k.lower() in _SENSITIVE_REDIRECT_HEADERS]:
+                    del mapping[key]
+        return new_req
+
 
 def _normalize_url(value: str) -> str:
     return value.rstrip("/")
+
+
+def _resource_path(segment: str) -> str:
+    """Percent-escape a dynamic URL path segment so it stays one segment.
+
+    IDs are caller-supplied; without escaping, "x/../admin" traverses out of
+    its route when spliced into a request path.
+    """
+    return urllib.parse.quote(str(segment), safe="")
 
 
 def _read_env(name: str) -> Optional[str]:
@@ -86,6 +131,20 @@ class MicroVMHTTPError(MicroVMError):
     def __init__(self, status_code: int, message: str) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+# Cap a single WebSocket message the SDK hands to a caller, matching the Go and
+# Java SDKs. websocket-client assembles the whole message inside recv(), so this
+# bounds what the SDK delivers rather than the transport's own memory.
+_MAX_WS_MESSAGE_BYTES = 32 * 1024 * 1024
+
+
+def _check_message_size(message: Any) -> None:
+    size = len(message.encode("utf-8")) if isinstance(message, str) else len(message)
+    if size > _MAX_WS_MESSAGE_BYTES:
+        raise MicroVMError(
+            f"websocket message of {size} bytes exceeds the {_MAX_WS_MESSAGE_BYTES}-byte limit"
+        )
 
 
 class ExecStreamHandle:
@@ -130,6 +189,7 @@ class ExecStreamHandle:
         try:
             while True:
                 message = self._ws.recv()
+                _check_message_size(message)
                 if isinstance(message, str):
                     self._handle_text_frame(message)
                     if self._done.done():
@@ -228,6 +288,7 @@ class SessionAttachHandle:
         try:
             while True:
                 message = self._ws.recv()
+                _check_message_size(message)
                 if isinstance(message, str):
                     self._handle_text_frame(message)
                     if self._done.done():
@@ -473,9 +534,9 @@ class MicroVM:
         """Build an Image and optionally push the result to a remote registry.
 
         When ``push`` is ``None``, behavior matches :meth:`build_image`.
-        Push credentials are forwarded to the daemon as a one-shot
-        ``X-Registry-Auth`` header on the underlying push call and are never
-        persisted server-side.
+        Push credentials are forwarded to the daemon in the ``push`` object of
+        the ``POST /v1/images/build`` request body and are never persisted
+        server-side.
         """
         if not isinstance(image, Image):
             raise TypeError("build_image expects an Image instance")
@@ -521,19 +582,19 @@ class MicroVM:
         return [self._wrap_sandbox(item) for item in sandboxes]
 
     def get(self, sandbox_id: str) -> Sandbox:
-        sandbox = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
+        sandbox = self._do_json("GET", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}", None)
         return self._wrap_sandbox(sandbox)
 
     def start(self, sandbox_id: str) -> Sandbox:
-        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/start", None)
+        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/start", None)
         return self._wrap_sandbox(sandbox)
 
     def stop(self, sandbox_id: str) -> Sandbox:
-        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/stop", None)
+        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/stop", None)
         return self._wrap_sandbox(sandbox)
 
     def create_snapshot(self, sandbox_id: str, name: str) -> SandboxSnapshot:
-        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/snapshot", {"name": name})
+        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/snapshot", {"name": name})
         return _from_api_sandbox_snapshot(response)
 
     def register_snapshot(self, options: RegisterSnapshotOptions) -> SandboxSnapshot:
@@ -578,7 +639,7 @@ class MicroVM:
         return self.register_snapshot(resolved_options)
 
     def destroy(self, sandbox_id: str) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)
+        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}", None)
 
     def create_template(self, options: CreateTemplateOptions) -> Template:
         """Register a Firecracker rootfs template.
@@ -614,11 +675,11 @@ class MicroVM:
         return [_from_api_template(item) for item in response]
 
     def get_template(self, template_id: str) -> Template:
-        response = self._do_json("GET", f"{self._version_prefix}/templates/{template_id}", None)
+        response = self._do_json("GET", f"{self._version_prefix}/templates/{_resource_path(template_id)}", None)
         return _from_api_template(response)
 
     def delete_template(self, template_id: str) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/templates/{template_id}", None)
+        self._do_json("DELETE", f"{self._version_prefix}/templates/{_resource_path(template_id)}", None)
 
     def create_wasm_module(self, options: CreateWasmModuleOptions) -> WasmModule:
         """Register a WASM module in the host catalogue.
@@ -650,11 +711,11 @@ class MicroVM:
         return [_from_api_wasm_module(item) for item in response]
 
     def get_wasm_module(self, module_id: str) -> WasmModule:
-        response = self._do_json("GET", f"{self._version_prefix}/wasm-modules/{module_id}", None)
+        response = self._do_json("GET", f"{self._version_prefix}/wasm-modules/{_resource_path(module_id)}", None)
         return _from_api_wasm_module(response)
 
     def delete_wasm_module(self, module_id: str) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/wasm-modules/{module_id}", None)
+        self._do_json("DELETE", f"{self._version_prefix}/wasm-modules/{_resource_path(module_id)}", None)
 
     def push_wasm_module(self, options: PushWasmModuleOptions) -> PushWasmModuleResult:
         """Upload a compiled core-wasip1 module to the registry under your own
@@ -699,15 +760,15 @@ class MicroVM:
         flight) or not supported (``ready_no_snapshot``/``failed`` —
         those need delete+recreate today).
         """
-        response = self._do_json("POST", f"{self._version_prefix}/templates/{template_id}/rebuild", None)
+        response = self._do_json("POST", f"{self._version_prefix}/templates/{_resource_path(template_id)}/rebuild", None)
         return _from_api_template(response)
 
     def resize(self, sandbox_id: str, options: ResizeOptions) -> Sandbox:
-        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/resize", _to_api_resize_options(options))
+        sandbox = self._do_json("POST", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/resize", _to_api_resize_options(options))
         return self._wrap_sandbox(sandbox)
 
     def update_lifecycle(self, sandbox_id: str, lifecycle: Lifecycle) -> Sandbox:
-        sandbox = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/lifecycle", _to_api_lifecycle(lifecycle))
+        sandbox = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/lifecycle", _to_api_lifecycle(lifecycle))
         return self._wrap_sandbox(sandbox)
 
     def reconcile(self) -> None:
@@ -717,30 +778,30 @@ class MicroVM:
         return _from_api_health_status(self._do_json("GET", "/health", None))
 
     def mounts(self, sandbox_id: str) -> List[MountSpecRedacted]:
-        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/mounts", None)
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/mounts", None)
         mounts = _first_of(payload, "mounts") or []
         if not isinstance(mounts, list):
             return []
         return [_from_api_mount_spec_redacted(item) for item in mounts]
 
     def clone_generation(self, sandbox_id: str) -> CloneGeneration:
-        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/clone-generation", None)
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/toolbox/clone-generation", None)
         return CloneGeneration(
             generation=str(_first_of(payload, "generation") or ""),
             resumedAt=int(_first_of(payload, "resumed_at", "resumedAt") or 0),
         )
 
     def get_network_usage(self, sandbox_id: str) -> NetworkUsage:
-        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/usage", None)
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/network/usage", None)
         return _from_api_network_usage(payload)
 
     def set_network_limits(self, sandbox_id: str, options: SetNetworkLimitsOptions) -> NetworkUsage:
         body = _to_api_set_network_limits_options(options)
-        payload = self._do_json("PATCH", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/limits", body)
+        payload = self._do_json("PATCH", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/network/limits", body)
         return _from_api_network_usage(payload)
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
-        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
+        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/toolbox/process/execute", _to_api_exec_request(request))
         return _from_api_exec_result(response)
 
     def exec_stream(self, sandbox_id: str, options: ExecStreamOptions) -> ExecStreamHandle:
@@ -755,34 +816,34 @@ class MicroVM:
         return ExecStreamHandle(websocket_module, ws, options)
 
     def create_session(self, sandbox_id: str, options: CreateSessionOptions) -> Session:
-        session = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions", _to_api_create_session_options(options))
+        session = self._do_json("POST", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/sessions", _to_api_create_session_options(options))
         return _from_api_session(session)
 
     def list_sessions(self, sandbox_id: str) -> List[Session]:
-        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions", None)
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/sessions", None)
         sessions = _first_of(payload, "sessions") or []
         if not isinstance(sessions, list):
             return []
         return [_from_api_session(item) for item in sessions]
 
     def get_session(self, sandbox_id: str, session_id: str) -> Session:
-        session = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}", None)
+        session = self._do_json("GET", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/sessions/{_resource_path(session_id)}", None)
         return _from_api_session(session)
 
     def delete_session(self, sandbox_id: str, session_id: str) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}", None)
+        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/sessions/{_resource_path(session_id)}", None)
 
     def signal_session(self, sandbox_id: str, session_id: str, signal: str) -> None:
-        self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/signal", {"signal": signal})
+        self._do_json("POST", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/sessions/{_resource_path(session_id)}/signal", {"signal": signal})
 
     def resize_session(self, sandbox_id: str, session_id: str, cols: int, rows: int) -> None:
-        self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/resize", {"cols": cols, "rows": rows})
+        self._do_json("POST", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/sessions/{_resource_path(session_id)}/resize", {"cols": cols, "rows": rows})
 
     def session_log(self, sandbox_id: str, session_id: str) -> bytes:
-        return self._request("GET", self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/log"))
+        return self._request("GET", self._url(f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/sessions/{_resource_path(session_id)}/log"))
 
     def session_recording(self, sandbox_id: str, session_id: str) -> bytes:
-        return self._request("GET", self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions/{session_id}/recording"))
+        return self._request("GET", self._url(f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/sessions/{_resource_path(session_id)}/recording"))
 
     def attach_session(
         self,
@@ -807,7 +868,7 @@ class MicroVM:
 
     def upload_file(self, sandbox_id: str, target_path: str, data: bytes) -> None:
         self._do_multipart(
-            f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/upload",
+            f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/toolbox/files/upload",
             {"path": target_path},
             "file",
             target_path,
@@ -815,7 +876,7 @@ class MicroVM:
         )
 
     def download_file(self, sandbox_id: str, target_path: str) -> bytes:
-        url = self._url(f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
+        url = self._url(f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/toolbox/files/download?path={urllib.parse.quote(target_path, safe='')}")
         return self._request("GET", url)
 
     def expose_port(self, sandbox_id: str, port: int, *, protocol: ExposeProtocol = "http") -> ExposeResult:
@@ -834,11 +895,11 @@ class MicroVM:
         populated only on the ``"tcp"`` path.
         """
         body: Optional[Dict[str, Any]] = {"protocol": protocol} if protocol and protocol != "http" else None
-        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", body)
+        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/ports/{port}", body)
         return _from_api_expose_port_response(response)
 
     def unexpose_port(self, sandbox_id: str, port: int) -> None:
-        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}/ports/{port}", None)
+        self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}/ports/{port}", None)
 
     def add_custom_domain(
         self,
@@ -864,7 +925,7 @@ class MicroVM:
             body["target_port"] = port
         response = self._do_json(
             "POST",
-            self._versioned(f"/sandboxes/{sandbox_id}/custom-domains"),
+            self._versioned(f"/sandboxes/{_resource_path(sandbox_id)}/custom-domains"),
             body,
         )
         return _from_api_custom_domains_response(response)
@@ -872,7 +933,7 @@ class MicroVM:
     def list_custom_domains(self, sandbox_id: str) -> List[CustomDomain]:
         response = self._do_json(
             "GET",
-            self._versioned(f"/sandboxes/{sandbox_id}/custom-domains"),
+            self._versioned(f"/sandboxes/{_resource_path(sandbox_id)}/custom-domains"),
             None,
         )
         return _from_api_custom_domains_response(response)
@@ -884,7 +945,7 @@ class MicroVM:
         encoded = urllib.parse.quote(hostname, safe="")
         self._do_json(
             "DELETE",
-            self._versioned(f"/sandboxes/{sandbox_id}/custom-domains/{encoded}"),
+            self._versioned(f"/sandboxes/{_resource_path(sandbox_id)}/custom-domains/{encoded}"),
             None,
         )
 
@@ -910,7 +971,7 @@ class MicroVM:
         """
         response = self._do_json(
             "GET",
-            self._versioned(f"/sandboxes/{sandbox_id}/custom-domains/dns"),
+            self._versioned(f"/sandboxes/{_resource_path(sandbox_id)}/custom-domains/dns"),
             None,
         )
         return _from_api_custom_domain_dns_response(response)
@@ -934,6 +995,7 @@ class MicroVM:
         max_delay_ms = self._retry_config["maxDelayMs"]
 
         last_exc: Optional[Exception] = None
+        opener = urllib.request.build_opener(_SafeRedirectHandler())
 
         for attempt in range(max_retries + 1):
             request = urllib.request.Request(url, data=body, method=method)
@@ -944,7 +1006,7 @@ class MicroVM:
                 request.add_header(header_key, header_val)
 
             try:
-                with urllib.request.urlopen(request) as response:
+                with opener.open(request) as response:
                     return response.read()
             except urllib.error.HTTPError as exc:
                 last_exc = exc
@@ -993,6 +1055,13 @@ class MicroVM:
         filename: str,
         data: bytes,
     ) -> None:
+        # Field values and the filename are spliced into MIME headers/parts
+        # raw; CR/LF or quotes there enable part/header injection.
+        for label, value in list(fields.items()) + [("filename", os.path.basename(filename))]:
+            if any(ch in value for ch in ("\r", "\n", '"')):
+                raise ValueError(
+                    f"multipart {label} must not contain CR, LF, or quote characters"
+                )
         boundary = uuid.uuid4().hex
         body = BytesIO()
         encoder = body.write
@@ -1025,6 +1094,8 @@ def _connect_websocket(websocket_module: Any, ws_url: str, pat_token: str, label
     the toolbox proxy ("toolbox unavailable") and 401s with JSON error bodies
     are decipherable without a packet capture.
     """
+    if any(ch in pat_token for ch in ("\r", "\n")):
+        raise ValueError("pat_token must not contain CR or LF")
     try:
         return websocket_module.create_connection(
             ws_url,

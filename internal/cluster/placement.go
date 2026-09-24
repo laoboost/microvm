@@ -308,6 +308,37 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 	return admitReservationCommands(c.membersWithCapacity(), pending, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
 }
 
+// stampReservationOverwriteDecisions evaluates each reservation's overwrite
+// eligibility against the FSM rows visible at propose time and records the
+// decision on the command (command.AllowExpiredOverwrite). Expiry is decided
+// HERE — once, on the leader, under the reservation admission lock — because
+// Apply must stay a pure function of (prior state, command): replicas have
+// different wall clocks and must never re-decide. The decision is only
+// stamped for an existing RESERVED row whose ExpiresUnix has already passed;
+// anything else leaves the flag false and the FSM then treats a foreign
+// live reservation as ErrReservationConflict.
+func (c *Cluster) stampReservationOverwriteDecisions(cmd *command) {
+	now := time.Now().Unix()
+	if cmd.Op == opReserveBatch {
+		for i := range cmd.Reservations {
+			cmd.Reservations[i].AllowExpiredOverwrite = c.reservationExpiredForOverwrite(cmd.Reservations[i].SandboxID, now)
+		}
+		return
+	}
+	cmd.AllowExpiredOverwrite = c.reservationExpiredForOverwrite(cmd.SandboxID, now)
+}
+
+// reservationExpiredForOverwrite reports whether sandboxID currently holds a
+// reserved row whose expiry has passed — the only case where a proposer may
+// authorize taking the reservation over from its previous owner.
+func (c *Cluster) reservationExpiredForOverwrite(sandboxID string, now int64) bool {
+	existing, ok := c.fsm.get(sandboxID)
+	if !ok || !existing.IsReserved() {
+		return false
+	}
+	return existing.ExpiresUnix < now
+}
+
 func admitReservationCommands(members []Member, pending map[string]capacity.Request, pendingCounts map[string]int, maxPendingPerWorker int, reservations []reservationCommand) error {
 	byID := make(map[string]Member, len(members))
 	for _, m := range members {

@@ -147,7 +147,23 @@ func isForcedNonVoterRole(role string) bool {
 	return hasKnown
 }
 
+// mayAutoPromoteToVoter reports whether gossip-driven auto-promotion to raft
+// voter is permitted. Suffrage grants a quorum vote, and gossip claims
+// (Role, RaftAddr) are self-reported — with an unencrypted gossip channel
+// any host that can reach the port can announce itself. Auto-promotion is
+// therefore gated on the shared gossip key, or on the operator's explicit
+// ClusterInsecureGossip opt-in (which accepts exactly this risk).
+func (c *Cluster) mayAutoPromoteToVoter() bool {
+	return c.gossipEncrypted || c.cfg.ClusterInsecureGossip
+}
+
 func (c *Cluster) addMemberAsVoter(nodeID, raftAddr string) {
+	if !c.mayAutoPromoteToVoter() {
+		c.logger.Warn("cluster: refusing auto-promotion to raft voter on an unencrypted gossip channel; adding as non-voter (set SB_CLUSTER_INSECURE_GOSSIP=true to accept the risk, or configure SB_GOSSIP_SECRET_KEY)",
+			"node_id", nodeID, "raft_addr", raftAddr)
+		c.addMemberAsNonvoter(nodeID, raftAddr)
+		return
+	}
 	f := c.raft.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, c.commitTimeout)
 	if err := f.Error(); err != nil {
 		c.logger.Warn("cluster: auto-AddVoter failed; will retry on next reconcile",

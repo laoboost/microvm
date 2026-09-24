@@ -11,20 +11,21 @@ export const PATH_PREFIX = "/v1";
  * (add) and GET (list). The DELETE variant lives at
  * {@link sandboxCustomDomainPath}.
  *
- * `id` is interpolated verbatim — sandbox IDs are server-generated opaque
- * tokens and already URL-safe.
+ * `id` is percent-escaped into a single path segment — it is caller-supplied
+ * and must not be able to traverse out of its route.
  */
 export function sandboxCustomDomainsPath(prefix: string, id: string): string {
-  return `${prefix}/sandboxes/${id}/custom-domains`;
+  return `${prefix}/sandboxes/${encodeURIComponent(id)}/custom-domains`;
 }
 
 /**
- * URL for a single custom-domain binding. The hostname is percent-encoded so
- * IDN punycode (`xn--...`) and wildcard labels round-trip safely through
+ * URL for a single custom-domain binding. The hostname and sandbox id are
+ * percent-encoded so IDN punycode (`xn--...`), wildcard labels, and hostile
+ * ids round-trip safely through
  * `DELETE /v1/sandboxes/{id}/custom-domains/{hostname}`.
  */
 export function sandboxCustomDomainPath(prefix: string, id: string, hostname: string): string {
-  return `${prefix}/sandboxes/${id}/custom-domains/${encodeURIComponent(hostname)}`;
+  return `${prefix}/sandboxes/${encodeURIComponent(id)}/custom-domains/${encodeURIComponent(hostname)}`;
 }
 
 /**
@@ -39,8 +40,8 @@ export function ingressDNSPath(prefix: string): string {
 /**
  * URL for the ready-to-paste DNS records of one sandbox's custom-domain
  * bindings. Sibling of {@link sandboxCustomDomainsPath} — same `id` rules
- * apply.
+ * apply (percent-escaped into one path segment).
  */
 export function sandboxCustomDomainDNSPath(prefix: string, id: string): string {
-  return `${prefix}/sandboxes/${id}/custom-domains/dns`;
+  return `${prefix}/sandboxes/${encodeURIComponent(id)}/custom-domains/dns`;
 }

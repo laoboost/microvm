@@ -692,6 +692,9 @@
         owner: root
         group: root
       loop: "{{ sandboxd_ops_env | dict2items }}"
+      # no_log: the loop writes SB_FLEET_TOKEN (a bearer secret) among other
+      # values; without it Ansible prints every key=value pair to the console.
+      no_log: true
       notify: Apply sandboxd ops config
 
     - name: Create backup output directory

@@ -21,19 +21,26 @@ func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.Response
 	if err := d.ensureLoaded(r.Context(), sandboxID); err != nil {
 		return err
 	}
+	// Copy groupKey under d.mu: markGroupMembersStopped / reloadSandbox rewrite
+	// it under the same lock, so reading it after unlock raced a concurrent
+	// group teardown (F2g).
 	d.mu.Lock()
 	rec := d.byID[sandboxID]
+	groupKey := ""
+	if rec != nil {
+		groupKey = rec.groupKey
+	}
 	d.mu.Unlock()
-	if rec == nil || rec.groupKey == "" {
+	if groupKey == "" {
 		return fmt.Errorf("isolate: sandbox %q not loaded", sandboxID)
 	}
-	d.touchGroup(rec.groupKey)
+	d.touchGroup(groupKey)
 
 	d.groupsMu.Lock()
-	g := d.groups[rec.groupKey]
+	g := d.groups[groupKey]
 	d.groupsMu.Unlock()
 	if g == nil {
-		return fmt.Errorf("isolate: group %q gone", rec.groupKey)
+		return fmt.Errorf("isolate: group %q gone", groupKey)
 	}
 
 	resp, err := g.host.Invoke(r.Context(), sandboxID, r)

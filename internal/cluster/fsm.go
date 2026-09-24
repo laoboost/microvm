@@ -78,6 +78,22 @@ type command struct {
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
 	// transitioning State back to Placed.
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
+	// NowUnix is the proposer-stamped wall clock (unix seconds) for this
+	// entry. Apply is a pure function of (prior state, command): every
+	// CreatedUnix/UpdatedUnix/OrphanedUnix and volume CreatedAt the FSM
+	// writes comes from this field, never from a replica-local clock, so
+	// every replica stores identical timestamps. Stamped by
+	// Cluster/Agent.applyCommand when unset; zero for pre-upgrade log
+	// entries (which then all store zero timestamps, identically).
+	NowUnix int64 `json:"now_unix,omitempty"`
+	// AllowExpiredOverwrite is the proposer's explicit expiry decision for
+	// opReserve/opReserveBatch: the proposer evaluated the existing
+	// reservation's ExpiresUnix at propose time and authorizes taking it
+	// over. Apply never re-evaluates expiry against a local clock — without
+	// this flag, an expired reservation held by a different owner is still
+	// an ErrReservationConflict. Stamped by the leader's reservation
+	// admission path (see stampReservationOverwriteDecisions).
+	AllowExpiredOverwrite bool `json:"allow_expired_overwrite,omitempty"`
 	// NodeID + Drained are populated by opSetNodeDrainState. NodeID is the
 	// target of the drain mark; Drained is the desired state (true = exclude
 	// from SelectPlacement, false = uncordon). All other ops leave them zero.
@@ -127,6 +143,12 @@ type reservationCommand struct {
 	SecretRef          string                       `json:"secret_ref,omitempty"`
 	SecretVersion      int                          `json:"secret_version,omitempty"`
 	ExpiresUnix        int64                        `json:"expires_unix,omitempty"`
+	// NowUnix / AllowExpiredOverwrite carry the same proposer-stamped
+	// decision fields as command — see the command struct docs. They are
+	// per-reservation so a batch can mix live-retry refreshes with explicit
+	// expired-takeovers in one entry.
+	NowUnix               int64 `json:"now_unix,omitempty"`
+	AllowExpiredOverwrite bool  `json:"allow_expired_overwrite,omitempty"`
 }
 
 // reassignApplyResult is returned only for failover-tagged opReassign entries.
@@ -158,28 +180,32 @@ func (c command) placementSecrets() PlacementSecrets {
 
 func reservationFromCommand(c command) reservationCommand {
 	return reservationCommand{
-		SandboxID:          c.SandboxID,
-		OwnerNodeID:        c.OwnerNodeID,
-		OwnerAPIURL:        c.OwnerAPIURL,
-		OwnerDataPlaneHost: c.OwnerDataPlaneHost,
-		Spec:               c.Spec,
-		SecretRef:          c.SecretRef,
-		SecretVersion:      c.SecretVersion,
-		ExpiresUnix:        c.ExpiresUnix,
+		SandboxID:             c.SandboxID,
+		OwnerNodeID:           c.OwnerNodeID,
+		OwnerAPIURL:           c.OwnerAPIURL,
+		OwnerDataPlaneHost:    c.OwnerDataPlaneHost,
+		Spec:                  c.Spec,
+		SecretRef:             c.SecretRef,
+		SecretVersion:         c.SecretVersion,
+		ExpiresUnix:           c.ExpiresUnix,
+		NowUnix:               c.NowUnix,
+		AllowExpiredOverwrite: c.AllowExpiredOverwrite,
 	}
 }
 
 func commandFromReservation(r reservationCommand) command {
 	return command{
-		Op:                 opReserve,
-		SandboxID:          r.SandboxID,
-		OwnerNodeID:        r.OwnerNodeID,
-		OwnerAPIURL:        r.OwnerAPIURL,
-		OwnerDataPlaneHost: r.OwnerDataPlaneHost,
-		Spec:               r.Spec,
-		SecretRef:          r.SecretRef,
-		SecretVersion:      r.SecretVersion,
-		ExpiresUnix:        r.ExpiresUnix,
+		Op:                    opReserve,
+		SandboxID:             r.SandboxID,
+		OwnerNodeID:           r.OwnerNodeID,
+		OwnerAPIURL:           r.OwnerAPIURL,
+		OwnerDataPlaneHost:    r.OwnerDataPlaneHost,
+		Spec:                  r.Spec,
+		SecretRef:             r.SecretRef,
+		SecretVersion:         r.SecretVersion,
+		ExpiresUnix:           r.ExpiresUnix,
+		NowUnix:               r.NowUnix,
+		AllowExpiredOverwrite: r.AllowExpiredOverwrite,
 	}
 }
 
@@ -397,6 +423,13 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return fmt.Errorf("placementFSM: decode: %w", err)
 	}
 
+	// Hydrate the command's recovery payloads OUTSIDE f.mu (W3b N6). The
+	// preserve paths (opPlace with a nil Spec, secret-only updates) read
+	// existing.Spec/SecretRef so a replay cannot erase the previously-
+	// replicated payload; resolving that ref under f.mu would stall every
+	// concurrent Apply and reader for the whole peer-fetch timeout.
+	f.hydrateCommandRecovery(cmd)
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// Use the raft log index as the FSM version. Raft guarantees it is
@@ -407,7 +440,6 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 	// and reset to 0 on every cold restart, which broke watchers that
 	// expected a monotonic revision across restores (B9).
 	f.version = log.Index
-	now := time.Now().Unix()
 
 	switch cmd.Op {
 	case opPlace:
@@ -424,7 +456,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if exists && existing.IsOrphaned() {
 			return fmt.Errorf("%w: %s is orphaned; use ClaimOrphan", ErrReservationConflict, cmd.SandboxID)
 		}
-		if exists && !existing.IsReserved() && existing.OwnerNodeID != "" && existing.OwnerNodeID != cmd.OwnerNodeID {
+		// A RESERVED row is an ownership claim like any other: opPlace from a
+		// different owner must not steal it (C6c). Taking over an expired
+		// reservation is exclusively opReserve's job, and only with an
+		// explicit AllowExpiredOverwrite decision from the proposer.
+		if exists && existing.OwnerNodeID != "" && existing.OwnerNodeID != cmd.OwnerNodeID {
 			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
 		// Cluster-wide name uniqueness. Without this, two concurrent creates
@@ -441,7 +477,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if err := f.validateNameUniqueLocked(cmd.SandboxID, name); err != nil {
 			return err
 		}
-		created := now
+		created := cmd.NowUnix
 		if exists {
 			created = existing.CreatedUnix
 		}
@@ -450,6 +486,18 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// Preserve the previously-replicated spec — never erase it via a
 			// later opPlace that omits the payload.
 			spec = existing.Spec
+		}
+		// F2b: when the row still references a replicated recovery payload that
+		// THIS replica could not resolve locally (a recovery-store read
+		// failure), carry the ref through verbatim. Rebuilding the row from the
+		// nil payload would recompute (and thus clear) RecoveryRef and drop any
+		// in-memory copy, permanently diverging this replica from a healthy one
+		// — a divergence that then propagates to new voters via snapshot. An
+		// apply error would not be convergent here either, since only this
+		// replica's disk failed; preserving the replicated ref is.
+		recoveryRef := ""
+		if exists && spec == nil && existing.RecoveryRef != "" {
+			recoveryRef = existing.RecoveryRef
 		}
 		// Same preservation rule as Spec: a partial replay must not erase the
 		// secret provider handle the original create stored.
@@ -472,17 +520,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if dataPlaneHost == "" && exists {
 			dataPlaneHost = existing.OwnerDataPlaneHost
 		}
-		// Drop the OLD name from the index before writing the new placement —
-		// otherwise a re-place with a renamed spec would leave a phantom
-		// nameIndex entry pointing at this sandbox under its previous name.
-		if exists {
-			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
-			f.releaseOwnerLocked(cmd.SandboxID, existing)
-			if existing.IsReserved() {
-				f.releasePendingReservationLocked(cmd.SandboxID)
-				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
-			}
-		}
+		// The fallible recovery-store Put runs first (inside
+		// storePlacementLocked) so a local I/O failure can never leave the
+		// indexes half-mutated (C6a): the row is committed, then the
+		// name/owner indexes are moved to match it, all under the FSM lock.
 		p := Placement{
 			SandboxID:          cmd.SandboxID,
 			OwnerNodeID:        cmd.OwnerNodeID,
@@ -490,8 +531,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			OwnerDataPlaneHost: dataPlaneHost,
 			Version:            f.version,
 			CreatedUnix:        created,
-			UpdatedUnix:        now,
+			UpdatedUnix:        cmd.NowUnix,
 			Name:               name,
+			RecoveryRef:        recoveryRef,
 			Spec:               spec,
 			SecretRef:          secrets.Ref,
 			SecretVersion:      secrets.Version,
@@ -508,6 +550,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if err := f.storePlacementLocked(cmd.SandboxID, p); err != nil {
 			return err
 		}
+		// Drop the OLD name from the index after writing the new placement —
+		// otherwise a re-place with a renamed spec would leave a phantom
+		// nameIndex entry pointing at this sandbox under its previous name.
+		if exists {
+			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
+			f.releaseOwnerLocked(cmd.SandboxID, existing)
+			if existing.IsReserved() {
+				f.releasePendingReservationLocked(cmd.SandboxID)
+				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
+			}
+		}
 		f.claimNameLocked(cmd.SandboxID, name)
 		f.claimShardLocked(cmd.SandboxID)
 		f.claimOwnerLocked(cmd.SandboxID, p)
@@ -520,7 +573,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		// TTL-expired-then-reclaimed reservation can be promoted by a future
 		// re-attempt without re-sealing. The FSM-side name uniqueness check
 		// uses the redacted spec's Name.
-		if err := f.reservePlacementLocked(cmd, now); err != nil {
+		if err := f.reservePlacementLocked(cmd); err != nil {
 			return err
 		}
 		return nil
@@ -528,11 +581,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if len(cmd.Reservations) == 0 {
 			return fmt.Errorf("placementFSM: opReserveBatch requires at least one reservation")
 		}
-		if err := f.validateReservationBatchLocked(cmd.Reservations, now); err != nil {
+		if err := f.validateReservationBatchLocked(cmd.Reservations); err != nil {
 			return err
 		}
 		for _, r := range cmd.Reservations {
-			if err := f.reservePlacementLocked(commandFromReservation(r), now); err != nil {
+			if err := f.reservePlacementLocked(commandFromReservation(r)); err != nil {
 				return err
 			}
 		}
@@ -599,7 +652,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				existing.OrphanedOwnerNodeID = previousOwner
 			}
 			if existing.OrphanedUnix == 0 {
-				existing.OrphanedUnix = now
+				existing.OrphanedUnix = cmd.NowUnix
 			}
 		} else {
 			existing.OwnerState = PlacementOwnerStateActive
@@ -607,7 +660,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			existing.OrphanedUnix = 0
 		}
 		existing.Version = f.version
-		existing.UpdatedUnix = now
+		existing.UpdatedUnix = cmd.NowUnix
 		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 			return err
 		}
@@ -635,9 +688,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			existing.OwnerDataPlaneHost = ""
 			existing.OwnerState = PlacementOwnerStateOrphaned
 			existing.OrphanedOwnerNodeID = cmd.NodeID
-			existing.OrphanedUnix = now
+			existing.OrphanedUnix = cmd.NowUnix
 			existing.Version = f.version
-			existing.UpdatedUnix = now
+			existing.UpdatedUnix = cmd.NowUnix
 			if err := f.storePlacementLocked(id, existing); err != nil {
 				return err
 			}
@@ -701,7 +754,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		existing.OrphanedOwnerNodeID = ""
 		existing.OrphanedUnix = 0
 		existing.Version = f.version
-		existing.UpdatedUnix = now
+		existing.UpdatedUnix = cmd.NowUnix
 		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 			return err
 		}
@@ -745,7 +798,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releasePendingReservationLocked(cmd.SandboxID)
 		}
 		existing.Version = f.version
-		existing.UpdatedUnix = now
+		existing.UpdatedUnix = cmd.NowUnix
 		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 			return err
 		}
@@ -785,7 +838,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		existing.ExposedPortRoutes[cmd.Port] = route
 		f.claimHostPortLocked(cmd.SandboxID, cmd.Port, route)
 		existing.Version = f.version
-		existing.UpdatedUnix = now
+		existing.UpdatedUnix = cmd.NowUnix
 		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 			return err
 		}
@@ -808,7 +861,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			existing.ExposedPortRoutes = nil
 		}
 		existing.Version = f.version
-		existing.UpdatedUnix = now
+		existing.UpdatedUnix = cmd.NowUnix
 		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 			return err
 		}
@@ -842,7 +895,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		existing.CustomHostnames = insertSortedHostname(existing.CustomHostnames, cmd.Hostname)
 		existing.Version = f.version
-		existing.UpdatedUnix = now
+		existing.UpdatedUnix = cmd.NowUnix
 		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 			return err
 		}
@@ -864,7 +917,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		existing.CustomHostnames = removeHostname(existing.CustomHostnames, cmd.Hostname)
 		existing.Version = f.version
-		existing.UpdatedUnix = now
+		existing.UpdatedUnix = cmd.NowUnix
 		if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 			return err
 		}
@@ -921,7 +974,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 		}
 		if v.CreatedAt.IsZero() {
-			v.CreatedAt = time.Unix(now, 0).UTC()
+			v.CreatedAt = time.Unix(cmd.NowUnix, 0).UTC()
 		}
 		v.Tenant, v.Name, v.ID = tenant, name, id
 		f.volumes[volumeKey(tenant, id)] = v
@@ -963,7 +1016,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			a.Tenant, a.VolumeID, a.SandboxID, a.Target, a.Source = tenant, volumeID, sandboxID, target, source
 			if a.CreatedAt.IsZero() {
-				a.CreatedAt = time.Unix(now, 0).UTC()
+				a.CreatedAt = time.Unix(cmd.NowUnix, 0).UTC()
 			}
 			cleaned = append(cleaned, a)
 		}
@@ -1000,7 +1053,7 @@ func placementName(p Placement) string {
 	return specName(p.Spec)
 }
 
-func (f *placementFSM) validateReservationBatchLocked(reservations []reservationCommand, now int64) error {
+func (f *placementFSM) validateReservationBatchLocked(reservations []reservationCommand) error {
 	seenIDs := make(map[string]struct{}, len(reservations))
 	seenNames := make(map[string]string, len(reservations))
 	for _, r := range reservations {
@@ -1016,7 +1069,7 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 			if !existing.IsReserved() {
 				return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
 			}
-			if existing.OwnerNodeID != r.OwnerNodeID && now <= existing.ExpiresUnix {
+			if existing.OwnerNodeID != r.OwnerNodeID && !r.AllowExpiredOverwrite {
 				return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
 			}
 		}
@@ -1036,7 +1089,7 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 	return nil
 }
 
-func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
+func (f *placementFSM) reservePlacementLocked(cmd command) error {
 	if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
 		return fmt.Errorf("placementFSM: opReserve requires sandbox_id and owner_node_id")
 	}
@@ -1047,24 +1100,32 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		if !existing.IsReserved() {
 			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
-		// Re-reserve from the same owner before expiry is an idempotent retry —
-		// refresh the TTL and treat it as a no-op otherwise.
-		if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
+		if cmd.AllowExpiredOverwrite {
+			// The proposer evaluated expiry at propose time and explicitly
+			// authorized the takeover. Apply must not re-check any clock —
+			// the flag is the decision, so every replica applies the same
+			// transition.
+			f.releasePendingReservationLocked(cmd.SandboxID)
+			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
+			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
+			f.releaseShardLocked(cmd.SandboxID)
+			// Release the same host-port/custom-hostname index claims
+			// opCancelReserve does: the replacement reservation row below does
+			// not carry them, so leaving them held would leak the claim
+			// cluster-wide and leave the indexes pointing at a stale row.
+			f.releaseAllHostPortsLocked(cmd.SandboxID, existing)
+			f.releaseAllCustomHostnamesLocked(cmd.SandboxID, existing)
+		} else if existing.OwnerNodeID == cmd.OwnerNodeID {
+			// Re-reserve from the same owner is an idempotent retry —
+			// refresh the TTL and treat it as a no-op otherwise.
 			existing.ExpiresUnix = cmd.ExpiresUnix
 			existing.Version = f.version
-			existing.UpdatedUnix = now
+			existing.UpdatedUnix = cmd.NowUnix
 			if err := f.storePlacementLocked(cmd.SandboxID, existing); err != nil {
 				return err
 			}
 			f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
 			return nil
-		}
-		// Expired reservations are eligible for overwrite by a fresh reservation.
-		if now > existing.ExpiresUnix {
-			f.releasePendingReservationLocked(cmd.SandboxID)
-			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
-			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
-			f.releaseShardLocked(cmd.SandboxID)
 		} else {
 			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
@@ -1080,8 +1141,8 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		OwnerAPIURL:        cmd.OwnerAPIURL,
 		OwnerDataPlaneHost: cmd.OwnerDataPlaneHost,
 		Version:            f.version,
-		CreatedUnix:        now,
-		UpdatedUnix:        now,
+		CreatedUnix:        cmd.NowUnix,
+		UpdatedUnix:        cmd.NowUnix,
 		Name:               name,
 		Spec:               cmd.Spec,
 		SecretRef:          secrets.Ref,
@@ -1546,8 +1607,13 @@ func (f *placementFSM) fullPlacementLocked(id string) (Placement, bool) {
 	if !ok {
 		return Placement{}, false
 	}
+	// LOCAL hydration only. resolveRecoveryRef's remote fetch-on-miss must
+	// never run under f.mu — a slow peer would stall every Apply (and every
+	// reader) for the whole fetch timeout. A row whose ref local state
+	// cannot satisfy comes back with Spec=nil; callers hydrate it outside
+	// the lock via hydrateRecovery (see needsRecoveryHydration).
 	if p.RecoveryRef != "" {
-		if rec, ok, err := f.resolveRecoveryRef(p.RecoveryRef); err == nil && ok {
+		if rec, ok, err := f.resolveRecoveryRefLocal(p.RecoveryRef); err == nil && ok {
 			return attachPlacementRecovery(p, rec), true
 		}
 	}
@@ -1564,13 +1630,58 @@ func attachPlacementRecovery(p Placement, rec placementRecovery) Placement {
 	return p
 }
 
-// resolveRecoveryRef serves ROW-level recovery hydration: FSM snapshots carry
-// hot rows with a RecoveryRef but not the payload, so a voter that joins from
-// a snapshot must fetch each payload from a peer exactly once (fetch-on-miss,
-// cached into the local store). Commands never carry refs — payloads ride
-// inline in the raft entry — so this is the only remote-recovery path left.
-// Pinned by TestFSMSnapshotJoinFetchOnMiss.
-func (f *placementFSM) resolveRecoveryRef(ref string) (placementRecovery, bool, error) {
+// needsRecoveryHydration reports whether p references a recovery payload that
+// local state could not satisfy (i.e. it still needs the remote fetch-on-miss).
+func needsRecoveryHydration(p Placement) bool {
+	return p.RecoveryRef != "" && p.Spec == nil && p.SecretRef == "" && p.SecretVersion == 0
+}
+
+// hydrateCommandRecovery warms the local recovery cache for every placement id
+// a command touches, fetching remote-only blobs with NO f.mu held. The fetch
+// result is cached in the local store, so the locked phase of apply (and any
+// later read) resolves the payload locally. MUST run before f.mu is taken.
+func (f *placementFSM) hydrateCommandRecovery(cmd command) {
+	ids := make([]string, 0, 1+len(cmd.Reservations))
+	if cmd.SandboxID != "" {
+		ids = append(ids, cmd.SandboxID)
+	}
+	for _, r := range cmd.Reservations {
+		if r.SandboxID != "" {
+			ids = append(ids, r.SandboxID)
+		}
+	}
+	for _, id := range ids {
+		f.mu.RLock()
+		p, ok := f.fullPlacementLocked(id)
+		f.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		f.hydrateRecovery(p)
+	}
+}
+
+// hydrateRecovery attaches the recovery payload for a row read under f.mu that
+// local state could not satisfy, running the fetch-on-miss with NO lock held
+// so concurrent Applies are never blocked behind a peer fetch. On fetch
+// failure the placement is returned unchanged (hot fields intact) — matching
+// the resolver-miss semantics pinned by TestFSMSnapshotJoinFetchOnMiss.
+func (f *placementFSM) hydrateRecovery(p Placement) Placement {
+	if !needsRecoveryHydration(p) {
+		return p
+	}
+	rec, ok, err := f.resolveRecoveryRef(p.RecoveryRef)
+	if err != nil || !ok {
+		return p
+	}
+	return attachPlacementRecovery(p, rec)
+}
+
+// resolveRecoveryRefLocal serves recovery hydration from LOCAL state only: the
+// content-addressed local store first, then nothing (the in-memory fallback
+// map is consulted separately by fullPlacementLocked). No network I/O — safe
+// to run under f.mu.
+func (f *placementFSM) resolveRecoveryRefLocal(ref string) (placementRecovery, bool, error) {
 	if f.recoveryStore != nil {
 		rec, ok, err := f.recoveryStore.Get(ref)
 		if err != nil {
@@ -1579,6 +1690,23 @@ func (f *placementFSM) resolveRecoveryRef(ref string) (placementRecovery, bool, 
 		if ok {
 			return rec, true, nil
 		}
+	}
+	return placementRecovery{}, false, nil
+}
+
+// resolveRecoveryRef serves ROW-level recovery hydration: FSM snapshots carry
+// hot rows with a RecoveryRef but not the payload, so a voter that joins from
+// a snapshot must fetch each payload from a peer exactly once (fetch-on-miss,
+// cached into the local store). Commands never carry refs — payloads ride
+// inline in the raft entry — so this is the only remote-recovery path left.
+// Pinned by TestFSMSnapshotJoinFetchOnMiss.
+//
+// MUST NOT be called under f.mu: the fetch-on-miss below talks to a peer with
+// a multi-second timeout and would stall every Apply behind the lock (see
+// TestFSMRecoveryFetchDoesNotBlockApply).
+func (f *placementFSM) resolveRecoveryRef(ref string) (placementRecovery, bool, error) {
+	if rec, ok, err := f.resolveRecoveryRefLocal(ref); err != nil || ok {
+		return rec, ok, err
 	}
 	if f.recoveryResolver == nil {
 		return placementRecovery{}, false, nil
@@ -1593,6 +1721,31 @@ func (f *placementFSM) resolveRecoveryRef(ref string) (placementRecovery, bool, 
 		return placementRecovery{}, false, err
 	}
 	return blob.recovery(), true, nil
+}
+
+// hydrateQueuedRecoveryRefs fetches the recovery payloads Restore could not
+// resolve locally, AFTER f.mu is released (W3b N6) — a peer fetch can block
+// for seconds and must not stall Apply. Successful fetches also re-claim the
+// pending-reservation capacity ledger with the real spec: the in-lock claim
+// ran against defaults while the payload was still remote.
+func (f *placementFSM) hydrateQueuedRecoveryRefs(ids []string) {
+	for _, id := range ids {
+		f.mu.RLock()
+		p, ok := f.fullPlacementLocked(id)
+		f.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		hydrated := f.hydrateRecovery(p)
+		if !p.IsReserved() || hydrated.Spec == nil {
+			continue
+		}
+		f.mu.Lock()
+		if cur, ok := f.placements[id]; ok && cur.IsReserved() {
+			f.claimPendingReservationLocked(id, hydrated)
+		}
+		f.mu.Unlock()
+	}
 }
 
 func (f *placementFSM) storeRecoveryBlob(blob RecoveryBlob) error {
@@ -1619,12 +1772,28 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 		return nil
 	}
 	if f.recoveryStore != nil {
-		ref, err := f.recoveryStore.Put(id, rec)
+		// The ref is content-addressed over (sandboxID, recovery), so it is
+		// computable with zero I/O and identical on every replica. Compute
+		// it up front so the hot row does not depend on whether the local
+		// Put succeeds.
+		ref, _, err := encodePlacementRecoveryRecord(placementRecoveryStoreRecord{SandboxID: id, Recovery: rec})
 		if err != nil {
+			// Deterministic marshal failure: every replica returns the same
+			// error before any state mutation, so FSMs stay convergent.
 			return err
 		}
+		if _, putErr := f.recoveryStore.Put(id, rec); putErr != nil {
+			// Local I/O failure must not fail or diverge Apply — outcomes
+			// differ per replica. Fall back to the in-memory recovery map so
+			// the state path is I/O-independent and deterministic (C6a).
+			if f.recovery == nil {
+				f.recovery = make(map[string]placementRecovery)
+			}
+			f.recovery[id] = clonePlacementRecovery(rec)
+		} else {
+			delete(f.recovery, id)
+		}
 		hot.RecoveryRef = ref
-		delete(f.recovery, id)
 	} else {
 		if f.recovery == nil {
 			f.recovery = make(map[string]placementRecovery)
@@ -1658,15 +1827,20 @@ func (r placementRecovery) empty() bool {
 	return r.Spec == nil && r.SecretRef == "" && r.SecretVersion == 0
 }
 
-// get returns the placement for id, or zero-value + false if absent.
+// get returns the placement for id, or zero-value + false if absent. Remote
+// recovery hydration runs OUTSIDE f.mu (see hydrateRecovery) so a slow peer
+// fetch can never block Apply.
 func (f *placementFSM) get(id string) (Placement, bool) {
 	f.mu.RLock()
-	defer f.mu.RUnlock()
 	p, ok := f.fullPlacementLocked(id)
+	if ok {
+		p = clonePlacement(p)
+	}
+	f.mu.RUnlock()
 	if !ok {
 		return Placement{}, false
 	}
-	return clonePlacement(p), true
+	return f.hydrateRecovery(p), true
 }
 
 // sandboxIDByCustomHostname returns the sandbox ID currently claiming
@@ -1775,7 +1949,6 @@ func (f *placementFSM) expiredReservationIDs(now int64) []string {
 
 func (f *placementFSM) fullPlacementsForOwner(nodeID string) map[string]Placement {
 	f.mu.RLock()
-	defer f.mu.RUnlock()
 	ids := f.ownedPlacementIDsLocked(nodeID)
 	out := make(map[string]Placement, len(ids))
 	for _, id := range ids {
@@ -1783,19 +1956,28 @@ func (f *placementFSM) fullPlacementsForOwner(nodeID string) map[string]Placemen
 			out[id] = clonePlacement(p)
 		}
 	}
+	f.mu.RUnlock()
+	for id, p := range out {
+		out[id] = f.hydrateRecovery(p)
+	}
 	return out
 }
 
 // snapshot copies the full placement map for correctness-sensitive tests and
 // recovery paths. Ingress/list reads use placementsForShards and placementPage,
-// which intentionally return hot rows without recovery payloads.
+// which intentionally return hot rows without recovery payloads. Remote
+// recovery hydration runs OUTSIDE f.mu so a slow peer fetch can never block
+// Apply.
 func (f *placementFSM) snapshot() map[string]Placement {
 	f.mu.RLock()
-	defer f.mu.RUnlock()
 	out := make(map[string]Placement, len(f.placements))
 	for k := range f.placements {
 		p, _ := f.fullPlacementLocked(k)
 		out[k] = clonePlacement(p)
+	}
+	f.mu.RUnlock()
+	for k, p := range out {
+		out[k] = f.hydrateRecovery(p)
 	}
 	return out
 }
@@ -2045,7 +2227,15 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		}
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	// Recovery refs the compact snapshot references but does not inline are
+	// queued here and fetched AFTER the lock is dropped (W3b N6): the
+	// fetch-on-miss can block on a peer for seconds and holding f.mu for it
+	// would stall every Apply behind Restore.
+	var unresolved []string
+	defer func() {
+		f.mu.Unlock()
+		f.hydrateQueuedRecoveryRefs(unresolved)
+	}()
 	if len(payload.Rows) > 0 {
 		payload.Placements = make(map[string]Placement, len(payload.Rows))
 		payload.Recovery = make(map[string]placementRecovery, len(payload.Rows))
@@ -2131,6 +2321,9 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 			return err
 		}
 		indexed, _ := f.fullPlacementLocked(id)
+		if needsRecoveryHydration(indexed) {
+			unresolved = append(unresolved, id)
+		}
 		if name := placementName(indexed); name != "" {
 			f.nameIndex[name] = id
 		}

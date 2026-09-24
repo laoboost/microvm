@@ -31,7 +31,7 @@ func (d *Driver) checkpointSandbox(ctx context.Context, sandbox *models.Sandbox,
 	if sandbox == nil {
 		return "", "", fmt.Errorf("checkpoint: nil sandbox")
 	}
-	inst, err := d.instance(sandbox.ID)
+	inst, snap, err := d.snapshotInstance(sandbox.ID)
 	if err != nil {
 		return "", "", err
 	}
@@ -52,9 +52,9 @@ func (d *Driver) checkpointSandbox(ctx context.Context, sandbox *models.Sandbox,
 		CloneGeneration: token,
 	}
 
-	client := d.newWorkerClient(inst.socketPath)
+	client := d.newWorkerClient(snap.socketPath)
 	if err := client.Checkpoint(ctx, sandbox.ID, outDir, meta); err != nil {
-		workerKey := inst.workerKey
+		workerKey := snap.workerKey
 		if workerKey == "" {
 			workerKey = sandbox.ID
 		}
@@ -70,7 +70,7 @@ func (d *Driver) checkpointSandbox(ctx context.Context, sandbox *models.Sandbox,
 		return outDir, token, nil
 	}
 	_ = client.StopInstance(sandbox.ID)
-	workerKey := inst.workerKey
+	workerKey := snap.workerKey
 	if workerKey == "" {
 		workerKey = sandbox.ID
 	}

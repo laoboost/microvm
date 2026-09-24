@@ -179,16 +179,16 @@ const (
 type CustomDomainDNSRecords = models.CustomDomainDNSRecords
 
 // BuildImagePushOptions describes the per-request push directive for
-// Client.BuildImageWithOptions. Credentials are forwarded to the daemon
-// as a one-shot X-Registry-Auth header on the push call and are never
+// Client.BuildImageWithOptions. Credentials are forwarded to the daemon in the
+// push object of the POST /v1/images/build request body and are never
 // persisted.
 type BuildImagePushOptions struct {
 	// Registry is the destination repository, e.g. "ghcr.io/my-org/my-image".
 	Registry string
 	// Tag is the destination tag. The daemon defaults to "latest" when empty.
 	Tag string
-	// Server is the registry serveraddress, e.g. "ghcr.io". Sent inside
-	// X-Registry-Auth.
+	// Server is the registry serveraddress, e.g. "ghcr.io". Sent inside the
+	// push body.
 	Server   string
 	Username string
 	Password string

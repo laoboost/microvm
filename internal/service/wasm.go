@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -37,6 +38,15 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	moduleRef := models.ModuleRefForCreate(req)
 	if moduleRef == "" {
 		return nil, errors.New("module_ref or image is required for wasm runtime")
+	}
+	// file:// and bare host-path refs read a file off the HOST filesystem as the
+	// daemon user. That is an operator/self-host convenience, not something a
+	// scoped tenant may drive — otherwise create becomes a host-file
+	// existence/size oracle (the resolver's errors distinguish missing/
+	// unreadable/empty/too-large/bad-magic). Mirrors the isolate create gate in
+	// isolate.go and the module-API gate in wasm_module_api.go.
+	if _, scoped := ownerScope(ctx); scoped && wasmmod.IsHostPathRef(moduleRef) {
+		return nil, fmt.Errorf("runtime %q: file:// and host-path module refs are operator-only; push via /v1/wasm-modules and reference the registry ref", req.Runtime)
 	}
 	req.ModuleRef = moduleRef
 	if strings.TrimSpace(req.Image) == "" {

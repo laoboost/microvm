@@ -498,15 +498,20 @@ func (s *Service) scheduleTLSWakeListenerClose(id string, port int, delay time.D
 	if t, ok := s.pendingTLSClose[key]; ok {
 		t.Stop()
 	}
-	s.pendingTLSClose[key] = time.AfterFunc(delay, func() {
-		// Re-check inside the mutex that this timer is still the
-		// authoritative one for the key. A cold→warm→cold sequence may
-		// have replaced it; in that case the newer schedule (or
-		// ensureTLSWakeListener's cancellation) already owns the
-		// lifecycle decision and we must not double-close.
+	// Capture this timer's identity: the callback must act only while it is
+	// still the authoritative timer for the key. Checking mere presence is
+	// not enough — a stale timer whose callback runs after a stop-and-replace
+	// would see the NEWER timer in the map and delete it, closing the
+	// listener early. The lock is held through the map assignment below, so
+	// the callback cannot observe a half-registered timer.
+	var t *time.Timer
+	t = time.AfterFunc(delay, func() {
 		s.l4WakeMu.Lock()
-		current, ok := s.pendingTLSClose[key]
-		if !ok || current == nil {
+		if s.pendingTLSClose[key] != t {
+			// Superseded by a newer schedule (or cancelled by
+			// ensureTLSWakeListener / closeTLSWakeListener). The current
+			// owner of the key makes the lifecycle decision; do not
+			// double-close or steal its entry.
 			s.l4WakeMu.Unlock()
 			return
 		}
@@ -514,6 +519,7 @@ func (s *Service) scheduleTLSWakeListenerClose(id string, port int, delay time.D
 		s.l4WakeMu.Unlock()
 		s.closeTLSWakeListener(id, port)
 	})
+	s.pendingTLSClose[key] = t
 }
 
 func (s *Service) closeAllTLSWakeListeners() {

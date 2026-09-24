@@ -28,11 +28,17 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
-	leader, cleanupLeader := newTestCluster(t, "ldr-int-fwd", true, nil)
+	// Both nodes are TLS-equipped and share one cert dir: internalClient must be
+	// installed by New (before the capacity-lease loop starts reading it), which
+	// is what the TLS path does — assigning follower.internalClient after New
+	// would race that loop. A mixed pair (TLS follower, plaintext leader) cannot
+	// complete a raft handshake, so the leader is TLS too.
+	tlsDir := writeTestClusterTLSDir(t)
+	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-int-fwd", true, nil, tlsDir)
 	defer cleanupLeader()
 	waitForLeader(t, leader, 10*time.Second)
 
-	follower, cleanupFollower := newTestCluster(t, "fol-int-fwd", false, []string{leader.gossip.ml.LocalNode().Address()})
+	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-int-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, tlsDir)
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 
@@ -54,7 +60,9 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	}))
 	defer internalSrv.Close()
 
-	follower.internalClient = internalSrv.Client()
+	// The mTLS client New installed dials the test server over plain HTTP — the
+	// member index below points the leader's peerInternalURL at it, which is the
+	// internal-channel selection this test pins.
 	follower.gossip.memberIndex.upsert(Member{
 		NodeID:      leader.nodeID,
 		InternalURL: internalSrv.URL,
@@ -555,6 +563,10 @@ func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossi
 			ClusterCapacityGossipInterval: time.Second,
 			ClusterTLSDir:                 tlsDir,
 			ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+			// Test clusters run plaintext gossip (no fleet key). Production only
+			// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+			// opt-in here so voter-promotion subjects stay exercisable.
+			ClusterInsecureGossip: true,
 		}
 		c, err := New(cfg, logger, nil)
 		if err == nil {
@@ -596,6 +608,10 @@ func newTestAgentWithTLS(t *testing.T, nodeID, role string, gossipPeers []string
 			ClusterCapacityGossipInterval: time.Second,
 			ClusterTLSDir:                 tlsDir,
 			ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
+			// Test clusters run plaintext gossip (no fleet key). Production only
+			// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+			// opt-in here so voter-promotion subjects stay exercisable.
+			ClusterInsecureGossip: true,
 		}
 		a, err := NewAgent(cfg, logger, nil)
 		if err == nil {
@@ -835,7 +851,7 @@ func TestFSMValidateHostPortLazyIndexRebuild(t *testing.T) {
 	}
 }
 
-func TestRemoveMemberRejectsLastVoter(t *testing.T) {
+func TestRemoveMemberRejectsSelfRemoval(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
@@ -843,9 +859,11 @@ func TestRemoveMemberRejectsLastVoter(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
 
+	// Removing self is refused up front by the self-guard (the last-voter
+	// check behind it would refuse too, on this single-voter cluster).
 	err := c.RemoveMember(context.Background(), c.nodeID, true)
-	if !errors.Is(err, ErrLastVoter) {
-		t.Fatalf("RemoveMember(self) = %v, want ErrLastVoter", err)
+	if !errors.Is(err, ErrSelfRemoval) {
+		t.Fatalf("RemoveMember(self) = %v, want ErrSelfRemoval", err)
 	}
 }
 

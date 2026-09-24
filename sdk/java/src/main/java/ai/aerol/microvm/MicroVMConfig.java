@@ -25,6 +25,15 @@ public class MicroVMConfig {
         return this;
     }
 
+    /**
+     * Supply a custom HTTP client. It <strong>must</strong> be built with
+     * {@link HttpClient.Redirect#NEVER}: the SDK follows redirects itself so it
+     * can strip {@code Authorization} and {@code X-Registry-*} and refuse a
+     * 307/308 body replay on a cross-origin hop. A redirect-following client
+     * would replay those credentials inside the JDK instead, so
+     * {@link MicroVMClient} rejects one with a {@link MicroVMException} at
+     * construction.
+     */
     public MicroVMConfig setHttpClient(HttpClient httpClient) {
         this.httpClient = httpClient;
         return this;

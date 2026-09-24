@@ -177,6 +177,7 @@ func TestHostStateKVInvalidKeyDelete(t *testing.T) {
 // ─── Daytona process routes with real sessions manager ────────────────────────
 
 func TestDaytonaSessionCreateAndExec(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	// Create a daytona session
@@ -229,6 +230,7 @@ func TestDaytonaSessionDeleteNotFound(t *testing.T) {
 }
 
 func TestDaytonaSessionExecBadJSON(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	// Create session first
@@ -249,6 +251,7 @@ func TestDaytonaSessionExecBadJSON(t *testing.T) {
 }
 
 func TestDaytonaSessionExecEmptyCommand(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	payload, _ := json.Marshal(map[string]string{"sessionId": "ds-empty-cmd"})
@@ -268,6 +271,7 @@ func TestDaytonaSessionExecEmptyCommand(t *testing.T) {
 }
 
 func TestDaytonaSessionExecAsync(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	// Create session
@@ -303,6 +307,7 @@ func TestDaytonaSessionExecAsync(t *testing.T) {
 }
 
 func TestDaytonaSessionCommandGetAndLogs(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	// Create session
@@ -420,6 +425,7 @@ func TestDaytonaSessionRouteMethodNotAllowed(t *testing.T) {
 }
 
 func TestDaytonaSessionCreateBadJSON(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	rec := httptest.NewRecorder()
@@ -432,6 +438,7 @@ func TestDaytonaSessionCreateBadJSON(t *testing.T) {
 }
 
 func TestDaytonaSessionCreateEmptySessionID(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	payload, _ := json.Marshal(map[string]string{"sessionId": ""})
@@ -519,6 +526,7 @@ func TestDaytonaSessionCommandInputCommandNotFound(t *testing.T) {
 }
 
 func TestDaytonaSessionCommandInputConflict(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	// Create session
@@ -615,6 +623,7 @@ func TestDaytonaSessionEntrypointNotImplemented(t *testing.T) {
 }
 
 func TestDaytonaSessionDeleteOK(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	// Create session

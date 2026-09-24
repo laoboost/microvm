@@ -358,7 +358,7 @@ func TestWasmMigrateLiveTwoNodeWorkers(t *testing.T) {
 		t.Fatalf("instance: %v", err)
 	}
 	client := driverB.newWorkerClient(inst.socketPath)
-	run, err := client.Exec(sandboxID, wasmengine.Capabilities{Args: []string{"post-migrate"}}, "_start")
+	run, err := client.Exec(ctx, sandboxID, wasmengine.Capabilities{Args: []string{"post-migrate"}}, "_start")
 	if err != nil {
 		t.Fatalf("Exec after migrate: %v", err)
 	}

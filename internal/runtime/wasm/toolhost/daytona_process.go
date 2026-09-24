@@ -81,7 +81,9 @@ func newDaytonaCommandStream() *daytonaCommandStream {
 
 // broadcast appends a chunk to the streaming buffer and pushes a framed copy
 // to every active subscriber. Sends are non-blocking — a slow subscriber
-// drops the frame rather than stalling the command runner.
+// drops the frame rather than stalling the command runner. The sends happen
+// while c.mu is held so they cannot race with finish() closing the same
+// channels (send on closed channel would panic the daemon).
 func (c *daytonaCommandStream) broadcast(stream sessions.Stream, chunk []byte) {
 	if c == nil || len(chunk) == 0 {
 		return
@@ -95,16 +97,13 @@ func (c *daytonaCommandStream) broadcast(stream sessions.Stream, chunk []byte) {
 	frame = append(frame, chunk...)
 
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if stream == sessions.StreamStderr {
 		c.stderr = append(c.stderr, chunk...)
 	} else {
 		c.stdout = append(c.stdout, chunk...)
 	}
-	subs := make([]chan []byte, len(c.subs))
-	copy(subs, c.subs)
-	c.mu.Unlock()
-
-	for _, sub := range subs {
+	for _, sub := range c.subs {
 		select {
 		case sub <- frame:
 		default:
@@ -114,25 +113,24 @@ func (c *daytonaCommandStream) broadcast(stream sessions.Stream, chunk []byte) {
 
 // finish signals all subscribers the command has ended and clears the
 // subscriber list. Safe to call multiple times — finished is closed at
-// most once.
+// most once. close(sub) runs under c.mu so it cannot interleave with
+// broadcast's non-blocking sends on the same channels.
 func (c *daytonaCommandStream) finish() {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	select {
 	case <-c.finished:
-		c.mu.Unlock()
 		return
 	default:
 		close(c.finished)
 	}
-	subs := c.subs
-	c.subs = nil
-	c.mu.Unlock()
-	for _, sub := range subs {
+	for _, sub := range c.subs {
 		close(sub)
 	}
+	c.subs = nil
 }
 
 // subscribe registers a new live subscriber. Returns the framed replay of
@@ -459,6 +457,13 @@ func (h *Host) handleDaytonaSessionCommandInput(w http.ResponseWriter, r *http.R
 }
 
 func (h *Host) handleDaytonaSessionCreate(w http.ResponseWriter, r *http.Request) {
+	// Fail closed while host-exec is disabled (Host.hostExecEnabled): this is the same host-shell
+	// spawn path as POST /sessions (sessions.Manager spawns a real host
+	// shell), and the wasm runtime has no jail to contain it.
+	if !h.hostExecEnabled {
+		writeError(w, http.StatusNotImplemented, hostExecDisabledMsg)
+		return
+	}
 	var req daytonaCreateSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -522,6 +527,12 @@ func (h *Host) handleDaytonaSessionDelete(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Host) handleDaytonaSessionExec(w http.ResponseWriter, r *http.Request, sessionID string) {
+	// Fail closed while host-exec is disabled (Host.hostExecEnabled): exec feeds a user command
+	// to the host shell backing the session. No jail exists to contain it.
+	if !h.hostExecEnabled {
+		writeError(w, http.StatusNotImplemented, hostExecDisabledMsg)
+		return
+	}
 	sess, state, ok := h.lookupDaytonaSession(sessionID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "session not found")

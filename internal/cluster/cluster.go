@@ -122,6 +122,18 @@ var ErrMemberStillAlive = errors.New("cluster: raft member is still alive")
 // server and leaving the cluster with no quorum path.
 var ErrLastVoter = errors.New("cluster: cannot remove last raft voter")
 
+// ErrSelfRemoval is returned when an operator tries to remove THIS node from
+// the raft configuration without explicitly opting in. Force-removing the
+// live leader orphans every placement the cluster owns — refuse unless the
+// caller passes allowSelf deliberately.
+var ErrSelfRemoval = errors.New("cluster: refusing to remove self from raft configuration")
+
+// ErrLeaderRemoval is returned when an operator tries to remove the node that
+// currently holds raft leadership (including self-removal with allowSelf).
+// The operator must transfer leadership away first so a healthy leader
+// coordinates the removal.
+var ErrLeaderRemoval = errors.New("cluster: refusing to remove the current raft leader; transfer leadership first")
+
 // ErrCustomHostnameConflict is returned when an opAddCustomDomain entry asks
 // the FSM to claim a hostname already held by a different sandbox. Maps to
 // the same 409 the local SQLite custom-domains insert returns — the FSM is
@@ -578,7 +590,8 @@ type Client interface {
 	// internal API endpoint pipes the request body through here on the leader
 	// so any owner-side mutating call (Record/Upsert/Add/Remove/Delete) made on
 	// a follower can transparently land on the leader's raft. Returns
-	// ErrNotLeader if leadership has shifted; the forwarder retries.
+	// ErrNotLeader if leadership has shifted; the forwarder retries a bounded
+	// number of times against a refreshed leader before surfacing the error.
 	ApplyEncoded(ctx context.Context, payload []byte) error
 
 	// AssertOwnership ensures the FSM lists self as owner for every entry in

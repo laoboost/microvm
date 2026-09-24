@@ -75,9 +75,45 @@ variable "availability_zone" {
 }
 
 variable "admin_allowed_cidrs" {
-  description = "CIDRs allowed to reach SSH (22) and the operator/SDK API (21212)."
+  description = "CIDRs allowed to reach SSH (22) and the operator/SDK API (21212). Must be set explicitly — the old 0.0.0.0/0 default left SSH+API+Grafana internet-open. An empty list fails plan, and documentation/reserved ranges are rejected so a copied placeholder cannot silently produce an unreachable cluster."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+  default     = []
+
+  validation {
+    condition     = length(var.admin_allowed_cidrs) > 0
+    error_message = "admin_allowed_cidrs must list at least one real operator CIDR (your office or VPN egress range, as <ip>/<prefix>). It defaults to [] so plan fails closed instead of opening SSH/API/Grafana to the internet."
+  }
+
+  # Every entry must parse as CIDR. Without this a typo (`10.0.0.1` with no
+  # prefix, or a stray space) only surfaced at apply, after the operator had
+  # already reviewed a clean plan.
+  validation {
+    condition     = alltrue([for c in var.admin_allowed_cidrs : can(cidrhost(c, 0))])
+    error_message = "every admin_allowed_cidrs entry must be a valid CIDR block, e.g. \"10.42.0.10/32\" or \"10.42.0.0/16\". A bare IP without /prefix is not accepted by the security-group rule."
+  }
+
+  # Reject unreachable placeholders and reserved space. The example tfvars used
+  # to ship the RFC 5737 documentation range (203.0.113.0/24) as its value; an
+  # operator who copied it got a plan that succeeded while SSH/API/Grafana were
+  # reachable from nowhere. Loopback/link-local/multicast/reserved ranges can
+  # never carry operator traffic either. 0.0.0.0/0 is rejected here as well as
+  # gated on allow_public_admin in locals.tf, so the failure is attached to the
+  # variable rather than a precondition.
+  validation {
+    condition = alltrue([
+      for c in var.admin_allowed_cidrs : !can(regex(
+        "^(0\\.0\\.0\\.0/0|127\\.|169\\.254\\.|192\\.0\\.2\\.|198\\.51\\.100\\.|203\\.0\\.113\\.|224\\.|240\\.)",
+        c,
+      ))
+    ])
+    error_message = "admin_allowed_cidrs contains 0.0.0.0/0, a reserved range (127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4), or an RFC 5737 documentation range (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). Those are unreachable placeholders — replace them with your real operator CIDR (0.0.0.0/0 additionally needs allow_public_admin = true)."
+  }
+}
+
+variable "allow_public_admin" {
+  description = "Opt-in acknowledgement that admin access (SSH 22, operator/SDK API 21212, Grafana 3000) is intentionally open to the whole internet. Required before admin_allowed_cidrs may contain 0.0.0.0/0. Keep false."
+  type        = bool
+  default     = false
 }
 
 variable "public_http_ports" {
@@ -309,7 +345,7 @@ variable "nodes" {
   validation {
     condition = alltrue([
       for k, v in var.nodes :
-      try(v.arch, null) == null || contains(["amd64", "arm64"], v.arch)
+      try(v.arch, null) == null ? true : contains(["amd64", "arm64"], v.arch)
     ])
     error_message = "nodes[*].arch must be \"amd64\" or \"arm64\" when set."
   }

@@ -83,8 +83,10 @@ func TestRuntimeProxy(t *testing.T) {
 		}
 	})
 
-	t.Run("valid proxy request no auth", func(t *testing.T) {
-		// remove secure flag so we don't need token
+	t.Run("secure false without operator flag is rejected", func(t *testing.T) {
+		// meta.Secure=false no longer exempts the request from the
+		// X-Access-Token check; only SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME
+		// (see the "empty publicPath" subtest) restores that.
 		stateBlob := compatBlob{Secure: false, OnTimeout: "kill"}
 		b, _ := json.Marshal(stateBlob)
 		st.UpsertCompatState(context.Background(), id, "e2b", string(b))
@@ -95,6 +97,9 @@ func TestRuntimeProxy(t *testing.T) {
 		req.Header.Set("E2b-Sandbox-Id", id)
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", rr.Code)
+		}
 	})
 
 	t.Run("url parse error", func(t *testing.T) {
@@ -160,6 +165,11 @@ func TestRuntimeProxy(t *testing.T) {
 	})
 
 	t.Run("empty publicPath and no toolboxToken", func(t *testing.T) {
+		// Operator flag on: exercises the old unauthenticated Secure=false
+		// path so Director's empty-publicPath / empty-toolboxToken branches
+		// stay covered.
+		t.Setenv("SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME", "1")
+
 		svc2, st2, handler2 := newE2BHandlerTestEnv(t)
 		id2 := createE2BSandbox(t, handler2)
 
@@ -178,7 +188,7 @@ func TestRuntimeProxy(t *testing.T) {
 		// Requesting exactly PathPrefix + "/runtime" to cover empty publicPath
 		req := httptest.NewRequest(http.MethodGet, "/e2b/runtime", nil)
 		req.Header.Set("E2b-Sandbox-Id", id2)
-		req.Header.Set("X-Access-Token", "") // secure false state below
+		req.Header.Set("X-Access-Token", "") // no token: the operator flag is what lets this through
 		stateBlob := compatBlob{Secure: false, OnTimeout: "kill"}
 		b, _ := json.Marshal(stateBlob)
 		st2.UpsertCompatState(context.Background(), id2, "e2b", string(b))

@@ -48,14 +48,23 @@ func New(logger *slog.Logger) *Pool {
 	}
 }
 
-func (p *Pool) SetSpawner(s Spawner) { p.spawner = s }
+func (p *Pool) SetSpawner(s Spawner) {
+	p.mu.Lock()
+	p.spawner = s
+	p.mu.Unlock()
+}
 func (p *Pool) SetParkReleaser(fn func(slotID string)) {
+	p.mu.Lock()
 	p.onReleasePark = fn
+	p.mu.Unlock()
 }
 
 func (p *Pool) releasePark(slotID string) {
-	if p.onReleasePark != nil && slotID != "" {
-		p.onReleasePark(slotID)
+	p.mu.Lock()
+	fn := p.onReleasePark
+	p.mu.Unlock()
+	if fn != nil && slotID != "" {
+		fn(slotID)
 	}
 }
 
@@ -67,14 +76,19 @@ func (p *Pool) releasePark(slotID string) {
 func (p *Pool) ReleasePark(slotID string) { p.releasePark(slotID) }
 
 // destroySlots tears down discarded slots outside the pool lock: the spawner
-// call talks to the Docker engine and must never run under p.mu.
+// call talks to the Docker engine and must never run under p.mu. The spawner
+// is copied out under the lock first — SetSpawner writes the same field
+// (boot wiring can race a discard path).
 func (p *Pool) destroySlots(ctx context.Context, slots []*ParkedSlot) {
+	p.mu.Lock()
+	spawner := p.spawner
+	p.mu.Unlock()
 	for _, slot := range slots {
 		if slot == nil {
 			continue
 		}
-		if p.spawner != nil {
-			_ = p.spawner.DestroyParked(ctx, slot)
+		if spawner != nil {
+			_ = spawner.DestroyParked(ctx, slot)
 		}
 		p.releasePark(slot.ID)
 	}
@@ -386,17 +400,19 @@ func (p *Pool) ListTargets() []Key {
 // Map surgery happens under one lock hold; slot destruction after unlock
 // (same rationale as Acquire/NoteTarget).
 func (p *Pool) ReapIdle(now time.Time) int {
-	if p.idleTTL <= 0 {
-		return 0
-	}
 	var reaped []*ParkedSlot
 	p.mu.Lock()
+	idleTTL := p.idleTTL
+	if idleTTL <= 0 {
+		p.mu.Unlock()
+		return 0
+	}
 	for ks := range p.targets {
 		if _, pinned := p.pinned[ks]; pinned {
 			continue
 		}
 		last := p.lastUsed[ks]
-		if !last.IsZero() && now.Sub(last) < p.idleTTL {
+		if !last.IsZero() && now.Sub(last) < idleTTL {
 			continue
 		}
 		reaped = append(reaped, p.ready[ks]...)

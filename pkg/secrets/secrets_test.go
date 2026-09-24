@@ -154,7 +154,8 @@ func TestLoadOrGenerateKeyEdgeCases(t *testing.T) {
 		t.Fatal("expected error for short key in fallback file")
 	}
 
-	// Using a directory as a file path should trigger a read error.
+	// Using a directory as a file path is rejected (insecure mode for a
+	// typical 0700 dir, or a read error otherwise).
 	isdir := filepath.Join(dir, "isdir")
 	os.Mkdir(isdir, 0700)
 	if _, err := loadOrGenerateKey("", isdir); err == nil {

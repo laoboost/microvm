@@ -25,8 +25,9 @@ func (c *stubWorkerNetstatsClient) LoadModule(string, string, int) (wasmengine.L
 func (c *stubWorkerNetstatsClient) Instantiate(string, wasmengine.Capabilities) error {
 	return nil
 }
-func (c *stubWorkerNetstatsClient) Invoke(string, string) error { return nil }
-func (c *stubWorkerNetstatsClient) Exec(string, wasmengine.Capabilities, string) (wasmengine.RunResult, error) {
+func (c *stubWorkerNetstatsClient) Invoke(string, string) error           { return nil }
+func (c *stubWorkerNetstatsClient) InvokeBackground(string, string) error { return nil }
+func (c *stubWorkerNetstatsClient) Exec(context.Context, string, wasmengine.Capabilities, string) (wasmengine.RunResult, error) {
 	return wasmengine.RunResult{}, nil
 }
 func (c *stubWorkerNetstatsClient) StopInstance(string) error { return nil }

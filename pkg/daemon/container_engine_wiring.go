@@ -25,13 +25,36 @@ func netrulesUserChain(cfg config.Config) string {
 }
 
 // wireContainerEngine registers the containerd driver and event source when
-// SB_CONTAINER_ENGINE=containerd. On the docker default path it only wires the
-// events source to the docker client, leaving behavior byte-identical.
+// SB_CONTAINER_ENGINE=containerd. On the docker default path it wires the events
+// source to the docker client and installs the global link-local (IMDS) DROP into
+// DOCKER-USER — the one piece of the containerd path's EnsureChain that the
+// Docker path also needs (see the comment in the branch below).
 func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, st *store.Store, dockerClient *docker.Client, dockerRules *netrules.Manager, admitter *capacity.Admitter) (*containerdEngineWiring, error) {
 	_ = ctx
-	_ = dockerRules // docker driver keeps its own DOCKER-USER manager (daemon.go)
 	if cfg.ContainerEngine != models.ContainerEngineContainerd {
 		svc.SetEventsSource(dockerClient)
+		// The Docker engine path must not call EnsureChain: dockerd creates and
+		// owns DOCKER-USER and the FORWARD jump it is reached from, so
+		// bootstrapping the chain here would create infrastructure dockerd is the
+		// authority for. But EnsureChain is also the only thing that installs the
+		// global link-local (IMDS) DROP, and a Docker sandbox with no egress
+		// policy installs no per-IP rule of its own — so without this install the
+		// host blocks nothing and the sandbox reaches 169.254.169.254 over IPv4.
+		// Install just that rule, idempotently, into the chain the Docker path
+		// actually uses.
+		//
+		// Operator tradeoff: DOCKER-USER is explicitly the operator's chain, and
+		// an unqualified -d 169.254.0.0/16 DROP inserted at position 1 overrides
+		// an operator ACCEPT for link-local (LAN discovery, a local service). We
+		// accept that override because link-local IMDS is a credential-theft path,
+		// and the install is gated on SB_NETWORK_RULES (a disabled manager
+		// installs nothing), the operator's documented switch for sandbox egress
+		// enforcement. Scoping the drop to the sandbox bridge subnet was rejected:
+		// it would exempt traffic already routed through Docker's own NAT and
+		// leave the IMDS reachable from the host-routed path we are closing.
+		if err := dockerRules.EnsureLinkLocalDrop(); err != nil {
+			return nil, fmt.Errorf("install link-local (IMDS) drop in %s: %w", netrules.ChainDockerUser, err)
+		}
 		return nil, nil
 	}
 	// Dedicated AEROLVM-USER manager for the containerd driver so its rules
@@ -46,6 +69,10 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	// bridge needs its own FORWARD ACCEPTs or all sandbox egress + peer traffic
 	// is dropped. EnsureChain installs them (below per-IP DROPs) for this subnet.
 	ctdRules.SetBridgeSubnet(cni.DefaultBridgeSubnet)
+	// Tell the manager the exact bridge too: the IPv6 precondition then probes
+	// aerolvm0's own sysctl instead of deriving the interface from the subnet,
+	// which cannot see an interface whose IPv6 was (re-)enabled on its own.
+	ctdRules.SetBridgeName(containerdSandboxBridge)
 	if err := ctdRules.EnsureChain(); err != nil {
 		return nil, fmt.Errorf("bootstrap AEROLVM-USER chain: %w", err)
 	}
@@ -84,9 +111,14 @@ func startChainReassert(ctx context.Context, rules *netrules.Manager, logger *sl
 	if rules == nil {
 		return func() {}
 	}
+	// Read the interval on the caller's goroutine. It is a package-level test
+	// seam, and a reassert goroutine that outlives its test would read it while
+	// the next test writes it — the data race `go test -race ./pkg/daemon/`
+	// reports (same shape as clusterOwnershipReplayTick in daemon.go).
+	interval := chainReassertInterval
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
-		t := time.NewTicker(chainReassertInterval)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {

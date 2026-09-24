@@ -134,14 +134,14 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	}
 	d.mu.Lock()
 	rec = d.byID[sandboxID]
-	if rec != nil {
-		rec.state.Status = models.SandboxStatusStarted
-	}
-	d.mu.Unlock()
 	if rec == nil {
+		d.mu.Unlock()
 		return nil, nil
 	}
-	return rec.state, nil
+	rec.state.Status = models.SandboxStatusStarted
+	c := *rec.state
+	d.mu.Unlock()
+	return &c, nil
 }
 
 // Stop marks a sandbox stopped but keeps its bundle pinned so a later Start is
@@ -192,22 +192,26 @@ func (d *Driver) Resize(ctx context.Context, sandboxID string, req models.Resize
 func (d *Driver) Inspect(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
 	d.mu.Lock()
 	rec := d.byID[sandboxID]
-	d.mu.Unlock()
 	if rec == nil {
+		d.mu.Unlock()
 		return nil, nil
 	}
-	return rec.state, nil
+	c := *rec.state
+	d.mu.Unlock()
+	return &c, nil
 }
 
 // ListManaged returns the runtime state of every isolate this daemon owns, so
 // restart reconcile can match live isolates against persisted rows and
-// terminal-ize any strays.
+// terminal-ize any strays. Entries are copies — the live records stay owned by
+// d.mu.
 func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	out := make(map[string]*models.SandboxRuntimeState, len(d.byID))
 	for id, rec := range d.byID {
-		out[id] = rec.state
+		c := *rec.state
+		out[id] = &c
 	}
 	return out, nil
 }

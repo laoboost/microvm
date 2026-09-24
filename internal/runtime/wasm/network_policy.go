@@ -16,10 +16,18 @@ func (d *Driver) DrainNetworkByteCounters() map[string]struct{ BytesIn, BytesOut
 		}
 	}
 	d.mu.Lock()
-	instances := make([]*sandboxInstance, 0, len(d.byID))
+	type netstatTarget struct {
+		sandboxID  string
+		socketPath string
+	}
+	instances := make([]netstatTarget, 0, len(d.byID))
 	for _, inst := range d.byID {
-		if inst != nil && inst.status == models.SandboxStatusStarted && inst.socketPath != "" {
-			instances = append(instances, inst)
+		if inst == nil {
+			continue
+		}
+		snap := snapshotOfLocked(inst)
+		if snap.status == models.SandboxStatusStarted && snap.socketPath != "" {
+			instances = append(instances, netstatTarget{sandboxID: snap.sandboxID, socketPath: snap.socketPath})
 		}
 	}
 	d.mu.Unlock()
@@ -56,11 +64,12 @@ func (d *Driver) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bo
 	}
 	d.mu.Lock()
 	inst := d.byID[sandboxID]
+	snap := snapshotOfLocked(inst)
 	d.mu.Unlock()
-	if inst == nil || inst.status != models.SandboxStatusStarted || inst.socketPath == "" {
+	if inst == nil || snap.status != models.SandboxStatusStarted || snap.socketPath == "" {
 		return
 	}
-	if err := d.newWorkerClient(inst.socketPath).SetNetworkBlocks(sandboxID, blockIngress, blockEgress); err != nil && d.logger != nil {
+	if err := d.newWorkerClient(snap.socketPath).SetNetworkBlocks(sandboxID, blockIngress, blockEgress); err != nil && d.logger != nil {
 		d.logger.Debug("wasm worker set network blocks failed", "sandbox_id", sandboxID, "error", err)
 	}
 }

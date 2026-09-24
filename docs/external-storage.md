@@ -37,7 +37,8 @@ The daemon rejects (with HTTP 400) mounts whose:
 
 - `type` isn't one of the four supported types
 - `target` is empty, relative, contains `..`, or matches one of: `/`, `/proc`, `/sys`, `/dev`, `/etc`, `/usr`, `/bin`, `/sbin`, `/lib*`, `/boot`, `/var/run`, `/run`, the toolbox mount path
-- `source` doesn't match the type-specific format (e.g. an `s3` source must not be a filesystem path; `nfs` must contain `:/`; `sshfs` must contain `@` and `:`)
+- `source` doesn't match the type-specific format (e.g. an `s3` source must not be a filesystem path; `nfs` must contain `:/`; `sshfs` must be `user@host:/absolute/path` with a plain `user`/`host` — no leading `-`, no whitespace, no option-looking host)
+- NFS mount options in `Options["opts"]` are checked against an allowlist (`vers`, `proto`, `port`, `mountport`, `addr`, `retry`, `timeo`, `trans`, `rsize`, `wsize`, `hard`/`soft`, `retrans`, `ro`, `rw`, `nosuid`, `nodev`, `noexec`). Anything else — `suid`, `dev`, `exec`, `user`, `users`, `owner`, `context=`, `umountprog`/`mountprog`, `x-systemd.*` — is rejected. Read-only normally comes from the spec's `ReadOnly` flag: a user `rw` is ignored, a user `ro` is honored only when `ReadOnly` is not already set (so it can never widen access), and `nosuid,nodev` are always forced on
 - `credentials` map has more than 32 keys or more than 4 KiB total payload, or contains null bytes / newlines
 
 These rules are enforced at the API boundary; nothing is created if any mount is invalid.
@@ -75,7 +76,10 @@ Mounts: []types.MountSpec{{
     Type:   types.MountTypeNFS,
     Source: "nfs.internal:/exports/team",
     Target: "/mnt/team",
-    Options: map[string]string{"opts": "ro,vers=4"},
+    // Read-only comes from ReadOnly below; ro/rw are allowlisted but rw is
+    // ignored and ro is only honored when ReadOnly is unset.
+    Options: map[string]string{"opts": "vers=4"},
+    ReadOnly: true,
 }}
 ```
 
@@ -94,7 +98,7 @@ Mounts: []types.MountSpec{{
 }}
 ```
 
-The key is written to a host-only tmpfs file; sshfs reads it and keeps reading it on reconnect (the option `reconnect` is set, along with `accept-new` host keys and 15 s/3-strike server-alive). The key file is mode 0600 and lives in `/run/sandboxd/`.
+The key is written to a host-only tmpfs file; sshfs reads it and keeps reading it on reconnect (the option `reconnect` is set, along with `StrictHostKeyChecking=yes` — known host keys only, since trust-on-first-use is MITM-able — `ProxyCommand=none`, and 15 s/3-strike server-alive). The key file is mode 0600 and lives in `/run/sandboxd/`.
 
 ### Rclone (any provider rclone supports)
 

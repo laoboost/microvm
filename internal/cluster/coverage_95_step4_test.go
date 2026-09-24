@@ -22,7 +22,12 @@ import (
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
 
-func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
+// TestFSMStoreFailureFallsBackInlineOnMutations walks every mutating op
+// under a permanently failing recovery store and pins the C6a contract: a
+// local Put failure must never error or half-apply an entry — each op still
+// succeeds with the inline recovery fallback (the name-conflict validation
+// error is a real FSM decision and still surfaces).
+func TestFSMStoreFailureFallsBackInlineOnMutations(t *testing.T) {
 	fsm := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
 	spec := &models.CreateSandboxRequest{Image: "alpine", Name: "n1"}
 	fsm.mu.Lock()
@@ -31,8 +36,8 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 	fsm.nameIndex = map[string]string{"n1": "sb"}
 	fsm.mu.Unlock()
 
-	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb", OwnerNodeID: "n2"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("reassign store fail=%v", got)
+	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb", OwnerNodeID: "n2"}); got != nil {
+		t.Fatalf("reassign store fail=%v, want nil (inline fallback)", got)
 	}
 
 	fsmOrphan := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
@@ -40,8 +45,8 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 	fsmOrphan.placements["sb"] = Placement{SandboxID: "sb", OwnerNodeID: "n", Spec: spec}
 	fsmOrphan.ownerIndex = map[string]map[string]struct{}{"n": {"sb": {}}}
 	fsmOrphan.mu.Unlock()
-	if got := applyOp(t, fsmOrphan, command{Op: opOrphanOwner, NodeID: "n"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("orphan store fail=%v", got)
+	if got := applyOp(t, fsmOrphan, command{Op: opOrphanOwner, NodeID: "n"}); got != nil {
+		t.Fatalf("orphan store fail=%v, want nil (inline fallback)", got)
 	}
 
 	fsm.mu.Lock()
@@ -50,8 +55,8 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 		Spec: &models.CreateSandboxRequest{Image: "x"},
 	}
 	fsm.mu.Unlock()
-	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-o", OwnerNodeID: "n"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("claim store fail=%v", got)
+	if got := applyOp(t, fsm, command{Op: opClaimOrphan, SandboxID: "sb-o", OwnerNodeID: "n"}); got != nil {
+		t.Fatalf("claim store fail=%v, want nil (inline fallback)", got)
 	}
 
 	fsm2 := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
@@ -69,16 +74,16 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 	if got := applyOp(t, fsm2, command{Op: opUpsertSpec, SandboxID: "b", Spec: &models.CreateSandboxRequest{Name: "keep", Image: "i2"}}); got == nil || !errors.Is(got.(error), ErrNameConflict) {
 		t.Fatalf("upsert rename conflict=%v", got)
 	}
-	if got := applyOp(t, fsm2, command{Op: opUpsertSpec, SandboxID: "b", Spec: &models.CreateSandboxRequest{Name: "old2", Image: "i2"}}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("upsert store fail=%v", got)
+	if got := applyOp(t, fsm2, command{Op: opUpsertSpec, SandboxID: "b", Spec: &models.CreateSandboxRequest{Name: "old2", Image: "i2"}}); got != nil {
+		t.Fatalf("upsert store fail=%v, want nil (inline fallback)", got)
 	}
 
 	fsm3 := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
 	fsm3.mu.Lock()
 	fsm3.placements["sb-p"] = Placement{SandboxID: "sb-p", OwnerNodeID: "n", Spec: &models.CreateSandboxRequest{Image: "i"}}
 	fsm3.mu.Unlock()
-	if got := applyOp(t, fsm3, command{Op: opAddExposedPort, SandboxID: "sb-p", Port: 80, Protocol: "http"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("add port store fail=%v", got)
+	if got := applyOp(t, fsm3, command{Op: opAddExposedPort, SandboxID: "sb-p", Port: 80, Protocol: "http"}); got != nil {
+		t.Fatalf("add port store fail=%v, want nil (inline fallback)", got)
 	}
 	fsm3.mu.Lock()
 	fsm3.placements["sb-p"] = Placement{
@@ -86,11 +91,11 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 		ExposedPorts: map[int]string{80: "http"}, ExposedPortRoutes: map[int]ExposedPortRoute{80: {Protocol: "http"}},
 	}
 	fsm3.mu.Unlock()
-	if got := applyOp(t, fsm3, command{Op: opRemoveExposedPort, SandboxID: "sb-p", Port: 80}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("remove port store fail=%v", got)
+	if got := applyOp(t, fsm3, command{Op: opRemoveExposedPort, SandboxID: "sb-p", Port: 80}); got != nil {
+		t.Fatalf("remove port store fail=%v, want nil (inline fallback)", got)
 	}
-	if got := applyOp(t, fsm3, command{Op: opAddCustomDomain, SandboxID: "sb-p", Hostname: "h.example"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("add domain store fail=%v", got)
+	if got := applyOp(t, fsm3, command{Op: opAddCustomDomain, SandboxID: "sb-p", Hostname: "h.example"}); got != nil {
+		t.Fatalf("add domain store fail=%v, want nil (inline fallback)", got)
 	}
 	fsm3.mu.Lock()
 	fsm3.placements["sb-p"] = Placement{
@@ -99,8 +104,8 @@ func TestFSMStoreFailureBranchesOnMutations(t *testing.T) {
 	}
 	fsm3.customHostnameIndex = map[string]string{"h.example": "sb-p"}
 	fsm3.mu.Unlock()
-	if got := applyOp(t, fsm3, command{Op: opRemoveCustomDomain, SandboxID: "sb-p", Hostname: "h.example"}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("remove domain store fail=%v", got)
+	if got := applyOp(t, fsm3, command{Op: opRemoveCustomDomain, SandboxID: "sb-p", Hostname: "h.example"}); got != nil {
+		t.Fatalf("remove domain store fail=%v, want nil (inline fallback)", got)
 	}
 }
 
@@ -302,7 +307,7 @@ func TestRemoveMemberLocalExpiredDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
 	time.Sleep(time.Millisecond)
-	_ = leader.removeMemberLocal(ctx, follower.nodeID, true)
+	_ = leader.removeMemberLocal(ctx, follower.nodeID, true, false)
 }
 
 func TestFSMClaimNameAndResolveRecoveryEdges(t *testing.T) {
@@ -449,14 +454,14 @@ func TestFSMOrphanOwnerStaleIndexAndReserveBatchStoreFail(t *testing.T) {
 	if got := applyOp(t, failFSM, command{Op: opReserveBatch, Reservations: []reservationCommand{{
 		SandboxID: "r1", OwnerNodeID: "a",
 		Spec: &models.CreateSandboxRequest{Image: "i", CPU: 1}, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
-	}}}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("reserve batch store fail=%v", got)
+	}}}); got != nil {
+		t.Fatalf("reserve batch store fail=%v, want nil (inline fallback)", got)
 	}
 	if got := applyOp(t, failFSM, command{
 		Op: opReserve, SandboxID: "r2", OwnerNodeID: "a",
 		Spec: &models.CreateSandboxRequest{Image: "i", CPU: 1}, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
-	}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
-		t.Fatalf("reserve store fail=%v", got)
+	}); got != nil {
+		t.Fatalf("reserve store fail=%v, want nil (inline fallback)", got)
 	}
 }
 

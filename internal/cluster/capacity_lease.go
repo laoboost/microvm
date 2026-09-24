@@ -67,14 +67,24 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 	// straight off this lease, so without the overlay our own snapshot
 	// would advertise no templates and the unknown-allow rule would
 	// let creates land on peers that lack them.
-	if c.localTemplateInventory != nil {
-		if ids, known := c.localTemplateInventory(); known {
+	//
+	// The providers are installed after construction (cluster.New starts this
+	// refresh loop, and the daemon calls SetLocalTemplateIDsProvider only once
+	// it has a service to read the inventory from), so they must be read under
+	// the same lock the setters take — an unlocked read can observe a torn func
+	// value. They are then invoked WITHOUT the lock: refreshLocal runs on the
+	// gossip tick and the callbacks read caches of their own.
+	c.mu.RLock()
+	templateInventory, wasmInventory := c.localTemplateInventory, c.localWasmModuleInventory
+	c.mu.RUnlock()
+	if templateInventory != nil {
+		if ids, known := templateInventory(); known {
 			snap.LocalTemplateInventoryKnown = true
 			snap.LocalTemplateIDs = ids
 		}
 	}
-	if c.localWasmModuleInventory != nil {
-		if refs, known := c.localWasmModuleInventory(); known {
+	if wasmInventory != nil {
+		if refs, known := wasmInventory(); known {
 			snap.LocalWasmModuleInventoryKnown = true
 			snap.LocalWasmModuleIDs = refs
 		}
@@ -153,11 +163,25 @@ func (c *Cluster) startCapacityLeaseLoop(interval time.Duration) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.capacityLeaseStop = cancel
-	go c.runCapacityLeaseLoop(ctx, interval)
+	// Capture the gossip node now. Production assigns it once in New before this
+	// loop starts and never swaps it, so re-reading the field every tick buys
+	// nothing — and it races a test that substitutes a synthetic node on a live
+	// cluster.
+	gossip := c.gossip
+	go c.runCapacityLeaseLoopWithGossip(ctx, interval, gossip)
 }
 
+// runCapacityLeaseLoop drives the loop against the cluster's current gossip
+// node. The background loop uses runCapacityLeaseLoopWithGossip with the node
+// captured at start instead: production never swaps gossip after New, and
+// re-reading the field every tick races a test that substitutes a synthetic
+// node on a live cluster.
 func (c *Cluster) runCapacityLeaseLoop(ctx context.Context, interval time.Duration) {
-	c.refreshCapacityLeases(ctx)
+	c.runCapacityLeaseLoopWithGossip(ctx, interval, c.gossip)
+}
+
+func (c *Cluster) runCapacityLeaseLoopWithGossip(ctx context.Context, interval time.Duration, gossip *gossipNode) {
+	c.refreshCapacityLeasesFrom(ctx, gossip)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -165,19 +189,27 @@ func (c *Cluster) runCapacityLeaseLoop(ctx context.Context, interval time.Durati
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			c.refreshCapacityLeases(ctx)
+			c.refreshCapacityLeasesFrom(ctx, gossip)
 		}
 	}
 }
 
+// refreshCapacityLeases refreshes from the cluster's current gossip node. The
+// background loop uses refreshCapacityLeasesFrom with the node it captured at
+// start; this entry point stays for callers (and tests) that drive a refresh
+// directly.
 func (c *Cluster) refreshCapacityLeases(ctx context.Context) {
-	if c == nil || c.capacityLeases == nil || c.gossip == nil {
+	c.refreshCapacityLeasesFrom(ctx, c.gossip)
+}
+
+func (c *Cluster) refreshCapacityLeasesFrom(ctx context.Context, gossip *gossipNode) {
+	if c == nil || c.capacityLeases == nil || gossip == nil {
 		return
 	}
 	now := time.Now()
 	c.capacityLeases.refreshLocal(now)
 
-	members := c.gossip.members()
+	members := gossip.members()
 	jobs := make(chan Member)
 	var wg sync.WaitGroup
 	for i := 0; i < capacityLeaseFetchConcurrency; i++ {

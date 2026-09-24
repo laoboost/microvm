@@ -53,13 +53,32 @@ apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin do
 systemctl enable --now docker
 
 OBS_ROOT=/opt/aerolvm-obs
-mkdir -p "$OBS_ROOT/grafana/dashboards" "$OBS_ROOT/grafana/provisioning/datasources" "$OBS_ROOT/grafana/provisioning/dashboards"
+# 0700 on OBS_ROOT: prometheus.yml embeds the scrape bearer token (PAT) and
+# .env holds the Grafana admin password. install -d only modes the leaf it
+# creates, so OBS_ROOT itself is forced explicitly.
+install -d -m 0700 "$OBS_ROOT"
+# Grafana bind-mounts these directories into the grafana container (uid 472),
+# which must be able to traverse and read them. 0700 root:root left grafana
+# with no dashboards/datasources, and restart: unless-stopped turned that into
+# a silent crash loop. They contain no secrets, so 0755 dirs / 0644 files.
+# (prometheus.yml below is different — it carries the PAT and is owned 65534.)
+install -d -m 0755 "$OBS_ROOT/grafana/dashboards" "$OBS_ROOT/grafana/provisioning/datasources" "$OBS_ROOT/grafana/provisioning/dashboards"
+chmod 0700 "$OBS_ROOT"
+chmod 0755 "$OBS_ROOT/grafana" "$OBS_ROOT/grafana/provisioning"
 
 cat > "$OBS_ROOT/docker-compose.yml" <<'COMPOSE_EOF'
 ${docker_compose}
 COMPOSE_EOF
 
-echo '${prometheus_yml_b64}' | base64 -d > "$OBS_ROOT/prometheus.yml"
+# prometheus.yml carries the bearer PAT for the sandboxd scrape targets. The
+# prometheus container (uid 65534) bind-mounts it read-only at
+# /etc/prometheus/prometheus.yml, so it must be owned by 65534 and readable by
+# it — 0600 root:root made Prometheus unable to read its own config, which with
+# restart: unless-stopped became a silent crash loop. 0400 (not 0600) also keeps
+# every other uid out.
+( umask 077; echo '${prometheus_yml_b64}' | base64 -d > "$OBS_ROOT/prometheus.yml.tmp" )
+install -o 65534 -g 65534 -m 0400 "$OBS_ROOT/prometheus.yml.tmp" "$OBS_ROOT/prometheus.yml"
+rm -f "$OBS_ROOT/prometheus.yml.tmp"
 
 cat > "$OBS_ROOT/grafana/provisioning/datasources/prometheus.yml" <<'DS_EOF'
 ${grafana_datasource_yml}
@@ -68,11 +87,14 @@ DS_EOF
 cat > "$OBS_ROOT/grafana/provisioning/dashboards/dashboards.yml" <<'DBPROV_EOF'
 ${grafana_dashboards_yml}
 DBPROV_EOF
+chmod 0644 "$OBS_ROOT/grafana/provisioning/datasources/prometheus.yml" \
+           "$OBS_ROOT/grafana/provisioning/dashboards/dashboards.yml"
 
 %{ for name, content in dashboard_files ~}
 cat > "$OBS_ROOT/grafana/dashboards/${name}" <<'__AEROLVM_DASH_EOF__'
 ${content}
 __AEROLVM_DASH_EOF__
+chmod 0644 "$OBS_ROOT/grafana/dashboards/${name}"
 %{ endfor ~}
 
 cat > "$OBS_ROOT/.env" <<EOF

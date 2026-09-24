@@ -125,7 +125,7 @@ For every other surviving server node, do not reuse stale Raft state:
 sudo systemctl stop sandboxd
 sudo mv /var/lib/sandboxd/raft /var/lib/sandboxd/raft.pre-rejoin.$(date +%s)
 sudo /usr/local/sbin/cluster-join.sh \
-  --gossip-key '<key>' \
+  --gossip-key-file /root/gossip-key \
   --peers <recovered-node-private-ip>:7001 \
   --tls-bundle /path/to/aerolvm-tls-bundle.tar.gz \
   --force

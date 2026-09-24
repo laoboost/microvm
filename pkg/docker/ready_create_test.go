@@ -160,9 +160,15 @@ func TestCreate_RemovesReadySocketOnStartFailure(t *testing.T) {
 func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	requireLinuxUnix(t)
 	readyDir := t.TempDir()
+	// healthHits is written by the toolboxServer handler goroutine and captured
+	// is written by the HTTP transport goroutine, while the push goroutine below
+	// reads both; guard them so -race stays trustworthy.
+	var stateMu sync.Mutex
 	healthHits := 0
 	ip, port, closeFn := toolboxServer(t, func(w http.ResponseWriter, r *http.Request) {
+		stateMu.Lock()
 		healthHits++
+		stateMu.Unlock()
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	t.Cleanup(closeFn)
@@ -173,7 +179,11 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	wrapped := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodPost && r.URL.Path == "/containers/create" && r.Body != nil {
 			body, _ := io.ReadAll(r.Body)
-			_ = json.Unmarshal(body, &captured)
+			var parsed map[string]any
+			_ = json.Unmarshal(body, &parsed)
+			stateMu.Lock()
+			captured = parsed
+			stateMu.Unlock()
 			r.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		return base(r)
@@ -197,32 +207,45 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		deadline := time.Now().Add(time.Second)
+		// The ready socket is bound before the /containers/create request, so on
+		// the first passes the create body (and the sandbox id carried in it) may
+		// not exist yet. Retry until the deadline instead of bailing on the first
+		// look — bailing made this test flaky whenever the glob won the race
+		// against the create request. Budget comfortably exceeds Create's
+		// toolboxWaitTimeout so a slow host fails the assertion, not the clock.
+		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
+			stateMu.Lock()
+			pushID := envValueFromCreate(captured, "SB_SANDBOX_ID")
+			stateMu.Unlock()
+			if pushID == "" {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
 			matches, _ := filepath.Glob(filepath.Join(readyDir, "sb-race.*.sock"))
 			if len(matches) == 0 {
 				time.Sleep(5 * time.Millisecond)
 				continue
 			}
-			conn, err := net.Dial("unix", matches[0])
-			if err != nil {
-				return
-			}
-			defer conn.Close()
 			base := filepath.Base(matches[0])
 			parts := strings.Split(strings.TrimSuffix(base, ".sock"), ".")
 			if len(parts) < 2 {
-				return
+				time.Sleep(5 * time.Millisecond)
+				continue
 			}
-			nonce := parts[1]
-			pushID := envValueFromCreate(captured, "SB_SANDBOX_ID")
-			if pushID == "" {
-				return
+			conn, err := net.Dial("unix", matches[0])
+			if err != nil {
+				time.Sleep(5 * time.Millisecond)
+				continue
 			}
-			_ = readyproto.Encode(conn, readyproto.ReadySignal{
-				Event: readyproto.EventReady, SandboxID: pushID, Token: "tok", Nonce: nonce,
+			encErr := readyproto.Encode(conn, readyproto.ReadySignal{
+				Event: readyproto.EventReady, SandboxID: pushID, Token: "tok", Nonce: parts[1],
 			})
-			return
+			_ = conn.Close()
+			if encErr == nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
 	}()
 
@@ -235,8 +258,11 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	if timing.Source != "socket" {
 		t.Fatalf("source = %q, want socket", timing.Source)
 	}
-	if healthHits > 0 {
-		t.Fatalf("health poll ran %d times on socket win", healthHits)
+	stateMu.Lock()
+	hits := healthHits
+	stateMu.Unlock()
+	if hits > 0 {
+		t.Fatalf("health poll ran %d times on socket win", hits)
 	}
 }
 

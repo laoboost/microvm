@@ -105,7 +105,13 @@ func (d *Driver) Inspect(ctx context.Context, sandboxID string) (*models.Sandbox
 		return nil, nil
 	}
 	inst = d.refreshWorkerInstanceState(ctx, sandboxID, inst)
-	return d.runtimeState(inst), nil
+	if inst == nil {
+		return nil, nil
+	}
+	d.mu.Lock()
+	state := d.runtimeState(inst)
+	d.mu.Unlock()
+	return state, nil
 }
 
 func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRuntimeState, error) {
@@ -122,19 +128,27 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 		if inst == nil {
 			continue
 		}
+		d.mu.Lock()
 		out[id] = d.runtimeState(inst)
+		d.mu.Unlock()
 	}
 	return out, nil
 }
 
 func (d *Driver) refreshWorkerInstanceState(ctx context.Context, sandboxID string, inst *sandboxInstance) *sandboxInstance {
-	if inst == nil || strings.TrimSpace(inst.socketPath) == "" {
+	if inst == nil {
+		return inst
+	}
+	d.mu.Lock()
+	snap := snapshotOfLocked(inst)
+	d.mu.Unlock()
+	if strings.TrimSpace(snap.socketPath) == "" {
 		return inst
 	}
 	// Resident-hosted instances live on a shared process. Verify the host socket
 	// is still alive (D8) — after a host crash, Inspect/List must not report
 	// started for gone instances. Per-sandbox spawn-count does not apply.
-	if inst.fromResidentHost {
+	if snap.fromResidentHost {
 		statusCtx := ctx
 		if statusCtx == nil {
 			statusCtx = context.Background()
@@ -144,17 +158,21 @@ func (d *Driver) refreshWorkerInstanceState(ctx context.Context, sandboxID strin
 			statusCtx, cancel = context.WithTimeout(statusCtx, 2*time.Second)
 			defer cancel()
 		}
-		loaded, err := d.newWorkerClient(inst.socketPath).InstanceLoaded(statusCtx, sandboxID)
+		loaded, err := d.newWorkerClient(snap.socketPath).InstanceLoaded(statusCtx, sandboxID)
 		if err != nil || !loaded {
 			return d.markWorkerInstanceStopped(sandboxID, inst)
 		}
 		return inst
 	}
-	if count, ok := d.supervisorSpawnCount(d.workerKeyForInstance(sandboxID, inst)); ok {
-		if inst.workerSpawnCount > 0 && count != inst.workerSpawnCount {
+	workerKey := snap.workerKey
+	if strings.TrimSpace(workerKey) == "" {
+		workerKey = sandboxID
+	}
+	if count, ok := d.supervisorSpawnCount(workerKey); ok {
+		if snap.workerSpawnCount > 0 && count != snap.workerSpawnCount {
 			return d.markWorkerInstanceStopped(sandboxID, inst)
 		}
-		if inst.workerSpawnCount == 0 && count > 0 {
+		if snap.workerSpawnCount == 0 && count > 0 {
 			d.mu.Lock()
 			if current := d.byID[sandboxID]; current == inst {
 				current.workerSpawnCount = count
@@ -173,7 +191,7 @@ func (d *Driver) refreshWorkerInstanceState(ctx context.Context, sandboxID strin
 		statusCtx, cancel = context.WithTimeout(statusCtx, 2*time.Second)
 		defer cancel()
 	}
-	loaded, err := d.newWorkerClient(inst.socketPath).InstanceLoaded(statusCtx, sandboxID)
+	loaded, err := d.newWorkerClient(snap.socketPath).InstanceLoaded(statusCtx, sandboxID)
 	if err != nil || loaded {
 		return inst
 	}
@@ -204,20 +222,23 @@ func (d *Driver) supervisorSpawnCount(workerKey string) (int, bool) {
 	return counter.SpawnCount(workerKey), true
 }
 
-func (d *Driver) workerKeyForInstance(sandboxID string, inst *sandboxInstance) string {
-	if inst != nil && strings.TrimSpace(inst.workerKey) != "" {
-		return inst.workerKey
-	}
-	return sandboxID
-}
-
+// noteWorkerSpawnCount records the supervisor's spawn counter on the instance
+// under d.mu (workerSpawnCount is a mutable field of the shared record).
 func (d *Driver) noteWorkerSpawnCount(inst *sandboxInstance) {
 	if inst == nil {
 		return
 	}
-	key := d.workerKeyForInstance(inst.sandboxID, inst)
+	d.mu.Lock()
+	snap := snapshotOfLocked(inst)
+	d.mu.Unlock()
+	key := snap.workerKey
+	if strings.TrimSpace(key) == "" {
+		key = snap.sandboxID
+	}
 	if count, ok := d.supervisorSpawnCount(key); ok {
+		d.mu.Lock()
 		inst.workerSpawnCount = count
+		d.mu.Unlock()
 	}
 }
 

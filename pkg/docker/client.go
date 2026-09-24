@@ -321,6 +321,43 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
+// baseHostConfig builds the HostConfig envelope shared by the cold create path
+// and the warm-pool park path: the privileged opt-in, the caller's binds, and
+// the no-new-privileges hardening. Building it in ONE place is what keeps the
+// two paths from drifting — a parked container is what most default creates
+// actually boot, so it must carry the same security envelope as a cold one.
+// Callers layer their own Runtime/NetworkMode/resources/GPU fields on top.
+func (c *Client) baseHostConfig(binds []string) map[string]any {
+	hostConfig := map[string]any{
+		"Privileged": c.privileged,
+		"Binds":      binds,
+	}
+	// no-new-privileges blocks setuid/setgid-based privilege escalation inside
+	// the container. Privileged (operator opt-in) is exempt — it deliberately
+	// restores full host capabilities and stays opt-in.
+	if !c.privileged {
+		hostConfig["SecurityOpt"] = []string{"no-new-privileges=true"}
+	}
+	return hostConfig
+}
+
+// bindEntry builds a HostConfig.Binds entry ("src:dst[:opts]") after asserting
+// each path component is plain. Bind entries are colon-joined and option lists
+// are comma-split, so a ':' or ',' in either segment would inject bind options
+// (e.g. ContainerPath "/data:rshared"). Used for both tenant mounts and the
+// operator-configured toolbox bind so neither can skip the guard.
+func bindEntry(src, dst string, opts ...string) (string, error) {
+	for _, p := range []string{src, dst} {
+		if p == "" || strings.ContainsAny(p, ":,") {
+			return "", fmt.Errorf("bind path %q must be non-empty and contain no ':' or ','", p)
+		}
+	}
+	if len(opts) == 0 {
+		return src + ":" + dst, nil
+	}
+	return src + ":" + dst + ":" + strings.Join(opts, ","), nil
+}
+
 // Create provisions and starts a managed container. The caller chooses the
 // sandbox ID up-front; we set it as the container's Docker name so the name
 // is the canonical sandbox identifier end-to-end (the container ID is an
@@ -331,9 +368,22 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if sandboxID == "" {
 		return nil, errors.New("sandbox ID is required")
 	}
+	// sandboxID is joined into host filesystem paths (ready-socket files) and
+	// used as the Docker name. Validate it up front — before any engine
+	// round-trip — matching pkg/mounts' per-id path guard (defense-in-depth;
+	// readysock.go re-validates its own path joins).
+	if err := mounts.ValidateSandboxID(sandboxID); err != nil {
+		return nil, err
+	}
 	if err := c.ensureToolboxBinary(); err != nil {
 		return nil, err
 	}
+
+	// OSUser is passed verbatim as HostConfig.User, which dockerd resolves
+	// case-sensitively against the image's /etc/passwd — "ROOT" is not a
+	// resolvable account. Normalize the root spelling once here, before the
+	// warm-pool eligibility check and the cold path, so both agree.
+	req.OSUser = normalizeOSUser(req.OSUser)
 
 	// Resolve the effective user-facing runtime: per-sandbox override wins
 	// over the host default. The service layer is expected to substitute the
@@ -443,9 +493,11 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		"Labels":     labels,
 	}
 
-	binds := []string{
-		fmt.Sprintf("%s:%s:ro", c.toolboxBinaryPath, c.toolboxMountPath),
+	toolboxBind, err := bindEntry(c.toolboxBinaryPath, c.toolboxMountPath, "ro")
+	if err != nil {
+		return nil, err
 	}
+	binds := []string{toolboxBind}
 
 	var readyListener *ReadyListener
 	var readyListenerClosed bool
@@ -470,6 +522,10 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("ready listener: %w", err)
 		}
 		readySocketCreated = true
+		// Operator-trusted and validated: the host path is built from the
+		// operator's ready-socket dir plus an already-validated sandboxID and a
+		// hex nonce, and the guest path is a package constant, so this bind is
+		// intentionally exempt from the tenant-mount option-injection guard.
 		binds = append(binds, readyListener.BindSpec())
 		envValues = append(envValues, readyListener.EnvVars()...)
 		sort.Strings(envValues)
@@ -482,9 +538,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	for _, m := range hostMounts {
-		entry := fmt.Sprintf("%s:%s", m.HostPath, m.ContainerPath)
+		// Tenant mount paths are attacker-influenced; bindEntry asserts the
+		// components are plain before joining (see its comment).
+		var opts []string
 		if m.ReadOnly {
-			entry += ":ro"
+			opts = append(opts, "ro")
+		}
+		entry, err := bindEntry(m.HostPath, m.ContainerPath, opts...)
+		if err != nil {
+			return nil, err
 		}
 		binds = append(binds, entry)
 	}
@@ -519,9 +581,12 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}()
 
-	hostConfig := map[string]any{
-		"Privileged": c.privileged,
-		"Binds":      binds,
+	hostConfig := c.baseHostConfig(binds)
+	// Honor req.OSUser instead of running as whatever USER the image ships
+	// (often root = host uid 0). Empty leaves the image default in charge —
+	// the caller's lack of a request must not be confused with an explicit root.
+	if user := strings.TrimSpace(req.OSUser); user != "" {
+		hostConfig["User"] = user
 	}
 
 	if netnsAdopted {

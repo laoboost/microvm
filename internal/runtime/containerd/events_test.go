@@ -195,7 +195,7 @@ func TestStreamEventsClosedChannel(t *testing.T) {
 
 type closedSubscribeTransport struct{ fakeTransport }
 
-func (closedSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
+func (*closedSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
 	ch := make(chan *events.Envelope)
 	close(ch)
 	return ch, make(chan error)
@@ -203,7 +203,7 @@ func (closedSubscribeTransport) subscribe(context.Context, ...string) (<-chan *e
 
 type errorSubscribeTransport struct{ fakeTransport }
 
-func (errorSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
+func (*errorSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
 	errCh := make(chan error, 1)
 	errCh <- errors.New("subscribe failed")
 	return make(chan *events.Envelope), errCh

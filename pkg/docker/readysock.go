@@ -163,7 +163,14 @@ func (l *ReadyListener) EnvVars() []string {
 
 // Wait accepts connections until a valid ready signal arrives or ctx expires.
 func (l *ReadyListener) Wait(ctx context.Context) error {
-	if l == nil || l.listener == nil {
+	if l == nil {
+		return errors.New("ready listener is not configured")
+	}
+	l.closeMu.Lock()
+	ln := l.listener
+	closed := l.closed
+	l.closeMu.Unlock()
+	if ln == nil || closed {
 		return errors.New("ready listener is not configured")
 	}
 	invalid := 0
@@ -181,9 +188,13 @@ func (l *ReadyListener) Wait(ctx context.Context) error {
 		if !ok {
 			deadline = time.Now().Add(30 * time.Second)
 		}
-		_ = l.listener.(*net.UnixListener).SetDeadline(deadline)
+		// Safe form: a non-unix listener cannot take a deadline, so it falls
+		// back to no deadline rather than panicking on an unchecked assertion.
+		if ul, ok := ln.(*net.UnixListener); ok {
+			_ = ul.SetDeadline(deadline)
+		}
 
-		conn, err := l.listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				if ctx.Err() != nil {
@@ -269,7 +280,8 @@ func (l *ReadyListener) Close() error {
 	var err error
 	if l.listener != nil {
 		err = l.listener.Close()
-		l.listener = nil
+		// Deliberately not nil-ed: Wait readers may still hold the pointer;
+		// closing the net.Listener is enough to unblock them.
 	}
 	return err
 }

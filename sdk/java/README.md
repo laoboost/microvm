@@ -141,3 +141,20 @@ var attach = sandbox.attachSession(
 attach.write("echo attached\n");
 attach.waitForExit();
 ```
+
+## Migration notes (0.6.0)
+
+Security release. Behaviour changes to review when upgrading:
+
+- **Redirects are now followed by the SDK** (up to 5 hops) with a hardened
+  policy: a redirect to a different scheme/host/port never carries
+  `Authorization` or the `X-Registry-*` credentials, and a 307/308 that would
+  replay a request body cross-origin is refused. Previously the 3xx surfaced
+  as an error.
+- `MicroVMConfig.setHttpClient` now **requires `HttpClient.Redirect.NEVER`**.
+  A redirect-following client would replay credentials inside the JDK, before
+  the SDK's policy runs, so `MicroVMClient` rejects one with a
+  `MicroVMException` at construction.
+- Upload target paths containing CR, LF, or a quote are rejected with a
+  `MicroVMException` before anything is encoded (MIME multipart injection).
+- WebSocket text frames are capped at 32 MiB, counted in UTF-8 bytes.

@@ -161,16 +161,28 @@ func readLine(r io.Reader) (string, error) {
 	if !ok {
 		br = bufio.NewReader(r)
 	}
-	raw, err := br.ReadBytes('\n')
-	if err != nil {
+	// ReadSlice returns a slice of its fixed buffer instead of allocating on
+	// every chunk the way ReadBytes does, so a newline-free stream from the
+	// world-writable ready socket is rejected at the MaxLineBytes cap without
+	// ever being buffered in full (OOM hardening).
+	var raw []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if len(raw)+len(chunk) > MaxLineBytes+1 {
+			return "", fmt.Errorf("readyproto: line exceeds %d bytes", MaxLineBytes)
+		}
+		raw = append(raw, chunk...)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
 		if errors.Is(err, io.EOF) && len(raw) > 0 {
 			// Tolerate a final line without a trailing newline (tests, short reads).
-		} else {
-			return "", err
+			break
 		}
-	}
-	if len(raw) > MaxLineBytes+1 {
-		return "", fmt.Errorf("readyproto: line exceeds %d bytes", MaxLineBytes)
+		return "", err
 	}
 	line := strings.TrimSpace(string(raw))
 	if line == "" {

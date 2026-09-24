@@ -53,6 +53,13 @@ type execStreamControlOut struct {
 }
 
 func (h *Host) handleExecStream(w http.ResponseWriter, r *http.Request) {
+	// Fail closed while host-exec is disabled (Host.hostExecEnabled): this handler runs
+	// `/bin/sh -c <user command>` on the host, and the wasm runtime has no
+	// jail to contain it.
+	if !h.hostExecEnabled {
+		writeError(w, http.StatusNotImplemented, hostExecDisabledMsg)
+		return
+	}
 	conn, err := execStreamUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Default().Warn("wasm exec stream upgrade failed", "error", err)

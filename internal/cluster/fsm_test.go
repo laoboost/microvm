@@ -101,7 +101,7 @@ func TestFSMOrphanOwnerBatchesPlacedRowsAndCancelsReservations(t *testing.T) {
 		t.Fatalf("reserve dead: %v", got)
 	}
 
-	if got := apply(4, command{Op: opOrphanOwner, NodeID: "dead"}); got != nil {
+	if got := apply(4, command{Op: opOrphanOwner, NodeID: "dead", NowUnix: time.Now().Unix()}); got != nil {
 		t.Fatalf("opOrphanOwner: %v", got)
 	}
 	orphan, ok := fsm.get("sb-dead-1")

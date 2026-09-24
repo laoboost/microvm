@@ -60,7 +60,11 @@ func New(runDir string, logger *slog.Logger) *Pool {
 }
 
 // SetSpawner injects the worker spawner (production: SupervisorSpawner).
-func (p *Pool) SetSpawner(s Spawner) { p.spawner = s }
+func (p *Pool) SetSpawner(s Spawner) {
+	p.mu.Lock()
+	p.spawner = s
+	p.mu.Unlock()
+}
 
 // SetDefaultMemoryMB sets the guest memory cap used when warming pool slots.
 func (p *Pool) SetDefaultMemoryMB(n int) {
@@ -248,7 +252,11 @@ func (p *Pool) SlotDir(digest, slotID string) string {
 
 // WarmOne spawns a single warm slot for digest/path. Used by the refill loop.
 func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, error) {
-	if p.spawner == nil {
+	p.mu.Lock()
+	spawner := p.spawner
+	memMB := p.defaultMemoryMB
+	p.mu.Unlock()
+	if spawner == nil {
 		return nil, fmt.Errorf("wasm pool: spawner not configured")
 	}
 	slotID := NewSlotID()
@@ -257,8 +265,7 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 		return nil, err
 	}
 	socketPath := filepath.Join(dir, "worker.sock")
-	memMB := p.defaultMemoryMB
-	if err := p.spawner.Warm(ctx, slotID, socketPath, modulePath, memMB); err != nil {
+	if err := spawner.Warm(ctx, slotID, socketPath, modulePath, memMB); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}

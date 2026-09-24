@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -369,6 +370,9 @@ func (s *server) routes() http.Handler {
 		case r.Method == http.MethodGet && r.URL.Path == "/health":
 			writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.Version})
 		case r.Method == http.MethodGet && r.URL.Path == "/version":
+			if !s.requireAuth(w, r) {
+				return
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version})
 		case r.Method == http.MethodGet && r.URL.Path == "/clone-generation":
 			// Unauthenticated like /health: the token is a non-sensitive
@@ -378,6 +382,11 @@ func (s *server) routes() http.Handler {
 			token, resumedAt := s.cloneGen.Current()
 			writeJSON(w, http.StatusOK, map[string]any{"generation": token, "resumed_at": resumedAt})
 		case strings.HasPrefix(r.URL.Path, "/proxy/"):
+			// Proxying reaches sandbox-local ports; without requireAuth this
+			// was a cross-tenant entry point over the shared bridge.
+			if !s.requireAuth(w, r) {
+				return
+			}
 			s.handleProxy(w, r)
 		case strings.HasPrefix(r.URL.Path, "/envd/"):
 			if !s.requireAuth(w, r) {
@@ -595,7 +604,10 @@ func (s *server) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	}
 	const prefix = "Bearer "
 	authorization := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authorization, prefix) || strings.TrimPrefix(authorization, prefix) != s.authToken {
+	// Constant-time compare so a caller can't walk the token byte-by-byte via
+	// response timing on the shared bridge.
+	if !strings.HasPrefix(authorization, prefix) ||
+		subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(authorization, prefix)), []byte(s.authToken)) != 1 {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return false
 	}
@@ -604,8 +616,7 @@ func (s *server) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 
 func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	var req models.ExecRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeError) {
 		return
 	}
 	if strings.TrimSpace(req.Command) == "" {
@@ -629,7 +640,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, shell, "-lc", req.Command)
-	cmd.Env = append(os.Environ(), envMapToSlice(req.Env)...)
+	cmd.Env = mergeEnvForExec(req.Env)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
@@ -650,24 +661,23 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var stdoutBytes []byte
-	var stderrBytes []byte
+	var stdoutBytes, stderrBytes string
 	var readWG sync.WaitGroup
 	readWG.Add(2)
 	go func() {
 		defer readWG.Done()
-		stdoutBytes, _ = io.ReadAll(stdout)
+		stdoutBytes = readCappedCapture(stdout)
 	}()
 	go func() {
 		defer readWG.Done()
-		stderrBytes, _ = io.ReadAll(stderr)
+		stderrBytes = readCappedCapture(stderr)
 	}()
 	readWG.Wait()
 	waitErr := cmd.Wait()
 
 	result := models.ExecResult{
-		Stdout:     string(stdoutBytes),
-		Stderr:     string(stderrBytes),
+		Stdout:     stdoutBytes,
+		Stderr:     stderrBytes,
 		DurationMS: time.Since(start).Milliseconds(),
 	}
 
@@ -749,8 +759,7 @@ func (s *server) handleSetAllowedPorts(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Ports []int `json:"ports"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &body, writeError) {
 		return
 	}
 	s.setAllowedPorts(body.Ports)
@@ -809,6 +818,50 @@ func detectShell() (string, error) {
 		return path, nil
 	}
 	return "", errors.New("no shell found in container")
+}
+
+// maxJSONBodyBytes matches pkg/api/apihttp.MaxJSONBodyBytes (1 MiB) so the
+// toolbox HTTP surface carries the same body cap as the versioned API.
+const maxJSONBodyBytes = 1 << 20
+
+// maxExecCaptureBytes caps each of stdout/stderr retained by the non-streaming
+// exec handlers so a chatty command can't balloon toolboxd memory. Streaming
+// endpoints (/process/exec/stream, sessions) are unaffected.
+const maxExecCaptureBytes = 1 << 20
+
+// execCaptureTruncatedMarker is appended to a captured stream that hit
+// maxExecCaptureBytes so the caller knows output was dropped.
+const execCaptureTruncatedMarker = "\n[output truncated]"
+
+// decodeJSONBody decodes one JSON value from r.Body capped at
+// maxJSONBodyBytes via http.MaxBytesReader. On failure it writes 413 (body
+// over the cap) or 400 (malformed) through writeErr — the envd surface uses
+// its own error envelope — and returns false.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, writeErr func(http.ResponseWriter, int, string)) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	return true
+}
+
+// readCappedCapture reads r to EOF, retaining at most maxExecCaptureBytes and
+// appending execCaptureTruncatedMarker on overflow. The tail past the cap is
+// drained to io.Discard so the child process never blocks on a full pipe once
+// we stop retaining output.
+func readCappedCapture(r io.Reader) string {
+	data, _ := io.ReadAll(io.LimitReader(r, maxExecCaptureBytes+1))
+	_, _ = io.Copy(io.Discard, r)
+	if len(data) > maxExecCaptureBytes {
+		return string(data[:maxExecCaptureBytes]) + execCaptureTruncatedMarker
+	}
+	return string(data)
 }
 
 func envMapToSlice(values map[string]string) []string {

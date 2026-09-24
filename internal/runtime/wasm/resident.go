@@ -139,9 +139,13 @@ func (d *Driver) releaseResidentSlotFor(inst *sandboxInstance) {
 	d.mu.Lock()
 	held := inst.residentSlotHeld
 	inst.residentSlotHeld = false
+	// Read socketPath under the same lock: migrateResidentToCold rewrites it
+	// (and clears fromResidentHost) under d.mu, so reading it after unlock raced
+	// that migration.
+	socket := inst.socketPath
 	d.mu.Unlock()
 	if held {
-		d.releaseResidentSlot(inst.socketPath)
+		d.releaseResidentSlot(socket)
 	}
 }
 
@@ -337,9 +341,13 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 	// original host (Findings A + P0-2).
 	d.mu.Lock()
 	old := d.byID[sandboxID]
+	var oldSnap instanceSnapshot
+	if old != nil {
+		oldSnap = snapshotOfLocked(old)
+	}
 	d.mu.Unlock()
-	if old != nil && old.fromResidentHost && old.socketPath != "" {
-		_ = d.newWorkerClient(old.socketPath).StopInstance(sandboxID)
+	if oldSnap.fromResidentHost && oldSnap.socketPath != "" {
+		_ = d.newWorkerClient(oldSnap.socketPath).StopInstance(sandboxID)
 		d.releaseResidentSlotFor(old)
 	}
 
@@ -410,14 +418,15 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 	if timing != nil {
 		timing.RecordStage("wasm_instantiate", time.Since(instStart))
 	}
-	inst.status = models.SandboxStatusStarted
 	d.mu.Lock()
+	inst.status = models.SandboxStatusStarted
 	// The reserved slot is now owned by this committed instance; Destroy releases
 	// it exactly once via releaseResidentSlotFor (Finding P1-2).
 	inst.residentSlotHeld = true
 	d.byID[sandboxID] = inst
+	state := d.runtimeState(inst)
 	d.mu.Unlock()
-	return d.runtimeState(inst), nil
+	return state, nil
 }
 
 // migrateResidentToCold moves a resident-hosted sandbox onto a dedicated cold

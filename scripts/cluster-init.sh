@@ -60,8 +60,12 @@ Options:
                                 derived like --raft-advertise.
   --gossip-key <base64>         Gossip secret key (base64-encoded 16/24/32
                                 bytes). Default: auto-generated 32-byte key.
-                                Save the printed value — every other node
-                                needs the same key to join.
+                                WARNING: argv is visible in `ps` and shell
+                                history — prefer --gossip-key-file or the
+                                SB_GOSSIP_SECRET_KEY environment variable.
+                                Every other node needs the same key to join.
+  --gossip-key-file <path>      Read the gossip secret key from a root-only
+                                file instead of argv (preferred).
   --tls-dir <path>              Directory for cluster TLS material (CA + node
                                 cert). Default: /etc/sandboxd/tls
   --internal-bind <host:port>   Cluster-internal mTLS listen address (used for
@@ -115,7 +119,7 @@ Options:
 
 Examples:
   sudo ./cluster-init.sh
-  sudo ./cluster-init.sh --gossip-key "$(openssl rand -base64 32)" \
+  sudo ./cluster-init.sh --gossip-key-file /root/gossip-key \
                          --api-advertise-url http://10.0.0.5:21212
 EOF
 }
@@ -129,7 +133,10 @@ while [[ $# -gt 0 ]]; do
 		--raft-advertise)     RAFT_ADVERTISE_ADDR="$2"; shift 2 ;;
 		--gossip-bind)        GOSSIP_BIND_ADDR="$2"; shift 2 ;;
 		--gossip-advertise)   GOSSIP_ADVERTISE_ADDR="$2"; shift 2 ;;
-		--gossip-key)         GOSSIP_SECRET_KEY="$2"; shift 2 ;;
+		--gossip-key)
+			echo "Warning: --gossip-key on argv is visible in process listings and shell history; prefer --gossip-key-file or the environment variable documented in --help" >&2
+			GOSSIP_SECRET_KEY="$2"; shift 2 ;;
+		--gossip-key-file)    GOSSIP_SECRET_KEY="$(cat "$2")"; shift 2 ;;
 		--tls-dir)            TLS_DIR="$2"; shift 2 ;;
 		--internal-bind)      INTERNAL_BIND_ADDR="$2"; shift 2 ;;
 		--internal-advertise) INTERNAL_ADVERTISE_URL="$2"; shift 2 ;;
@@ -159,7 +166,7 @@ fi
 validate_node_role() {
 	local raw="$1"
 	if [[ -z "$raw" ]]; then return 0; fi
-	local has_server="false" has_mixed="false" has_other="false" token_count=0
+	local has_server="false" has_mixed="false" token_count=0
 	local IFS=','
 	# shellcheck disable=SC2206
 	local parts=($raw)
@@ -173,7 +180,7 @@ validate_node_role() {
 		case "$tok" in
 			server)  has_server="true" ;;
 			mixed)   has_mixed="true" ;;
-			worker|ingress) has_other="true" ;;
+			worker|ingress) ;;  # joiners rather than init targets; handled by cluster-join.sh
 			*)
 				echo "Unknown --role token '$tok' in '$raw' (allowed: server, worker, ingress, mixed)" >&2
 				exit 1
@@ -261,6 +268,24 @@ if [[ -z "$DATA_PLANE_ADVERTISE_HOST" ]]; then
 	DATA_PLANE_ADVERTISE_HOST="$PRIMARY_IP"
 fi
 
+# Cross-node forwards dial each peer's OPERATOR URL as advertised here
+# (SB_API_ADVERTISE_URL), but install.sh binds the API to 127.0.0.1. On a
+# multi-node cluster that mismatch refuses every cross-node fan-out read, and
+# in a --no-tls private-network deployment every write forward too (TLS
+# clusters cover writes via the internal mTLS channel, but not the reads).
+# Layer an explicit SB_API_HOST onto cluster.env so the listener binds the
+# advertised interface. Only when the advertised host is a literal IPv4 — a
+# hostname may resolve to an address this node must not bind.
+api_bind_host_from_url() {
+	local host="${1#*://}"
+	host="${host%%/*}"
+	host="${host%%:*}"
+	if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+		echo "$host"
+	fi
+}
+API_BIND_HOST="$(api_bind_host_from_url "$API_ADVERTISE_URL")"
+
 # Derive advertise addrs from the primary IP + each bind's port if the operator
 # didn't override them. Binding 0.0.0.0 is fine; advertising 0.0.0.0 is not —
 # peers can't dial it.
@@ -271,6 +296,10 @@ derive_advertise() {
 }
 if [[ -z "$RAFT_ADVERTISE_ADDR" ]];   then RAFT_ADVERTISE_ADDR="$(derive_advertise "$RAFT_BIND_ADDR")"; fi
 if [[ -z "$GOSSIP_ADVERTISE_ADDR" ]]; then GOSSIP_ADVERTISE_ADDR="$(derive_advertise "$GOSSIP_BIND_ADDR")"; fi
+
+if [[ -z "$GOSSIP_SECRET_KEY" && -n "${SB_GOSSIP_SECRET_KEY:-}" ]]; then
+	GOSSIP_SECRET_KEY="$SB_GOSSIP_SECRET_KEY"
+fi
 
 if [[ -z "$GOSSIP_SECRET_KEY" ]]; then
 	if ! command -v openssl >/dev/null 2>&1; then
@@ -407,7 +436,6 @@ fi
 
 # In --no-tls mode we still need to ship the credential key. Emit a tiny
 # standalone bundle so the joiner has a uniform extraction path.
-CRED_BUNDLE_GENERATED="false"
 if [[ "$NO_TLS" == "true" ]]; then
 	if [[ -z "$CRED_BUNDLE_OUT" ]]; then
 		CRED_BUNDLE_OUT="$(pwd)/aerolvm-cred-bundle.tar.gz"
@@ -417,7 +445,6 @@ if [[ "$NO_TLS" == "true" ]]; then
 	tar -C "$CRED_STAGE_DIR" -czf "$CRED_BUNDLE_OUT" credential_encryption.key
 	chmod 0600 "$CRED_BUNDLE_OUT"
 	rm -rf "$CRED_STAGE_DIR"
-	CRED_BUNDLE_GENERATED="true"
 fi
 
 # Derive internal advertise URL when operator didn't override.
@@ -446,6 +473,11 @@ SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
 SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
 SB_CLUSTER_MAX_AUTO_VOTERS=$MAX_AUTO_VOTERS
 EOF
+	if [[ -n "$API_BIND_HOST" ]]; then
+		# Overrides the SB_API_HOST=127.0.0.1 written by install.sh so peers
+		# can reach this node's operator API at $API_ADVERTISE_URL.
+		echo "SB_API_HOST=$API_BIND_HOST"
+	fi
 	if [[ -n "$NODE_ROLE" ]]; then
 		echo "SB_NODE_ROLE=$NODE_ROLE"
 	fi
@@ -494,11 +526,13 @@ restart_sandboxd_with_diagnostics() {
 		pat="$(read_sandboxd_env_value SB_PAT_TOKEN)"
 		if [[ -n "$pat" ]]; then
 			echo "[cluster-init] local /v1/cluster/members"
-			curl -sS --max-time 5 -H "Authorization: Bearer ${pat}" \
+			curl -sS --max-time 5 \
+				--config <(printf 'header = "Authorization: Bearer %s"\n' "$pat") \
 				"http://127.0.0.1:${SB_API_PORT_DEFAULT}/v1/cluster/members" || true
 			echo
 			echo "[cluster-init] local /v1/cluster/leader"
-			curl -sS --max-time 5 -H "Authorization: Bearer ${pat}" \
+			curl -sS --max-time 5 \
+				--config <(printf 'header = "Authorization: Bearer %s"\n' "$pat") \
 				"http://127.0.0.1:${SB_API_PORT_DEFAULT}/v1/cluster/leader" || true
 			echo
 		fi
@@ -520,10 +554,14 @@ Cluster bootstrapped on this node.
   Gossip advertise:  $GOSSIP_ADVERTISE_ADDR
 
 =========================================================================
-GOSSIP SECRET KEY (save this — every joining node needs the same value):
+GOSSIP SECRET KEY: stored in /etc/sandboxd/cluster.env as
+SB_GOSSIP_SECRET_KEY. It is deliberately NOT printed here (argv, shell
+history, and logs leak). Read it with:
 
-  $GOSSIP_SECRET_KEY
+  sudo grep '^SB_GOSSIP_SECRET_KEY=' /etc/sandboxd/cluster.env
 
+and copy it to each joining node over a SECURE channel into a root-only
+file (never onto a command line).
 EOF
 
 if [[ "$GENERATED_KEY" == "true" ]]; then
@@ -547,8 +585,11 @@ sealed registry/mount credentials.
 To add another node, on that host:
 
   scp this-host:$TLS_BUNDLE_OUT /tmp/aerolvm-tls-bundle.tar.gz   # secure transfer
+  # Put the gossip key (see /etc/sandboxd/cluster.env on THIS node) into
+  # /tmp/gossip-key on the joiner over a secure channel — never onto a
+  # command line (argv and shell history leak).
   sudo ./cluster-join.sh \\
-      --gossip-key '$GOSSIP_SECRET_KEY' \\
+      --gossip-key-file /tmp/gossip-key \\
       --peers $GOSSIP_ADVERTISE_ADDR \\
       --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
 EOF
@@ -568,8 +609,11 @@ credentials.
 To add another node (NO TLS — keep all traffic on a private network), run:
 
   scp this-host:$CRED_BUNDLE_OUT /tmp/aerolvm-cred-bundle.tar.gz   # secure transfer
+  # Put the gossip key (see /etc/sandboxd/cluster.env on THIS node) into
+  # /tmp/gossip-key on the joiner over a secure channel — never onto a
+  # command line (argv and shell history leak).
   sudo ./cluster-join.sh \\
-      --gossip-key '$GOSSIP_SECRET_KEY' \\
+      --gossip-key-file /tmp/gossip-key \\
       --peers $GOSSIP_ADVERTISE_ADDR \\
       --cred-bundle /tmp/aerolvm-cred-bundle.tar.gz \\
       --no-tls

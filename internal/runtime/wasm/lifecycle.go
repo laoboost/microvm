@@ -96,22 +96,25 @@ func (d *Driver) resolveRef(ctx context.Context, ref string, authOverride *wasmm
 }
 
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
-	inst, err := d.instance(sandboxID)
+	inst, snap, err := d.snapshotInstance(sandboxID)
 	if err != nil {
 		return nil, err
 	}
-	if inst.status == models.SandboxStatusStarted {
-		return d.runtimeState(inst), nil
+	if snap.status == models.SandboxStatusStarted {
+		d.mu.Lock()
+		state := d.runtimeState(inst)
+		d.mu.Unlock()
+		return state, nil
 	}
 
-	workerKey := inst.workerKey
+	workerKey := snap.workerKey
 	if workerKey == "" {
 		workerKey = sandboxID
 	}
-	if err := d.supervisor.Ensure(ctx, workerKey, inst.socketPath); err != nil {
+	if err := d.supervisor.Ensure(ctx, workerKey, snap.socketPath); err != nil {
 		return nil, fmt.Errorf("start worker: %w", err)
 	}
-	client := d.newWorkerClient(inst.socketPath)
+	client := d.newWorkerClient(snap.socketPath)
 	if err := d.waitWorker(ctx, client, sandboxID); err != nil {
 		return nil, err
 	}
@@ -128,11 +131,12 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		return nil, fmt.Errorf("instantiate module: %w", err)
 	}
-	inst.status = models.SandboxStatusStarted
 	d.mu.Lock()
+	inst.status = models.SandboxStatusStarted
 	d.byID[sandboxID] = inst
+	state := d.runtimeState(inst)
 	d.mu.Unlock()
-	return d.runtimeState(inst), nil
+	return state, nil
 }
 
 // StartSandbox reconstructs a stopped sandbox from its persisted row and mounts.
@@ -140,8 +144,8 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 	if sandbox == nil {
 		return nil, fmt.Errorf("start sandbox: nil sandbox")
 	}
-	if inst, err := d.instance(sandbox.ID); err == nil {
-		return d.Start(ctx, inst.sandboxID)
+	if _, _, err := d.snapshotInstance(sandbox.ID); err == nil {
+		return d.Start(ctx, sandbox.ID)
 	}
 
 	ref := strings.TrimSpace(sandbox.ModuleRef)
@@ -194,16 +198,16 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 }
 
 func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
-	inst, err := d.instance(sandboxID)
+	inst, snap, err := d.snapshotInstance(sandboxID)
 	if err != nil {
 		return err
 	}
-	client := d.newWorkerClient(inst.socketPath)
+	client := d.newWorkerClient(snap.socketPath)
 	if err := client.StopInstance(sandboxID); err != nil {
 		return fmt.Errorf("stop instance: %w", err)
 	}
-	inst.status = models.SandboxStatusStopped
 	d.mu.Lock()
+	inst.status = models.SandboxStatusStopped
 	d.byID[sandboxID] = inst
 	d.mu.Unlock()
 	return nil
@@ -249,11 +253,18 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 }
 
 func (d *Driver) Resize(ctx context.Context, sandboxID string, req models.ResizeSandboxRequest) error {
-	inst, err := d.instance(sandboxID)
-	if err != nil {
-		return err
+	// The read-modify-write on the live record must happen under d.mu: Stop /
+	// Start / migrateResidentToCold write status/socketPath under the same lock,
+	// so reading inst.status or writing inst.cpu/memoryMB after releasing it
+	// raced a concurrent lifecycle call (F2c).
+	d.mu.Lock()
+	inst := d.byID[sandboxID]
+	if inst == nil {
+		d.mu.Unlock()
+		return fmt.Errorf("wasm sandbox %q not found", sandboxID)
 	}
 	if req.DiskGB > 0 && req.DiskGB != inst.diskGB {
+		d.mu.Unlock()
 		return fmt.Errorf("wasm runtime: disk resize not supported on a live instance")
 	}
 	if req.CPU > 0 {
@@ -262,28 +273,21 @@ func (d *Driver) Resize(ctx context.Context, sandboxID string, req models.Resize
 	if req.MemoryMB > 0 {
 		inst.memoryMB = req.MemoryMB
 	}
-	if inst.status == models.SandboxStatusStarted && req.MemoryMB > 0 {
-		client := d.newWorkerClient(inst.socketPath)
-		caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{}, inst.memoryMB, d.cfg.DefaultWallTimeout)
+	memoryMB := inst.memoryMB
+	started := inst.status == models.SandboxStatusStarted
+	socketPath := inst.socketPath
+	d.mu.Unlock()
+
+	// Re-cap the live worker OUTSIDE the lock: SetCapability is a network call.
+	if started && req.MemoryMB > 0 {
+		client := d.newWorkerClient(socketPath)
+		caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{}, memoryMB, d.cfg.DefaultWallTimeout)
 		if err := client.SetCapability(sandboxID, caps); err != nil {
 			return fmt.Errorf("resize worker caps: %w", err)
 		}
 	}
 	_ = ctx
-	d.mu.Lock()
-	d.byID[sandboxID] = inst
-	d.mu.Unlock()
 	return nil
-}
-
-func (d *Driver) instance(sandboxID string) (*sandboxInstance, error) {
-	d.mu.Lock()
-	inst := d.byID[sandboxID]
-	d.mu.Unlock()
-	if inst == nil {
-		return nil, fmt.Errorf("wasm sandbox %q not found", sandboxID)
-	}
-	return inst, nil
 }
 
 func ctxDeadline(ctx context.Context) time.Time {

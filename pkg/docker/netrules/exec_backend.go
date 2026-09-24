@@ -31,6 +31,10 @@ func (e *execBackend) Insert(table, chain string, pos int, spec ...string) error
 	return e.ipt.Insert(table, chain, pos, spec...)
 }
 
+func (e *execBackend) Append(table, chain string, spec ...string) error {
+	return e.ipt.Append(table, chain, spec...)
+}
+
 func (e *execBackend) Delete(table, chain string, spec ...string) error {
 	return e.ipt.Delete(table, chain, spec...)
 }

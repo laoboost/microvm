@@ -218,6 +218,7 @@ func TestSessionsRecordingOpenError(t *testing.T) {
 }
 
 func TestSessionsDisabled(t *testing.T) {
+	requireHostExec(t)
 	h := New(Config{
 		SandboxID: "sb",
 		WorkDir:   t.TempDir(),
@@ -334,6 +335,7 @@ func TestDrainSessionFrames(t *testing.T) {
 }
 
 func TestSessionsEdgeCases(t *testing.T) {
+	requireHostExec(t)
 	h, mgr := newHostWithRealSessions(t)
 
 	// 1. Session ID empty -> 400
@@ -363,25 +365,10 @@ func TestSessionsEdgeCases(t *testing.T) {
 	}
 	defer func() { _ = mgr.Delete(sess.ID()) }()
 
-	// 3. Signal REST API success
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/signal", strings.NewReader(`{"signal":"INT"}`))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("signal success got %d", rec.Code)
-	}
-
-	// Signal REST API error (invalid signal)
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/signal", strings.NewReader(`{"signal":"SIGINVALID"}`))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("signal error got %d", rec.Code)
-	}
-
-	// 4. Resize REST API success
+	// 3. Resize REST API success. Do this BEFORE any signal: SIGINT below kills
+	// the `sleep 10`, and resize needs a live session — asserting resize after
+	// the signal raced the process exit (exposed once this test stopped being
+	// skipped by the host-exec gate).
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/resize", strings.NewReader(`{"cols":120,"rows":40}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -397,6 +384,24 @@ func TestSessionsEdgeCases(t *testing.T) {
 	h.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("resize error got %d", rec.Code)
+	}
+
+	// 4. Signal REST API success
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/signal", strings.NewReader(`{"signal":"INT"}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("signal success got %d", rec.Code)
+	}
+
+	// Signal REST API error (invalid signal)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/signal", strings.NewReader(`{"signal":"SIGINVALID"}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("signal error got %d", rec.Code)
 	}
 
 	// 5. Session recording empty when recorder fails to initialize (blocked by file)

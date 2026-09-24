@@ -89,6 +89,31 @@ func encodePlacementRecoveryRecord(record placementRecoveryStoreRecord) (string,
 
 type placementRecoveryFileStore struct {
 	dir string
+	// now is the clock for GC-start gating and manifest timestamps; nil
+	// means time.Now. Tests override it to hold GC mid-run.
+	now func() time.Time
+	// mu serializes Put against RetainSnapshotRefs: without it the GC scan
+	// can delete a blob a concurrent Put just wrote (its ref is in no
+	// retain set yet).
+	mu sync.Mutex
+}
+
+// syncDir fsyncs a directory so a completed rename survives power failure.
+// Var seam so tests can observe the post-rename syncs.
+var syncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+func (s *placementRecoveryFileStore) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 func newPlacementRecoveryFileStore(dir string) (*placementRecoveryFileStore, error) {
@@ -105,6 +130,8 @@ func (s *placementRecoveryFileStore) Put(sandboxID string, rec placementRecovery
 	if strings.TrimSpace(sandboxID) == "" {
 		return "", errors.New("placement recovery store: empty sandbox id")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	record := placementRecoveryStoreRecord{
 		SandboxID: sandboxID,
 		Recovery:  clonePlacementRecovery(rec),
@@ -139,6 +166,12 @@ func (s *placementRecoveryFileStore) Put(sandboxID string, rec placementRecovery
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return "", fmt.Errorf("placement recovery store: rename: %w", err)
+	}
+	// fsync the directory too: the rename lives only in the directory entry
+	// until the dir is synced, so without this a power failure can lose a
+	// blob whose temp-write fsynced fine.
+	if err := syncDir(s.dir); err != nil {
+		return "", fmt.Errorf("placement recovery store: sync dir: %w", err)
 	}
 	return ref, nil
 }
@@ -196,6 +229,11 @@ func (s *placementRecoveryFileStore) pathForRef(ref string) (string, error) {
 }
 
 func (s *placementRecoveryFileStore) RetainSnapshotRefs(refs []string) error {
+	// Serialize against Put: without this the scan below can delete a blob a
+	// concurrent Put just wrote — its ref is in no retain set yet.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gcStart := s.clock()
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return fmt.Errorf("placement recovery store: mkdir: %w", err)
 	}
@@ -204,7 +242,7 @@ func (s *placementRecoveryFileStore) RetainSnapshotRefs(refs []string) error {
 		return err
 	}
 	manifest.Snapshots = append(manifest.Snapshots, placementRecoverySnapshotRefs{
-		CreatedUnix: time.Now().Unix(),
+		CreatedUnix: gcStart.Unix(),
 		Refs:        normalizeRecoveryRefs(refs),
 	})
 	if len(manifest.Snapshots) > placementRecoverySnapshotRefSets {
@@ -229,6 +267,12 @@ func (s *placementRecoveryFileStore) RetainSnapshotRefs(refs []string) error {
 		}
 		ref := placementRecoveryRefPrefix + strings.TrimSuffix(entry.Name(), ".json")
 		if _, ok := keep[ref]; ok {
+			continue
+		}
+		// Belt-and-braces with the mutex: a blob whose mtime is after
+		// GC-start cannot belong to any retain set computed here, so it is
+		// a write this pass must not judge — leave it for the next GC.
+		if info, ierr := entry.Info(); ierr == nil && info.ModTime().After(gcStart) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(s.dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -281,6 +325,11 @@ func (s *placementRecoveryFileStore) writeGCManifest(manifest placementRecoveryG
 	}
 	if err := os.Rename(tmpName, s.gcManifestPath()); err != nil {
 		return fmt.Errorf("placement recovery store: rename gc manifest: %w", err)
+	}
+	// fsync the directory so the manifest rename survives power failure,
+	// same as Put's blob rename.
+	if err := syncDir(s.dir); err != nil {
+		return fmt.Errorf("placement recovery store: sync dir: %w", err)
 	}
 	return nil
 }

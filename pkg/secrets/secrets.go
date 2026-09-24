@@ -97,7 +97,18 @@ func loadOrGenerateKey(keyB64, fallbackPath string) ([]byte, error) {
 		return nil, errors.New("no encryption key configured and no fallback path provided")
 	}
 
-	if data, err := os.ReadFile(fallbackPath); err == nil {
+	if info, err := os.Stat(fallbackPath); err == nil {
+		// Same strictness as wrap_key_loader.go: any group/world bit or a
+		// mode looser than 0600/0400 is refused before the key bytes are
+		// trusted (owner-write is allowed here because this function
+		// itself generates the file at 0600).
+		if mode := info.Mode().Perm(); mode != 0o600 && mode != 0o400 {
+			return nil, fmt.Errorf("encryption key file %s has insecure mode %#o; want 0600 or 0400", fallbackPath, mode)
+		}
+		data, readErr := os.ReadFile(fallbackPath)
+		if readErr != nil {
+			return nil, fmt.Errorf("read encryption key %s: %w", fallbackPath, readErr)
+		}
 		decoded, decErr := base64.StdEncoding.DecodeString(string(data))
 		if decErr != nil || len(decoded) != 32 {
 			return nil, fmt.Errorf("invalid encryption key at %s", fallbackPath)

@@ -432,6 +432,14 @@ resource "terraform_data" "validate_cluster_ops" {
       condition     = contains(["docker", "containerd"], local.container_engine)
       error_message = "container_engine in config/cluster.yml must be \"docker\" or \"containerd\" (plans/containerd-engine.md)."
     }
+
+    # admin_allowed_cidrs defaults to [] (fail closed). A non-empty list is
+    # enforced by the variable's own validation; the internet-open escape
+    # hatch additionally requires the explicit allow_public_admin opt-in.
+    precondition {
+      condition     = !contains(var.admin_allowed_cidrs, "0.0.0.0/0") || var.allow_public_admin
+      error_message = "admin_allowed_cidrs contains 0.0.0.0/0 (SSH + operator API + Grafana open to the whole internet). Set allow_public_admin = true only if that is intentional, or scope the list to your operator CIDRs."
+    }
   }
 }
 

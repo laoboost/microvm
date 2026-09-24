@@ -98,6 +98,32 @@ type VsockHandler interface {
 // slow host but is otherwise harmless because the host retries.
 const vsockReadDeadline = 5 * time.Second
 
+// maxVsockLineBytes caps one newline-delimited vsock message. The stream is
+// peer-controlled: unbounded ReadBytes-style buffering is an OOM vector.
+const maxVsockLineBytes = 1 << 20
+
+// readVsockLine reads one newline-terminated message with a hard size cap.
+// ReadSlice only ever hands out chunks of its fixed buffer (ErrBufferFull
+// continuation), so a newline-free stream is rejected at the cap instead of
+// being buffered in full.
+func readVsockLine(reader *bufio.Reader) ([]byte, error) {
+	var raw []byte
+	for {
+		chunk, err := reader.ReadSlice('\n')
+		if len(raw)+len(chunk) > maxVsockLineBytes {
+			return nil, fmt.Errorf("vsock message exceeds %d bytes", maxVsockLineBytes)
+		}
+		raw = append(raw, chunk...)
+		if err == nil {
+			return raw, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return nil, err
+	}
+}
+
 // handleVsockConn drives one accepted connection through its message
 // loop. Exported only via the linux serveVsock wrapper; broken out so
 // vsock_test.go can drive it with an io.Pipe and skip the socket
@@ -117,7 +143,7 @@ func handleVsockConn(ctx context.Context, rw io.ReadWriter, handler VsockHandler
 	encoder := json.NewEncoder(rw)
 
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, err := readVsockLine(reader)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				logger.Debug("vsock read", "error", err)

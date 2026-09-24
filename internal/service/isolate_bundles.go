@@ -147,7 +147,10 @@ func (s *Service) GetJSBundle(ctx context.Context, digest string) (*models.JSBun
 	if s.isolateBundles == nil {
 		return nil, fmt.Errorf("js-bundles require the isolate runtime (SB_ENABLE_ISOLATE=true): %w", models.ErrRuntimeNotImplemented)
 	}
-	digest = normalizeBundleDigest(digest)
+	digest, err := normalizeBundleDigest(digest)
+	if err != nil {
+		return nil, err
+	}
 	owner := ownerRefForCreate(ctx)
 	if _, scoped := ownerScope(ctx); scoped && !s.isolateBundles.TenantOwns(owner, digest) {
 		return nil, store.ErrNotFound
@@ -176,9 +179,9 @@ func (s *Service) DeleteJSBundle(ctx context.Context, digest string) error {
 	if s.isolateBundles == nil {
 		return fmt.Errorf("js-bundles require the isolate runtime (SB_ENABLE_ISOLATE=true): %w", models.ErrRuntimeNotImplemented)
 	}
-	digest = normalizeBundleDigest(digest)
+	id := stripBundleDigestPrefix(digest)
 	owner := ownerRefForCreate(ctx)
-	if _, scoped := ownerScope(ctx); scoped && !s.isolateBundles.TenantOwns(owner, digest) {
+	if _, scoped := ownerScope(ctx); scoped && !s.isolateBundles.TenantOwns(owner, id) {
 		return store.ErrNotFound
 	}
 	sandboxes, err := s.store.ListByRuntime(ctx, models.RuntimeIsolate)
@@ -186,9 +189,15 @@ func (s *Service) DeleteJSBundle(ctx context.Context, digest string) error {
 		return fmt.Errorf("check bundle references: %w", err)
 	}
 	for _, sb := range sandboxes {
-		if sb.ModuleDigest == digest {
-			return fmt.Errorf("bundle %s is in use by sandbox %s: %w", digest, sb.ID, store.ErrJSBundleInUse)
+		if sb.ModuleDigest == id {
+			return fmt.Errorf("bundle %s is in use by sandbox %s: %w", id, sb.ID, store.ErrJSBundleInUse)
 		}
+	}
+	// The reference scan above is pure string compares (path-safe); the delete
+	// below joins the digest into blobPath, so format validation gates it.
+	digest, err = normalizeBundleDigest(digest)
+	if err != nil {
+		return err
 	}
 	// Owner-scoped, ref-counted delete: removes only this owner's ownership and
 	// drops the shared blob only when no tenant still owns it. Maps the store's
@@ -214,11 +223,40 @@ func jsBundleView(digest, name string, b *jsbundle.Bundle) *models.JSBundle {
 }
 
 // normalizeBundleDigest strips an optional "sha256:" prefix so callers may
-// pass either form as the {id} path segment.
-func normalizeBundleDigest(id string) string {
+// pass either form as the {id} path segment, and enforces that the remainder
+// is a bare 64-hex digest (mirroring jsbundle.asDigest). Validation is
+// load-bearing: the digest is joined into a filesystem path (jsbundle
+// blobPath), so traversal payloads like `../../etc/x` must be rejected before
+// any store call that forms that path — for unscoped callers too. Rejections
+// map to store.ErrNotFound (a bad id must not be probeable).
+func normalizeBundleDigest(id string) (string, error) {
+	id = stripBundleDigestPrefix(id)
+	if !isHex64Digest(id) {
+		return "", fmt.Errorf("bundle id is not a valid digest: %w", store.ErrNotFound)
+	}
+	return id, nil
+}
+
+// stripBundleDigestPrefix removes an optional "sha256:" prefix without
+// validating the remainder — for path-safe uses (string compares) that must
+// see the bare id before validation gates the blob-path calls.
+func stripBundleDigestPrefix(id string) string {
 	id = strings.TrimSpace(id)
 	if rest, ok := strings.CutPrefix(id, "sha256:"); ok {
 		return rest
 	}
 	return id
+}
+
+// isHex64Digest reports whether s is exactly 64 lowercase hex characters.
+func isHex64Digest(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }

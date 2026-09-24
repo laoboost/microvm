@@ -249,7 +249,7 @@ func TestFSMValidateReservationBatchLockedErrors(t *testing.T) {
 	now := time.Now().Unix()
 
 	fsm.mu.Lock()
-	err := fsm.validateReservationBatchLocked([]reservationCommand{{SandboxID: "", OwnerNodeID: "n"}}, now)
+	err := fsm.validateReservationBatchLocked([]reservationCommand{{SandboxID: "", OwnerNodeID: "n"}})
 	fsm.mu.Unlock()
 	if err == nil || !strings.Contains(err.Error(), "sandbox_id") {
 		t.Fatalf("empty sandbox_id = %v", err)
@@ -259,7 +259,7 @@ func TestFSMValidateReservationBatchLockedErrors(t *testing.T) {
 	err = fsm.validateReservationBatchLocked([]reservationCommand{
 		{SandboxID: "dup", OwnerNodeID: "n1"},
 		{SandboxID: "dup", OwnerNodeID: "n1"},
-	}, now)
+	})
 	fsm.mu.Unlock()
 	if err == nil || !errors.Is(err, ErrReservationConflict) {
 		t.Fatalf("duplicate sandbox in batch = %v", err)
@@ -272,7 +272,7 @@ func TestFSMValidateReservationBatchLockedErrors(t *testing.T) {
 	fsm.mu.Lock()
 	err = fsm.validateReservationBatchLocked([]reservationCommand{
 		{SandboxID: "placed", OwnerNodeID: "owner-b", ExpiresUnix: now + 60},
-	}, now)
+	})
 	fsm.mu.Unlock()
 	if err == nil || !errors.Is(err, ErrReservationConflict) {
 		t.Fatalf("reserve over active placement = %v", err)
@@ -623,7 +623,7 @@ func TestFSMClaimPendingReservationReindexesOnOwnerChange(t *testing.T) {
 	})
 	got := applyOp(t, fsm, command{
 		Op: opReserve, SandboxID: "sb-swap", OwnerNodeID: "owner-b",
-		Spec: &models.CreateSandboxRequest{CPU: 2}, ExpiresUnix: future,
+		Spec: &models.CreateSandboxRequest{CPU: 2}, ExpiresUnix: future, AllowExpiredOverwrite: true,
 	})
 	if got != nil {
 		t.Fatalf("re-reserve after expiry = %v", got)
@@ -985,12 +985,21 @@ func TestGossipMembersFallsBackToScan(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 5*time.Second)
 
-	c.gossip.memberIndex = nil
-	members := c.gossip.members()
+	// Exercise the nil-index fallback through a standalone gossipNode instead of
+	// nilling the live c.gossip.memberIndex: the gossip refresh loop and the
+	// capacity-lease loop both read that field concurrently, so assigning it
+	// after construction is a data race (production sets it once in setupGossip
+	// and never reassigns). The wrapper shares the running memberlist, so
+	// scanMembers still walks the real cluster.
+	scanOnly := &gossipNode{ml: c.gossip.ml, delegate: c.gossip.delegate}
+	members := scanOnly.members()
 	if len(members) == 0 {
 		t.Fatal("members() with nil index expected scan fallback")
 	}
-	c.gossip.refreshMemberIndex() // nil index early return
+	scanOnly.refreshMemberIndex() // nil index early return
+	if scanOnly.memberIndex != nil {
+		t.Fatal("refreshMemberIndex must leave a nil index nil")
+	}
 }
 
 func TestAgentAssertOwnershipClaimOrphanReplaysPortsAfterSuccess(t *testing.T) {

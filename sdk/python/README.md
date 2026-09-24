@@ -128,3 +128,14 @@ handle = sandbox.attach_session(
 handle.write("echo attached\n")
 print(handle.wait())
 ```
+
+## Migration notes (0.6.0)
+
+Security release. Behaviour changes to review when upgrading:
+
+- `upload_file` raises `ValueError` when the target path or filename contains
+  CR, LF, or a quote (MIME multipart injection).
+- Cross-origin redirects are stripped of `Authorization` and `X-Registry-*`,
+  and a 307/308 that would replay a request body cross-origin is refused.
+- A single WebSocket message larger than 32 MiB fails the stream instead of
+  being delivered to `onStdout`/`onStderr`.

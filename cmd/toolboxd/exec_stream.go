@@ -30,7 +30,9 @@ var execStreamUpgrader = websocket.Upgrader{
 	// Auth happens in the HTTP handler before upgrade. Once upgraded the
 	// connection is private to the authenticated caller, so we don't need
 	// origin checks (also avoids breaking SDK / CLI clients that don't set
-	// Origin).
+	// Origin). Invariant: authentication is HEADER-ONLY (bearer) — this
+	// endpoint must never accept cookie auth, otherwise an ambient-credential
+	// browser CSRF could open these sockets cross-origin.
 	CheckOrigin:     func(r *http.Request) bool { return true },
 	ReadBufferSize:  64 * 1024,
 	WriteBufferSize: 64 * 1024,
@@ -147,7 +149,7 @@ func (s *server) runWithPTY(conn *websocket.Conn, cmd *exec.Cmd, start *execStre
 	}()
 
 	// Main: PTY → client.
-	if err := pumpReader(conn, ptmx, streamFramePrefixStdout); err != nil && !errors.Is(err, io.EOF) {
+	if err := pumpReader(conn, ptmx, streamFramePrefixStdout); err != nil {
 		s.logger.Debug("pty read ended", "error", err)
 	}
 
@@ -260,7 +262,8 @@ func sendSignalToCmd(cmd *exec.Cmd, name string) {
 }
 
 // pumpReader copies from r into the websocket as binary frames, prefixed
-// with `prefix`. Locks shared with stderr writes via the mutex variant.
+// with `prefix`. A clean reader EOF is success (nil), not an error — before,
+// the function had no nil-return path at all and leaked io.EOF to callers.
 func pumpReader(conn *websocket.Conn, r io.Reader, prefix byte) error {
 	buf := make([]byte, 32*1024)
 	out := make([]byte, 1+len(buf))
@@ -274,6 +277,9 @@ func pumpReader(conn *websocket.Conn, r io.Reader, prefix byte) error {
 			}
 		}
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
 			return err
 		}
 	}
@@ -295,6 +301,9 @@ func pumpReaderLocked(conn *websocket.Conn, r io.Reader, prefix byte, mu *sync.M
 			}
 		}
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
 			return err
 		}
 	}

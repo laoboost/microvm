@@ -43,9 +43,19 @@ func newHostWithSessions(t *testing.T) (*toolhost.Host, *sessions.Manager) {
 	return h, mgr
 }
 
+// requireHostExec enables live host-exec behavior for a test. The gate is off by
+// default in production (fail-closed, no jail), but the enabled code path must
+// still be exercised, so this flips toolhost's injectable default for the test
+// rather than skipping it.
+func requireHostExec(t *testing.T) {
+	t.Helper()
+	toolhost.EnableHostExecForTest(t)
+}
+
 // ─── Sessions create / list / get / delete with real manager ─────────────────
 
 func TestSessionsCreateAndList(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	// create a session
@@ -241,6 +251,7 @@ func TestSessionsRecordingNotFound(t *testing.T) {
 }
 
 func TestSessionsCreateBadJSON(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithSessions(t)
 
 	rec := httptest.NewRecorder()

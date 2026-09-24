@@ -140,6 +140,14 @@ func TestRun_GracefulShutdown(t *testing.T) {
 	t.Setenv("SB_ENABLE_WASM", "false")
 	t.Setenv("SB_ENABLE_CADDY", "false")
 	t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	// This test exercises the daemon lifecycle, not egress enforcement. With
+	// rules on (the default) the Docker boot path installs the link-local (IMDS)
+	// DROP and fails closed on netrules' IPv6 precondition; the suite
+	// neutralises the sandbox-IPv6-disable seam (see TestMain), so on a host with
+	// IPv6 live on docker0 that refusal would abort boot before the graceful
+	// shutdown under test. The rules-enabled boot path is covered by
+	// TestCoverage95RunExtendedWiringBranches.
+	t.Setenv("SB_ENABLE_NETWORK_RULES", "false")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

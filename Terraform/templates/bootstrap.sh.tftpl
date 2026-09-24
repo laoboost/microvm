@@ -39,10 +39,46 @@
 #                          /etc/sandboxd/sandboxd.env and the systemd unit).
 #   2. cluster-init OR cluster-join — flips the daemon into cluster mode.
 ###############################################################################
-set -euxo pipefail
+# NEVER enable xtrace (set -x) in this script: it would copy every secret
+# (PAT, Cloudflare token, S3 keys, gossip key) into the bootstrap log.
+# umask 077 runs BEFORE the log redirect so the log is created 0600, and all
+# secret staging below inherits it.
+set -euo pipefail
+umask 077
+touch /var/log/aerolvm-bootstrap.log
+chmod 0600 /var/log/aerolvm-bootstrap.log
 exec > >(tee -a /var/log/aerolvm-bootstrap.log) 2>&1
 
-echo "[bootstrap] node=${node_name} role=${role} seed=${is_seed}"
+# Operator strings arrive base64-encoded (charset-safe at template render) and
+# are validated against strict patterns BEFORE any use. They used to be
+# single-quote interpolated straight into argv, so a crafted domain/role/node
+# name could break out of its quotes and run arbitrary shell.
+decode_val() { printf '%s' "$1" | base64 -d; }
+NODE_NAME="$(decode_val '${base64encode(node_name)}')"
+ROLE="$(decode_val '${base64encode(role)}')"
+DOMAIN="$(decode_val '${base64encode(domain)}')"
+ACME_EMAIL="$(decode_val '${base64encode(acme_email)}')"
+# Terraform's role validation strips spaces ("server, worker" is legal) —
+# normalize the same way before the strict check.
+ROLE="$${ROLE// /}"
+if ! [[ "$NODE_NAME" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+  echo "[bootstrap] refusing node_name with unexpected characters" >&2
+  exit 1
+fi
+if ! [[ "$ROLE" =~ ^(server|worker|ingress|mixed)(,(server|worker|ingress))*$ ]]; then
+  echo "[bootstrap] refusing role with unexpected characters" >&2
+  exit 1
+fi
+if [ -n "$DOMAIN" ] && ! [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]{1,253}$ ]]; then
+  echo "[bootstrap] refusing domain with unexpected characters" >&2
+  exit 1
+fi
+if [ -n "$ACME_EMAIL" ] && ! [[ "$ACME_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
+  echo "[bootstrap] refusing acme_email with unexpected characters" >&2
+  exit 1
+fi
+
+echo "[bootstrap] node=$NODE_NAME role=$ROLE seed=${is_seed}"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
@@ -113,12 +149,26 @@ fi
 curl_download '${install_script_url}' -o /tmp/install.sh
 chmod +x /tmp/install.sh
 
-INSTALL_ARGS=(--pat-token '${pat_token}' --node-name '${node_name}')
-if [ -n '${domain}' ]; then
+# Stage secrets as root-only files (base64-staged so no token is ever
+# interpolated into a shell word — quote-breakout safe) and hand them to
+# install.sh by PATH via the --*-file flags: nothing secret in argv (ps), and
+# nothing xtraced. install.sh keeps the old argv flags for manual installs.
+install -d -m 0700 /etc/sandboxd/secrets
+base64 -d > /etc/sandboxd/secrets/pat-token <<'AEROLVM_B64'
+${base64encode(pat_token)}
+AEROLVM_B64
+chmod 0600 /etc/sandboxd/secrets/pat-token
+
+INSTALL_ARGS=(--pat-token-file /etc/sandboxd/secrets/pat-token --node-name "$NODE_NAME")
+if [ -n "$DOMAIN" ]; then
+  base64 -d > /etc/sandboxd/secrets/dns-api-token <<'AEROLVM_B64'
+${base64encode(cloudflare_api_token)}
+AEROLVM_B64
+  chmod 0600 /etc/sandboxd/secrets/dns-api-token
   INSTALL_ARGS+=(
-    --domain '${domain}'
+    --domain "$DOMAIN"
     --dns-provider cloudflare
-    --dns-api-token '${cloudflare_api_token}'
+    --dns-api-token-file /etc/sandboxd/secrets/dns-api-token
   )
 else
   # No domain => local-mode install: no Caddy, no DNS-01 TLS, API bound on
@@ -130,8 +180,8 @@ fi
 # Register an ACME contact email so Let's Encrypt can notify on cert expiry,
 # revocation, and rate-limit triage. Empty string => omit the flag and Caddy
 # falls back to an anonymous account (no notifications).
-if [ -n '${acme_email}' ]; then
-  INSTALL_ARGS+=(--acme-email '${acme_email}')
+if [ -n "$ACME_EMAIL" ]; then
+  INSTALL_ARGS+=(--acme-email "$ACME_EMAIL")
 fi
 %{ if caddy_binary_url != "" ~}
 INSTALL_ARGS+=(--caddy-binary-url '${caddy_binary_url}')
@@ -162,15 +212,29 @@ INSTALL_ARGS+=(
   --caddy-storage-s3-bucket '${caddy_storage_s3_bucket}'
   --caddy-storage-s3-region '${caddy_storage_s3_region}'
   --caddy-storage-s3-prefix '${caddy_storage_s3_prefix}'
-  --caddy-storage-s3-encryption-key '${caddy_storage_s3_encryption_key}'
 )
+# Secret material is base64-staged into root-only files (quote-breakout safe)
+# and handed to install.sh by PATH via the --*-file flags: nothing secret in
+# argv (ps), and nothing xtraced.
+base64 -d > /etc/sandboxd/secrets/caddy-s3-encryption-key <<'AEROLVM_B64'
+${base64encode(caddy_storage_s3_encryption_key)}
+AEROLVM_B64
+chmod 0600 /etc/sandboxd/secrets/caddy-s3-encryption-key
+INSTALL_ARGS+=(--caddy-storage-s3-encryption-key-file /etc/sandboxd/secrets/caddy-s3-encryption-key)
 %{ if caddy_storage_s3_endpoint != "" ~}
 INSTALL_ARGS+=(--caddy-storage-s3-endpoint '${caddy_storage_s3_endpoint}')
 %{ endif ~}
 %{ if caddy_storage_s3_access_key != "" ~}
+base64 -d > /etc/sandboxd/secrets/caddy-s3-access-key <<'AEROLVM_B64'
+${base64encode(caddy_storage_s3_access_key)}
+AEROLVM_B64
+base64 -d > /etc/sandboxd/secrets/caddy-s3-secret-key <<'AEROLVM_B64'
+${base64encode(caddy_storage_s3_secret_key)}
+AEROLVM_B64
+chmod 0600 /etc/sandboxd/secrets/caddy-s3-access-key /etc/sandboxd/secrets/caddy-s3-secret-key
 INSTALL_ARGS+=(
-  --caddy-storage-s3-access-key '${caddy_storage_s3_access_key}'
-  --caddy-storage-s3-secret-key '${caddy_storage_s3_secret_key}'
+  --caddy-storage-s3-access-key-file /etc/sandboxd/secrets/caddy-s3-access-key
+  --caddy-storage-s3-secret-key-file /etc/sandboxd/secrets/caddy-s3-secret-key
 )
 %{ endif ~}
 %{ endif ~}
@@ -187,18 +251,19 @@ sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
 # --ingress-advertise-host is the public hostname SDK-returned URLs use.
 ###############################################################################
 GOSSIP_KEY="$(openssl rand -base64 32)"
+printf '%s' "$GOSSIP_KEY" > /etc/sandboxd/secrets/gossip-key
+chmod 0600 /etc/sandboxd/secrets/gossip-key
 
 curl_download '${cluster_init_script_url}' -o /tmp/cluster-init.sh
 chmod +x /tmp/cluster-init.sh
 sudo /tmp/cluster-init.sh \
-  --role '${role}' \
-  --ingress-advertise-host '${domain}' \
-  --gossip-key "$GOSSIP_KEY" \
+  --role "$ROLE" \
+  --ingress-advertise-host "$DOMAIN" \
+  --gossip-key-file /etc/sandboxd/secrets/gossip-key \
   --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz
 
 # Publish artifacts joiners need. Bucket is private + SSE-encrypted.
-printf '%s' "$GOSSIP_KEY" > /tmp/gossip-key.txt
-aws --region '${aws_region}' s3 cp /tmp/gossip-key.txt \
+aws --region '${aws_region}' s3 cp /etc/sandboxd/secrets/gossip-key \
     "s3://${bundle_bucket}/gossip-key.txt" \
     --sse AES256
 aws --region '${aws_region}' s3 cp /tmp/aerolvm-tls-bundle.tar.gz \
@@ -231,17 +296,17 @@ while :; do
 done
 
 aws --region '${aws_region}' s3 cp \
-    "s3://${bundle_bucket}/gossip-key.txt" /tmp/gossip-key.txt
+    "s3://${bundle_bucket}/gossip-key.txt" /etc/sandboxd/secrets/gossip-key
+chmod 0600 /etc/sandboxd/secrets/gossip-key
 aws --region '${aws_region}' s3 cp \
     "s3://${bundle_bucket}/aerolvm-tls-bundle.tar.gz" /tmp/aerolvm-tls-bundle.tar.gz
-GOSSIP_KEY="$(cat /tmp/gossip-key.txt)"
 
 curl_download '${cluster_join_script_url}' -o /tmp/cluster-join.sh
 chmod +x /tmp/cluster-join.sh
 sudo /tmp/cluster-join.sh \
-  --role '${role}' \
-  --ingress-advertise-host '${domain}' \
-  --gossip-key "$GOSSIP_KEY" \
+  --role "$ROLE" \
+  --ingress-advertise-host "$DOMAIN" \
+  --gossip-key-file /etc/sandboxd/secrets/gossip-key \
   --peers '${seed_private_ip}:7001' \
   --tls-bundle /tmp/aerolvm-tls-bundle.tar.gz
 %{ endif ~}
@@ -265,20 +330,20 @@ sudo ss -ltnup 2>/dev/null | grep -E ':(7000|7001|7002|21212)\b' || echo "(nothi
 echo "[bootstrap] local /health"
 curl -sS --max-time 5 http://127.0.0.1:21212/health || true
 echo
-set +x
 BOOTSTRAP_PAT="$(sudo awk -F= '$1 == "SB_PAT_TOKEN" { print substr($0, length($1) + 2) }' /etc/sandboxd/sandboxd.env 2>/dev/null || true)"
 if [ -n "$${BOOTSTRAP_PAT}" ]; then
   echo "[bootstrap] local /v1/cluster/members"
-  curl -sS --max-time 5 -H "Authorization: Bearer $${BOOTSTRAP_PAT}" \
+  curl -sS --max-time 5 \
+    --config <(printf 'header = "Authorization: Bearer %s"\n' "$${BOOTSTRAP_PAT}") \
     http://127.0.0.1:21212/v1/cluster/members || true
   echo
   echo "[bootstrap] local /v1/cluster/leader"
-  curl -sS --max-time 5 -H "Authorization: Bearer $${BOOTSTRAP_PAT}" \
+  curl -sS --max-time 5 \
+    --config <(printf 'header = "Authorization: Bearer %s"\n' "$${BOOTSTRAP_PAT}") \
     http://127.0.0.1:21212/v1/cluster/leader || true
   echo
 fi
 unset BOOTSTRAP_PAT
-set -x
 
 %{ if with_firecracker ~}
 ###############################################################################
@@ -648,6 +713,11 @@ SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=${containerd_cfg.native_netns_pool_enabl
 EOF
 
 sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env >/dev/null
+
+# The staged file holds SB_FLEET_TOKEN and the platform-volume S3 keys; leaving
+# it on disk in /tmp leaks them to any local user (the bootstrap umask only
+# makes it 0600, and it is still readable if the box is later compromised).
+rm -f /tmp/aerolvm-ops.env
 
 # containerd engine needs the CNI bridge+host-local+loopback plugin binaries
 # under cni_plugin_dir, or the native netns pool's CNI ADD fails hard on every

@@ -32,12 +32,17 @@ INGRESS_ADVERTISE_HOST=""
 
 usage() {
 	cat <<'EOF'
-Usage: cluster-join.sh --gossip-key <base64> --peers <host:port,...> [options]
+Usage: cluster-join.sh --gossip-key-file <path> --peers <host:port,...> [options]
 
 Required:
-  --gossip-key <base64>         Same gossip secret key the seed node printed.
-                                Without an exact match, joining fails silently
-                                (the gossip handshake is rejected).
+  --gossip-key-file <path>      Root-only file holding the same gossip secret
+                                key the seed generated (preferred — argv and
+                                shell history leak). Without an exact match,
+                                joining fails silently (the gossip handshake
+                                is rejected).
+  --gossip-key <base64>         Same key on argv. WARNING: visible in `ps` and
+                                shell history — prefer --gossip-key-file or
+                                the SB_GOSSIP_SECRET_KEY environment variable.
   --peers <host:port,...>       Comma-separated list of gossip-advertise
                                 addresses for one or more existing cluster
                                 members. One reachable peer is enough.
@@ -110,7 +115,7 @@ Optional:
 
 Example:
   sudo ./cluster-join.sh \
-      --gossip-key 'A1bC2dE3...==' \
+      --gossip-key-file /root/gossip-key \
       --peers 10.0.0.5:7001
 EOF
 }
@@ -124,7 +129,10 @@ while [[ $# -gt 0 ]]; do
 		--raft-advertise)     RAFT_ADVERTISE_ADDR="$2"; shift 2 ;;
 		--gossip-bind)        GOSSIP_BIND_ADDR="$2"; shift 2 ;;
 		--gossip-advertise)   GOSSIP_ADVERTISE_ADDR="$2"; shift 2 ;;
-		--gossip-key)         GOSSIP_SECRET_KEY="$2"; shift 2 ;;
+		--gossip-key)
+			echo "Warning: --gossip-key on argv is visible in process listings and shell history; prefer --gossip-key-file or the environment variable documented in --help" >&2
+			GOSSIP_SECRET_KEY="$2"; shift 2 ;;
+		--gossip-key-file)    GOSSIP_SECRET_KEY="$(cat "$2")"; shift 2 ;;
 		--peers)              PEERS="$2"; shift 2 ;;
 		--tls-bundle)         TLS_BUNDLE="$2"; shift 2 ;;
 		--cred-bundle)        CRED_BUNDLE="$2"; shift 2 ;;
@@ -182,8 +190,12 @@ validate_node_role() {
 }
 validate_node_role "$NODE_ROLE"
 
+if [[ -z "$GOSSIP_SECRET_KEY" && -n "${SB_GOSSIP_SECRET_KEY:-}" ]]; then
+	GOSSIP_SECRET_KEY="$SB_GOSSIP_SECRET_KEY"
+fi
+
 if [[ -z "$GOSSIP_SECRET_KEY" || -z "$PEERS" ]]; then
-	echo "--gossip-key and --peers are required" >&2
+	echo "--gossip-key-file (or --gossip-key) and --peers are required" >&2
 	usage
 	exit 1
 fi
@@ -282,6 +294,24 @@ fi
 if [[ -z "$DATA_PLANE_ADVERTISE_HOST" ]]; then
 	DATA_PLANE_ADVERTISE_HOST="$PRIMARY_IP"
 fi
+
+# Cross-node forwards dial each peer's OPERATOR URL as advertised here
+# (SB_API_ADVERTISE_URL), but install.sh binds the API to 127.0.0.1. On a
+# multi-node cluster that mismatch refuses every cross-node fan-out read, and
+# in a --no-tls private-network deployment every write forward too (TLS
+# clusters cover writes via the internal mTLS channel, but not the reads).
+# Layer an explicit SB_API_HOST onto cluster.env so the listener binds the
+# advertised interface. Only when the advertised host is a literal IPv4 — a
+# hostname may resolve to an address this node must not bind.
+api_bind_host_from_url() {
+	local host="${1#*://}"
+	host="${host%%/*}"
+	host="${host%%:*}"
+	if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+		echo "$host"
+	fi
+}
+API_BIND_HOST="$(api_bind_host_from_url "$API_ADVERTISE_URL")"
 
 derive_advertise() {
 	local bind="$1"
@@ -424,6 +454,11 @@ SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
 SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
 SB_CLUSTER_MAX_AUTO_VOTERS=$MAX_AUTO_VOTERS
 EOF
+	if [[ -n "$API_BIND_HOST" ]]; then
+		# Overrides the SB_API_HOST=127.0.0.1 written by install.sh so peers
+		# can reach this node's operator API at $API_ADVERTISE_URL.
+		echo "SB_API_HOST=$API_BIND_HOST"
+	fi
 	if [[ -n "$NODE_ROLE" ]]; then
 		echo "SB_NODE_ROLE=$NODE_ROLE"
 	fi
@@ -470,11 +505,13 @@ restart_sandboxd_with_diagnostics() {
 		pat="$(read_sandboxd_env_value SB_PAT_TOKEN)"
 		if [[ -n "$pat" ]]; then
 			echo "[cluster-join] local /v1/cluster/members"
-			curl -sS --max-time 5 -H "Authorization: Bearer ${pat}" \
+			curl -sS --max-time 5 \
+				--config <(printf 'header = "Authorization: Bearer %s"\n' "$pat") \
 				"http://127.0.0.1:${SB_API_PORT_DEFAULT}/v1/cluster/members" || true
 			echo
 			echo "[cluster-join] local /v1/cluster/leader"
-			curl -sS --max-time 5 -H "Authorization: Bearer ${pat}" \
+			curl -sS --max-time 5 \
+				--config <(printf 'header = "Authorization: Bearer %s"\n' "$pat") \
 				"http://127.0.0.1:${SB_API_PORT_DEFAULT}/v1/cluster/leader" || true
 			echo
 		fi

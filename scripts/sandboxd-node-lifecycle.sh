@@ -105,7 +105,7 @@ if [[ -z "$node_id" ]]; then
 	exit 2
 fi
 if [[ -z "${SB_PAT_TOKEN:-}" ]]; then
-	echo "SB_PAT_TOKEN required in environment or env file" >&2
+	echo "missing API token: set the sandboxd API token in the environment or env file (see the script header)" >&2
 	exit 2
 fi
 if ! [[ "$timeout_s" =~ ^[0-9]+$ ]]; then
@@ -124,19 +124,26 @@ PY
 request() {
 	local method="$1"
 	local path="$2"
+	# The bearer token is handed to curl through a process-substitution config
+	# file, never argv — argv leaks it to `ps` for every local user (same
+	# reasoning as owned_count below).
 	curl -fsS -X "$method" \
-		-H "Authorization: Bearer ${SB_PAT_TOKEN}" \
+		--config <(printf 'header = "Authorization: Bearer %s"\n' "$SB_PAT_TOKEN") \
 		"${api_url}${path}" >/dev/null
 }
 
 owned_count() {
-	python3 - "$api_url" "$SB_PAT_TOKEN" "$node_id" <<'PY'
+	# SB_PAT_TOKEN travels via the environment, never argv — argv leaks the
+	# bearer token to `ps` for every local user.
+	SB_PAT_TOKEN="$SB_PAT_TOKEN" python3 - "$api_url" "$node_id" <<'PY'
 import json
+import os
 import sys
 import urllib.parse
 import urllib.request
 
-api_url, token, node_id = sys.argv[1:4]
+api_url, node_id = sys.argv[1:3]
+token = os.environ["SB_PAT_TOKEN"]
 count = 0
 page_token = ""
 

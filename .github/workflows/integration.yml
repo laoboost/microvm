@@ -72,10 +72,16 @@ jobs:
           jq --version
 
       - name: Materialize secrets (gitignored at rest)
+        env:
+          # Secrets go through env: rather than ${{ secrets.* }} inside run:
+          # script text — direct interpolation would be expanded into the
+          # generated shell script (and can be shell-injected on PR contexts).
+          AEROL_SECRETS_YML: ${{ secrets.AEROL_SECRETS_YML }}
+          AEROL_DOMAINS_YML: ${{ secrets.AEROL_DOMAINS_YML }}
         run: |
           mkdir -p config integration-tests/scenarios
-          printf '%s' "${{ secrets.AEROL_SECRETS_YML }}" > config/secrets.yml
-          printf '%s' "${{ secrets.AEROL_DOMAINS_YML }}" > integration-tests/scenarios/domains.yml
+          printf '%s' "$AEROL_SECRETS_YML" > config/secrets.yml
+          printf '%s' "$AEROL_DOMAINS_YML" > integration-tests/scenarios/domains.yml
 
       - name: Run scenario
         run: |

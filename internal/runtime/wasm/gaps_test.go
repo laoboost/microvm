@@ -24,7 +24,7 @@ type execWorkerClient struct {
 	execErr error
 }
 
-func (c *execWorkerClient) Exec(_ string, _ wasmengine.Capabilities, _ string) (wasmengine.RunResult, error) {
+func (c *execWorkerClient) Exec(_ context.Context, _ string, _ wasmengine.Capabilities, _ string) (wasmengine.RunResult, error) {
 	return c.run, c.execErr
 }
 
@@ -56,6 +56,11 @@ func (c *invokeWorkerClient) Invoke(_ string, export string) error {
 		c.invokeCh <- export
 	}
 	return nil
+}
+
+// The guest serve path invokes the entry as a background (long-lived) call.
+func (c *invokeWorkerClient) InvokeBackground(_, export string) error {
+	return c.Invoke("", export)
 }
 
 func (c *invokeWorkerClient) ResolvedListenPort(string) (int, error) {

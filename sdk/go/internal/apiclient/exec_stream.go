@@ -57,7 +57,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, options ExecStreamOp
 		return nil, errors.New("command is required")
 	}
 
-	wsURL, err := websocketURL(c.baseURL, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/process/exec/stream")
+	wsURL, err := websocketURL(c.baseURL, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/toolbox/process/exec/stream")
 	if err != nil {
 		return nil, err
 	}
@@ -71,6 +71,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, options ExecStreamOp
 	if err != nil {
 		return nil, decorateHandshakeError("exec stream", wsURL, resp, err)
 	}
+	conn.SetReadLimit(32 << 20)
 
 	handle := &ExecStreamHandle{
 		conn: conn,

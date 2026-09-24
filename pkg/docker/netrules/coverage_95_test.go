@@ -46,24 +46,24 @@ func TestEnsureBridgeForwardAcceptSkipsExistingRules(t *testing.T) {
 	}
 }
 
-type bridgeInsertFailBackend struct {
+type bridgeAppendFailBackend struct {
 	memBackend
 	fail bool
 }
 
-func (b *bridgeInsertFailBackend) Insert(table, chain string, pos int, spec ...string) error {
+func (b *bridgeAppendFailBackend) Append(table, chain string, spec ...string) error {
 	if b.fail {
-		return errors.New("bridge insert boom")
+		return errors.New("bridge append boom")
 	}
-	return b.memBackend.Insert(table, chain, pos, spec...)
+	return b.memBackend.Append(table, chain, spec...)
 }
 
-func TestEnsureBridgeForwardAcceptInsertError(t *testing.T) {
-	be := &bridgeInsertFailBackend{fail: true}
+func TestEnsureBridgeForwardAcceptAppendError(t *testing.T) {
+	be := &bridgeAppendFailBackend{fail: true}
 	mgr := &Manager{enabled: true, ipt: be, userChain: ChainAerolvmUser}
 	mgr.SetBridgeSubnet("10.88.0.0/16")
 	if err := mgr.ensureBridgeForwardAccept(); err == nil {
-		t.Fatal("expected insert error")
+		t.Fatal("expected append error")
 	}
 }
 

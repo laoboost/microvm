@@ -4,8 +4,8 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 
 /**
  * Per-request push directive for {@code MicroVMClient.buildImage(Image, BuildImageOptions)}.
- * Credentials are forwarded to the daemon as a one-shot {@code X-Registry-Auth}
- * header on the underlying push call and are never persisted server-side.
+ * Credentials are forwarded to the daemon in the {@code push} object of the
+ * {@code POST /v1/images/build} request body and are never persisted server-side.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class BuildImagePushOptions {
@@ -13,7 +13,7 @@ public class BuildImagePushOptions {
     public String registry;
     /** Destination tag. Defaults to {@code "latest"} on the daemon when null/empty. */
     public String tag;
-    /** Registry serveraddress (e.g. {@code "ghcr.io"}). Sent inside X-Registry-Auth. */
+    /** Registry serveraddress (e.g. {@code "ghcr.io"}). Sent inside the push body. */
     public String server;
     public String username;
     public String password;

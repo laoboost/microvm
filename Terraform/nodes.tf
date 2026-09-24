@@ -31,9 +31,13 @@ resource "aws_instance" "seed" {
   }
 
   metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+    # Hop limit 1 (not 2): with 2, containers/bridged sandboxes can reach the
+    # IMDS at 169.254.169.254 and read instance-role credentials + user-data
+    # (which carries every cluster secret). pkg/docker/netrules drops 169.254/16
+    # as defense in depth.
+    http_put_response_hop_limit = 1
   }
 
   # Spot is opt-in per node. The dynamic block emits ZERO blocks when spot is
@@ -222,9 +226,10 @@ resource "aws_instance" "joiner" {
   }
 
   metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+    # Hop limit 1 (not 2) — see the seed resource: keeps sandboxes off IMDS.
+    http_put_response_hop_limit = 1
   }
 
   # See the seed resource for the rationale: zero blocks when spot=false keeps

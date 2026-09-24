@@ -85,18 +85,25 @@ func (d *Driver) InvokeHTTP(ctx context.Context, sandboxID string, r *http.Reque
 	if err := d.ensureLoaded(ctx, sandboxID); err != nil {
 		return nil, err
 	}
+	// Copy groupKey under d.mu: markGroupMembersStopped / reloadSandbox rewrite
+	// it under the same lock, so reading it after unlock raced a concurrent
+	// group teardown (F2g).
 	d.mu.Lock()
 	rec := d.byID[sandboxID]
+	groupKey := ""
+	if rec != nil {
+		groupKey = rec.groupKey
+	}
 	d.mu.Unlock()
-	if rec == nil || rec.groupKey == "" {
+	if groupKey == "" {
 		return nil, fmt.Errorf("isolate: sandbox %q not loaded", sandboxID)
 	}
 	d.groupsMu.Lock()
-	g := d.groups[rec.groupKey]
+	g := d.groups[groupKey]
 	d.groupsMu.Unlock()
 	if g == nil {
-		return nil, fmt.Errorf("isolate: group %q gone", rec.groupKey)
+		return nil, fmt.Errorf("isolate: group %q gone", groupKey)
 	}
-	d.touchGroup(rec.groupKey)
+	d.touchGroup(groupKey)
 	return g.host.Invoke(ctx, sandboxID, r)
 }

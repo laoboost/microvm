@@ -71,8 +71,12 @@ type Session struct {
 	doneCh     chan struct{}
 }
 
-// Snapshot returns the metadata view of the session.
+// Snapshot returns the metadata view of the session. The exit fields are
+// read under the mutex because finish() publishes them under it — the exited
+// atomic alone does not order those writes.
 func (s *Session) Snapshot() models.Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	status := models.SessionStatusRunning
 	if s.exited.Load() {
 		switch {
@@ -128,11 +132,14 @@ func (s *Session) Done() <-chan struct{} { return s.doneCh }
 func (s *Session) RecordingPath() string { return s.recorder.Path() }
 
 // ExitInfo returns the exit code and signal name (empty if not signaled). If
-// the session is still running, returns -1, "".
+// the session is still running, returns -1, "". Exit fields are read under the
+// mutex (see Snapshot).
 func (s *Session) ExitInfo() (int, string) {
 	if !s.exited.Load() {
 		return -1, ""
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.exitCode, s.exitSignal
 }
 
@@ -289,17 +296,17 @@ func (s *Session) runPump(r io.Reader, stream Stream) {
 }
 
 // finish records the exit code/signal, closes subscribers, and finalizes
-// the recorder.
+// the recorder. Exit fields are written under the mutex so concurrent
+// Snapshot/ExitInfo readers can't race on them.
 func (s *Session) finish(code int, signal string, failed bool) {
 	if !s.exited.CompareAndSwap(false, true) {
 		return
 	}
+	s.mu.Lock()
 	s.exitCode = code
 	s.exitSignal = signal
 	s.failed = failed
 	s.exitedAt = time.Now().UTC()
-
-	s.mu.Lock()
 	for id, ch := range s.subscribers {
 		close(ch)
 		delete(s.subscribers, id)

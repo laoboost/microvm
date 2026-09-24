@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -29,8 +30,38 @@ type Client struct {
 }
 
 func New(cfg config.Config) *Client {
+	// rawAdmin keeps the full unix:// URL: TrimRight below would corrupt a
+	// bare "unix://" into "unix:" and skip the socket branch entirely.
+	rawAdmin := strings.TrimSpace(cfg.CaddyAdminURL)
+	baseURL := strings.TrimRight(rawAdmin, "/")
+	transport := http.RoundTripper(http.DefaultTransport)
+	// The admin endpoint is bound to a unix socket (see
+	// packaging/Caddyfile.template) so no local TCP port offers unauthenticated
+	// route/cert-key control. unix:// URLs dial the socket; http(s):// keeps
+	// the ordinary TCP client for legacy/admin-port setups.
+	if strings.HasPrefix(rawAdmin, "unix:") {
+		sockPath, perr := unixSocketPath(rawAdmin)
+		baseURL = "http://localhost"
+		if perr != nil {
+			// New has no error return; surface the misconfiguration on the
+			// first admin call instead of silently dialing a truncated path.
+			cfgErr := perr
+			transport = &http.Transport{
+				DialContext: func(context.Context, string, string) (net.Conn, error) {
+					return nil, cfgErr
+				},
+			}
+		} else {
+			transport = &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", sockPath)
+				},
+			}
+		}
+	}
 	return &Client{
-		baseURL:  strings.TrimRight(cfg.CaddyAdminURL, "/"),
+		baseURL:  baseURL,
 		serverID: cfg.CaddyServerID,
 		domain:   cfg.Domain,
 		// In cluster mode an operator points SB_INGRESS_ADVERTISE_HOST at
@@ -47,9 +78,27 @@ func New(cfg config.Config) *Client {
 		// them without per-call-site instrumentation drift.
 		httpClient: &http.Client{
 			Timeout:   cfg.HTTPClientTimeout,
-			Transport: wrapTransport(http.DefaultTransport),
+			Transport: wrapTransport(transport),
 		},
 	}
+}
+
+// unixSocketPath parses the socket path out of a unix:// admin URL. It rejects
+// a host component (unix://run/x.sock — a missing slash that used to truncate
+// to /x.sock) and an empty path (unix://) rather than silently dialing the
+// wrong target.
+func unixSocketPath(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid caddy admin url %q: %w", raw, err)
+	}
+	if u.Host != "" {
+		return "", fmt.Errorf("invalid caddy admin url %q: must be unix:///path (got a host component)", raw)
+	}
+	if p := strings.TrimSpace(u.Path); p == "" || p == "/" {
+		return "", fmt.Errorf("invalid caddy admin url %q: no unix socket path", raw)
+	}
+	return u.Path, nil
 }
 
 // L4TLSListen returns the listen address configured for the shared TLS-SNI

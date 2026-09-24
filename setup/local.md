@@ -29,14 +29,16 @@ No port-forwarding, DNS, or firewall changes are needed - the API binds to
 One command:
 
 ```bash
+# Stage the PAT in a root-only file first — argv is visible in `ps` and shell history.
+sudo install -m 0600 /dev/null /root/pat-token   # then paste the PAT into it
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
   | sudo bash -s -- \
       --local \
-      --pat-token your-secret-pat
+      --pat-token-file /root/pat-token
 ```
 
-If you omit `--pat-token`, the installer generates a random token and prints
-it once at the end. Save it - you can also re-read it from
+If you omit `--pat-token-file`, the installer generates a random token and
+prints it once at the end. Save it - you can also re-read it from
 `/etc/sandboxd/sandboxd.env` later.
 
 What the installer does:

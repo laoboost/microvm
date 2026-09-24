@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -135,8 +136,24 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 	if moduleRef == "" {
 		return nil, errors.New("module_ref is required")
 	}
+	// file:// / absolute refs read a file off the HOST filesystem as the
+	// daemon user — an operator/self-host convenience, not something a scoped
+	// tenant may drive (same gate shape as isolate.go's jsbundle.IsFileRef
+	// rule). ".." segments are operator-only too; the resolver rejects any ref
+	// that would escape the modules dir for everyone.
+	if _, scoped := ownerScope(ctx); scoped {
+		if wasmmod.IsHostPathRef(moduleRef) {
+			return nil, errors.New("file:// and host-path module refs are operator-only; push via /v1/wasm-modules and reference the registry ref")
+		}
+		if hasParentSegment(moduleRef) {
+			return nil, fmt.Errorf("module refs containing %q path segments are operator-only", "..")
+		}
+	}
 	explicitID := strings.TrimSpace(req.ID)
 	if explicitID != "" {
+		if !moduleIDValid(explicitID) {
+			return nil, fmt.Errorf("invalid module id %q", explicitID)
+		}
 		if existing, err := s.store.GetWasmModule(ctx, explicitID); err == nil {
 			if strings.TrimSpace(existing.ModuleRef) == moduleRef {
 				// Re-registering an already-catalogued module re-arms the warm
@@ -269,10 +286,11 @@ func (s *Service) DeleteWasmModule(ctx context.Context, id string) error {
 
 func wasmModuleFromRecord(rec store.WasmModuleRecord) *models.WasmModule {
 	return &models.WasmModule{
-		ID:              rec.ID,
-		ModuleRef:       rec.ModuleRef,
-		Status:          models.WasmModuleStatus(rec.Status),
-		ModulePath:      rec.ModulePath,
+		ID:        rec.ID,
+		ModuleRef: rec.ModuleRef,
+		Status:    models.WasmModuleStatus(rec.Status),
+		// ModulePath deliberately not copied: it is a host filesystem
+		// location and must not leave the service in API responses.
 		ModuleSizeBytes: rec.ModuleSizeBytes,
 		Digest:          rec.Digest,
 		Entrypoint:      rec.Entrypoint,
@@ -282,6 +300,24 @@ func wasmModuleFromRecord(rec store.WasmModuleRecord) *models.WasmModule {
 		UpdatedAt:       rec.UpdatedAt,
 		ReadyAt:         rec.ReadyAt,
 	}
+}
+
+// moduleIDPattern mirrors templateIDPattern / pkg/mounts.ValidateSandboxID:
+// ids are opaque path-segment-safe tokens only.
+var moduleIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+func moduleIDValid(id string) bool {
+	return moduleIDPattern.MatchString(id)
+}
+
+// hasParentSegment reports whether ref carries a ".." path segment.
+func hasParentSegment(ref string) bool {
+	for _, seg := range strings.FieldsFunc(ref, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) invalidateWasmModuleInventoryCache() {

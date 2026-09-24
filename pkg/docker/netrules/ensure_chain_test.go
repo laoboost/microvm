@@ -2,6 +2,9 @@ package netrules
 
 import (
 	"errors"
+	"slices"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -94,15 +97,40 @@ func TestEnsureChainBothUserChainsRegression(t *testing.T) {
 			if !be.hasChain(chain) {
 				t.Fatalf("chain %s not bootstrapped", chain)
 			}
-			// Per-IP rules must target the bootstrapped chain.
+			// Per-IP rules must target the bootstrapped chain — assert the
+			// exact SET of rules in that chain so a stray or duplicated rule
+			// is caught, not just the one egress rule we expect. Order is not
+			// the property under test (chain membership is), so compare sorted.
 			if err := mgr.BlockAllEgress("10.1.2.3"); err != nil {
 				t.Fatal(err)
 			}
-			if got := be.countMatching("|" + chain + "|"); got != 1 {
-				t.Fatalf("egress rule not in %s: %d", chain, got)
+			want := []string{
+				"filter|" + chain + "|-d|" + LinkLocalEgressCIDR + "|-j|DROP",
+				"filter|" + chain + "|-s|10.1.2.3|-j|DROP",
+			}
+			sort.Strings(want)
+			if got := chainRules(be, chain); !slices.Equal(got, want) {
+				t.Fatalf("rules in %s = %v, want exactly %v", chain, got, want)
 			}
 		})
 	}
+}
+
+// chainRules returns the sorted rule set living in chain, so a test can assert
+// the exact membership (strays and duplicates included) rather than a single
+// substring match.
+func chainRules(be *memBackend, chain string) []string {
+	be.mu.Lock()
+	defer be.mu.Unlock()
+	prefix := "filter|" + chain + "|"
+	var out []string
+	for _, r := range be.rules {
+		if strings.HasPrefix(r, prefix) {
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestEnsureChainRetriesAfterReset(t *testing.T) {
@@ -162,6 +190,7 @@ type ruleOnlyBackend struct{}
 
 func (ruleOnlyBackend) Exists(string, string, ...string) (bool, error) { return false, nil }
 func (ruleOnlyBackend) Insert(string, string, int, ...string) error    { return nil }
+func (ruleOnlyBackend) Append(string, string, ...string) error         { return nil }
 func (ruleOnlyBackend) Delete(string, string, ...string) error         { return nil }
 
 // TestEnsureChainFailsLoudOnNonBootstrapBackend is the regression for the

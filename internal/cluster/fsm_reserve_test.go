@@ -124,12 +124,14 @@ func TestFSMReserveRejectsLiveReservationByDifferentOwner(t *testing.T) {
 // contract: an opReserve that arrives after the previous reservation's TTL
 // elapsed (but before the GC sweep cancelled it) must be allowed to overwrite,
 // otherwise stuck reservations would deny placements until the next GC tick.
+// The takeover decision is explicit on the command (AllowExpiredOverwrite,
+// stamped by the proposer) — Apply never re-checks expiry against a clock.
 func TestFSMReserveOverwritesExpiredReservation(t *testing.T) {
 	fsm := newPlacementFSM()
 	applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "B", ExpiresUnix: time.Now().Add(-time.Second).Unix()})
 
 	freshExpiry := time.Now().Add(120 * time.Second).Unix()
-	if got := applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "C", ExpiresUnix: freshExpiry}); got != nil {
+	if got := applyOp(t, fsm, command{Op: opReserve, SandboxID: "sb1", OwnerNodeID: "C", ExpiresUnix: freshExpiry, AllowExpiredOverwrite: true}); got != nil {
 		t.Fatalf("opReserve over expired reservation = %v, want nil", got)
 	}
 

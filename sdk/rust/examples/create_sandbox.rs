@@ -5,8 +5,11 @@ fn main() {
     let api_url = env::args()
         .nth(1)
         .unwrap_or_else(|| "http://127.0.0.1:21212".to_owned());
-    let pat_token = env::args().nth(2).expect("PAT token is required");
-    let image = env::args().nth(3).expect("Image is required");
+    // Read the PAT from the environment so it never shows up in shell history
+    // or process listings.
+    let pat_token =
+        env::var("SB_PAT_TOKEN").expect("PAT token is required. Set SB_PAT_TOKEN.");
+    let image = env::args().nth(2).expect("Image is required");
 
     let client = Client::new(Some(&api_url), Some(&pat_token)).expect("failed to create client");
     let health = client.health().expect("health check failed");
@@ -22,6 +25,7 @@ fn main() {
         })
         .expect("sandbox creation failed");
 
-    println!("sandbox = {:#?}", sandbox.data);
+    // Sandbox's Debug redacts ssh_private_key and the client PAT.
+    println!("sandbox = {:#?}", sandbox);
     println!("open {}", sandbox.data.public_url);
 }

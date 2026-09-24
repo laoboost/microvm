@@ -48,6 +48,13 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 		argv = append(argv, "--region", region)
 	}
 	if endpoint := spec.Options["endpoint"]; endpoint != "" {
+		if !useStaticCreds {
+			// Caller-supplied endpoints are only safe alongside static keys:
+			// with ambient credentials (instance role / IRSA) mount-s3 would
+			// sign requests to whatever host the caller names — a confused
+			// deputy against the node's IAM role.
+			return Plan{}, fmt.Errorf("s3 endpoint override requires static credentials; refusing to sign ambient credentials to a caller-supplied endpoint")
+		}
 		if err := validateS3Endpoint(endpoint); err != nil {
 			return Plan{}, err
 		}
@@ -95,11 +102,14 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 	}, nil
 }
 
-// hasS3Credentials reports whether the spec carries static keys. An access key
-// alone (or with a secret) means the operator wants the sandbox profile; an
-// empty map means fall back to the ambient credential chain.
+// hasS3Credentials reports whether the spec carries a COMPLETE static key
+// pair. Both access_key_id and secret_access_key are required: a partial set
+// is not a usable profile — mount-s3 would sign with an incomplete profile,
+// fall through the SDK chain to IMDS, and still send the node role's signature
+// to a caller-named endpoint. A session token alone does not count either.
+// Anything short of a full pair falls back to the ambient credential chain.
 func hasS3Credentials(creds map[string]string) bool {
-	return strings.TrimSpace(creds["access_key_id"]) != "" ||
+	return strings.TrimSpace(creds["access_key_id"]) != "" &&
 		strings.TrimSpace(creds["secret_access_key"]) != ""
 }
 

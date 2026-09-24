@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -336,25 +337,72 @@ func TestClusterAssertOwnershipSkipsEmptySandboxID(t *testing.T) {
 	}
 }
 
+// TestCapacityLeaseRefreshLocalReadsInventoryProvidersSafely: refreshLocal runs
+// on the capacity-lease loop goroutine, which cluster.New starts before the
+// daemon can install the inventory providers (daemon.Run calls
+// SetLocalTemplateIDsProvider after New returned). The read of those provider
+// fields was unlocked while the setters take c.mu, so an install racing a tick
+// could observe a torn func value — a real data race in production and in the
+// daemon's -race gate.
+func TestCapacityLeaseRefreshLocalReadsInventoryProvidersSafely(t *testing.T) {
+	admitter := capacity.New(
+		capacity.HostInfo{CPUCores: 4, MemoryTotalMB: 2048, DiskTotalGB: 10, DiskFreeGB: 10},
+		capacity.Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1, DiskReservationRatio: 1},
+		nil,
+	)
+	cache := newCapacityLeaseCache("node-a", admitter, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				cache.refreshLocal(time.Now())
+			}
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		cache.SetLocalTemplateIDsProvider(func() ([]string, bool) { return []string{"tpl-a"}, true })
+		cache.SetLocalWasmModuleIDsProvider(func() ([]string, bool) { return []string{"mod-a"}, true })
+	}
+	close(stop)
+	<-done
+
+	if out := cache.apply([]Member{{NodeID: "node-a", Alive: true, Role: config.NodeRoleServer}}, time.Now()); len(out) != 1 || out[0].CapacityStale {
+		t.Fatalf("refreshLocal did not publish a fresh local lease: %+v", out)
+	}
+}
+
 func TestForwardRemoveMemberToLeaderInternalMock(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
-	leader, cleanupLeader := newTestCluster(t, "ldr-rm-fwd", true, nil)
+	// Both nodes are TLS-equipped and share one cert dir: internalClient must be
+	// installed by New (before the capacity-lease loop starts reading it), which
+	// is what the TLS path does — assigning follower.internalClient after New
+	// would race that loop. A mixed pair (TLS follower, plaintext leader) cannot
+	// complete a raft handshake, so the leader is TLS too.
+	tlsDir := writeTestClusterTLSDir(t)
+	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-rm-fwd", true, nil, tlsDir)
 	defer cleanupLeader()
 	waitForLeader(t, leader, 10*time.Second)
 
-	follower, cleanupFollower := newTestCluster(t, "fol-rm-fwd", false, []string{leader.gossip.ml.LocalNode().Address()})
+	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-rm-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, tlsDir)
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 	// forwardRemoveMemberToLeader resolves the leader via the follower's own raft
 	// state; wait until that has propagated, otherwise Leader() is briefly empty.
 	waitForLeader(t, follower, 20*time.Second)
 
-	var deleted string
+	var deleted atomic.Pointer[string]
 	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "ghost-node") {
-			deleted = r.URL.Path
+			path := r.URL.Path
+			deleted.Store(&path)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -362,7 +410,9 @@ func TestForwardRemoveMemberToLeaderInternalMock(t *testing.T) {
 	}))
 	defer internal.Close()
 
-	follower.internalClient = internal.Client()
+	// The mTLS client New installed dials the test server over plain HTTP — the
+	// member index below points the leader's peerInternalURL at it, which is the
+	// internal-channel selection this test pins.
 	follower.gossip.memberIndex.upsert(Member{
 		NodeID:      leader.nodeID,
 		InternalURL: internal.URL,
@@ -375,7 +425,7 @@ func TestForwardRemoveMemberToLeaderInternalMock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("forwardRemoveMemberToLeader: %v", err)
 	}
-	if deleted == "" {
+	if deleted.Load() == nil {
 		t.Fatal("internal DELETE was not invoked")
 	}
 }

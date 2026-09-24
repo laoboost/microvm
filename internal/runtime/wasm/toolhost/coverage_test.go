@@ -211,6 +211,7 @@ func TestHostExecError(t *testing.T) {
 // ─── Code-run interpreter routes ─────────────────────────────────────────────
 
 func TestHostCodeRunBadJSON(t *testing.T) {
+	requireHostExec(t)
 	h := newHost(t)
 	rec := serve(h, http.MethodPost, "/process/code-run", []byte("notjson"), map[string]string{
 		"Content-Type": "application/json",
@@ -221,6 +222,7 @@ func TestHostCodeRunBadJSON(t *testing.T) {
 }
 
 func TestHostCodeRunMissingCode(t *testing.T) {
+	requireHostExec(t)
 	h := newHost(t)
 	payload, _ := json.Marshal(map[string]string{"language": "python"})
 	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
@@ -232,6 +234,7 @@ func TestHostCodeRunMissingCode(t *testing.T) {
 }
 
 func TestHostCodeRunUnsupportedLanguage(t *testing.T) {
+	requireHostExec(t)
 	h := newHost(t)
 	payload, _ := json.Marshal(map[string]string{"code": "x", "language": "cobol"})
 	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
@@ -243,6 +246,7 @@ func TestHostCodeRunUnsupportedLanguage(t *testing.T) {
 }
 
 func TestHostCodeRunInterpreterNotInstalled(t *testing.T) {
+	requireHostExec(t)
 	h := newHost(t)
 	// ts-node is unlikely to be installed in test environment
 	payload, _ := json.Marshal(map[string]string{"code": "console.log(1)", "language": "typescript"})
@@ -256,6 +260,7 @@ func TestHostCodeRunInterpreterNotInstalled(t *testing.T) {
 }
 
 func TestHostCodeRunBash(t *testing.T) {
+	requireHostExec(t)
 	h := newHost(t)
 	payload, _ := json.Marshal(map[string]string{"code": "echo hello", "language": "bash"})
 	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
@@ -491,6 +496,7 @@ func TestHostSessionsWithoutManager(t *testing.T) {
 }
 
 func TestHostSessionsCreateNilManager(t *testing.T) {
+	requireHostExec(t)
 	h := toolhost.New(toolhost.Config{
 		SandboxID: "sb",
 		WorkDir:   t.TempDir(),

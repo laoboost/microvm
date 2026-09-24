@@ -79,6 +79,12 @@ type Pool struct {
 	// daemon restart, so reloading the map from disk is meaningless).
 	handlesMu sync.Mutex
 	handles   map[string]SpawnedHandle
+
+	// afterRecordLoaded, when non-nil, runs at the tail of RecordLoaded
+	// after the store write commits. Test seam: lets a test hold the
+	// publish window open while it races AcquireWithHandle against the
+	// refill loop's row/handle publication sequence.
+	afterRecordLoaded func()
 }
 
 // Slot is the policy-level view of one warm-VMM pool entry. Mirrors
@@ -277,10 +283,10 @@ func (p *Pool) AcquireWithHandle(ctx context.Context, templateID, sandboxID stri
 }
 
 // registerHandle is the refill loop's hook for parking the live
-// SpawnedHandle alongside the SQLite row. Called after RecordLoaded
-// has committed the 'loaded' status — registering earlier could
-// expose a handle that the Acquire path's RowsAffected race would
-// then claim before the row was loaded.
+// SpawnedHandle alongside the SQLite row. Called BEFORE RecordLoaded so
+// the handle is in the map by the time the row becomes claimable —
+// registering after left a window where AcquireWithHandle claimed the
+// row, missed the handle, and cold-spawned past the warm VMM.
 func (p *Pool) registerHandle(slotID string, h SpawnedHandle) {
 	if h == nil {
 		return
@@ -414,7 +420,13 @@ func (p *Pool) RecordSpawning(ctx context.Context, slotID, templateID string, no
 // the guest snapshot bakes vsockCID. Promotes the row to 'loaded' so
 // subsequent Acquire calls can pick it up.
 func (p *Pool) RecordLoaded(ctx context.Context, slotID, apiSocket, runDir string, vsockCID uint32, now time.Time) error {
-	return p.st.MarkFirecrackerVMMSlotLoaded(ctx, slotID, apiSocket, runDir, vsockCID, now)
+	if err := p.st.MarkFirecrackerVMMSlotLoaded(ctx, slotID, apiSocket, runDir, vsockCID, now); err != nil {
+		return err
+	}
+	if p.afterRecordLoaded != nil {
+		p.afterRecordLoaded()
+	}
+	return nil
 }
 
 // RecordFailed is the spawner-failure entry point: the spawner could

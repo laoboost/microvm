@@ -48,6 +48,13 @@ var codeRunSpecs = map[string]codeRunSpec{
 }
 
 func (h *Host) handleCodeRun(w http.ResponseWriter, r *http.Request) {
+	// Fail closed while host-exec is disabled (Host.hostExecEnabled): this handler resolves and
+	// runs host interpreters (python3/node/bash) for user code, and the wasm
+	// runtime has no jail to contain them.
+	if !h.hostExecEnabled {
+		writeError(w, http.StatusNotImplemented, hostExecDisabledMsg)
+		return
+	}
 	var req codeRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")

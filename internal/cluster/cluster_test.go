@@ -255,6 +255,10 @@ func newTestClusterWithAPI(t *testing.T, nodeID string, bootstrap bool, gossipPe
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
+		// Test clusters run plaintext gossip (no fleet key). Production only
+		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+		// opt-in here so voter-promotion subjects stay exercisable.
+		ClusterInsecureGossip: true,
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

@@ -296,7 +296,11 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			s.bindNetworkHook(env.SandboxID)
-			invokeCtx, cancel := wasmengine.WithInvocationDeadline(ctx, s.lastCaps)
+			// One-shot invokes are wall-bounded so a CPU-bound guest cannot spin
+			// forever; a background invoke is the long-lived guest entry (HTTP
+			// serve) and gets no deadline — the sandbox lifecycle bounds it
+			// (MsgStopInstance cancels the in-flight call in the engine).
+			invokeCtx, cancel := wasmengine.InvocationContext(ctx, s.lastCaps, p.Background)
 			eng := s.eng
 			s.mu.Unlock()
 			start := time.Now()

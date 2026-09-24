@@ -28,6 +28,10 @@ var (
 )
 
 var daytonaLogsUpgrader = websocket.Upgrader{
+	// Auth happens in the HTTP handler before upgrade. CheckOrigin stays
+	// permissive while authentication is HEADER-ONLY (bearer) — no cookie
+	// auth may ever be accepted here, or an ambient-credential browser CSRF
+	// could open these sockets cross-origin.
 	CheckOrigin:     func(r *http.Request) bool { return true },
 	ReadBufferSize:  64 * 1024,
 	WriteBufferSize: 64 * 1024,

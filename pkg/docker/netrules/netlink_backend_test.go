@@ -40,6 +40,14 @@ func (f *fakeNFT) InsertRule(r *nftables.Rule) *nftables.Rule {
 	return &cp
 }
 
+func (f *fakeNFT) AddRule(r *nftables.Rule) *nftables.Rule {
+	f.inserted = append(f.inserted, r)
+	cp := *r
+	cp.Handle = uint64(len(f.rules) + 1)
+	f.rules = append(f.rules, &cp)
+	return &cp
+}
+
 func (f *fakeNFT) DelRule(r *nftables.Rule) error {
 	if f.delErr != nil {
 		return f.delErr

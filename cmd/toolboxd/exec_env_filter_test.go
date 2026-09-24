@@ -15,22 +15,22 @@ import (
 
 func TestMergeEnvForExec_DropsPrivilegeEscalationKeys(t *testing.T) {
 	merged := mergeEnvForExec(map[string]string{
-		"SAFE_VAR":          "1",
-		"LD_PRELOAD":        "/workspace/evil.so",
-		"LD_LIBRARY_PATH":   "/workspace/lib",
-		"LD_AUDIT":          "/workspace/audit.so",
-		"BASH_ENV":          "/workspace/evil.sh",
-		"ENV":               "/workspace/evil.sh",
-		"SHELLOPTS":         "xtrace",
-		"BASHOPTS":          "xtrace",
-		"PS4":               "$(id)",
-		"GCONV_PATH":        "/workspace/gconv",
-		"LOCPATH":           "/workspace/locale",
-		"HOSTALIASES":       "/workspace/hosts",
-		"IFS":               "-",
-		"BASH_FUNC_evil%%":  "() { id; }",
-		"A=B":               "injected",
-		"PATH":              "/workspace/bin:/usr/bin",
+		"SAFE_VAR":         "1",
+		"LD_PRELOAD":       "/workspace/evil.so",
+		"LD_LIBRARY_PATH":  "/workspace/lib",
+		"LD_AUDIT":         "/workspace/audit.so",
+		"BASH_ENV":         "/workspace/evil.sh",
+		"ENV":              "/workspace/evil.sh",
+		"SHELLOPTS":        "xtrace",
+		"BASHOPTS":         "xtrace",
+		"PS4":              "$(id)",
+		"GCONV_PATH":       "/workspace/gconv",
+		"LOCPATH":          "/workspace/locale",
+		"HOSTALIASES":      "/workspace/hosts",
+		"IFS":              "-",
+		"BASH_FUNC_evil%%": "() { id; }",
+		"A=B":              "injected",
+		"PATH":             "/workspace/bin:/usr/bin",
 	})
 
 	// These exact caller-supplied assignments must never appear in the root

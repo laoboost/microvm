@@ -39,6 +39,19 @@ func (t *deadOwnerTracker) clear(nodeID string) {
 	delete(t.firstSeen, nodeID)
 }
 
+// isTracked reports whether nodeID currently has a dead-since mark. A rejoin
+// (cancelDeadOwnerWatch) clears the mark, so "tracked" doubles as "still
+// considered dead" for the eviction re-check.
+func (t *deadOwnerTracker) isTracked(nodeID string) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.firstSeen[nodeID]
+	return ok
+}
+
 func (t *deadOwnerTracker) snapshot() map[string]time.Time {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -152,6 +165,30 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 	}
 }
 
+// afterEvictOwnedSnapshot runs after evictDeadOwner has snapshotted the dead
+// node's placements and before it acts on any of them. Tests use it to fake a
+// mid-eviction rejoin; nil in production.
+var afterEvictOwnedSnapshot func(nodeID string)
+
+// beforeRemoveDeadOwnerServer runs immediately before evictDeadOwner's final
+// RemoveServer decision. Tests use it to fake a rejoin that lands in the window
+// between the orphan step and the removal; nil in production.
+var beforeRemoveDeadOwnerServer func(nodeID string)
+
+// deadOwnerBack reports whether nodeID has come back since its eviction
+// started: gossip reports it alive again, or — when the node was tracked as
+// dead at eviction start — the dead-owner tracker entry vanished because the
+// memberlist join callback cleared it. Checked before EVERY mutation during
+// eviction so a rejoining node is never reassigned or orphaned on the basis
+// of a stale live-map snapshot (C6e). trackedAtStart is passed explicitly so
+// direct calls for untracked phantom nodes (tests) only consult gossip.
+func (c *Cluster) deadOwnerBack(nodeID string, trackedAtStart bool) bool {
+	if c.memberAlive(nodeID) {
+		return true
+	}
+	return trackedAtStart && !c.deadOwners.isTracked(nodeID)
+}
+
 // evictDeadOwner handles every placement owned by nodeID and removes the dead
 // node from the raft configuration. Sandboxes that opted into
 // failover.policy=recreate are reassigned to a live peer scored against their
@@ -161,11 +198,22 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 //
 // All steps are idempotent so a partial failure is safe to retry on the next
 // tick: a placement already orphaned stays orphaned, and RemoveServer is a
-// no-op once the dead node is gone.
+// no-op once the dead node is gone. Before EVERY placement mutation (and the
+// final orphan) the eviction re-checks that the node is still dead — see
+// deadOwnerBack.
 func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
+	trackedAtStart := c.deadOwners.isTracked(nodeID)
 	ids := c.fsm.idsOwnedBy(nodeID)
+	if afterEvictOwnedSnapshot != nil {
+		afterEvictOwnedSnapshot(nodeID)
+	}
 	var reassigned int
 	for _, id := range ids {
+		if c.deadOwnerBack(nodeID, trackedAtStart) {
+			c.logger.Warn("cluster: dead owner is back; aborting eviction",
+				"dead_node", nodeID, "sandbox_id", id)
+			return
+		}
 		p, ok := c.fsm.get(id)
 		if !ok {
 			continue
@@ -197,6 +245,11 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 		// deliberately still counts successful acknowledgements.
 		reassigned++
 	}
+	if c.deadOwnerBack(nodeID, trackedAtStart) {
+		c.logger.Warn("cluster: dead owner is back; aborting eviction before orphan",
+			"dead_node", nodeID)
+		return
+	}
 	orphaned := len(c.fsm.idsOwnedBy(nodeID))
 	if err := c.orphanOwner(ctx, nodeID); err != nil {
 		c.logger.Warn("cluster: orphan dead-owner placements failed; will retry next tick",
@@ -206,6 +259,19 @@ func (c *Cluster) evictDeadOwner(ctx context.Context, nodeID string) {
 	if reassigned > 0 || orphaned > 0 {
 		c.logger.Warn("cluster: handled placements after owner death",
 			"dead_node", nodeID, "reassigned", reassigned, "orphaned", orphaned)
+	}
+	if beforeRemoveDeadOwnerServer != nil {
+		beforeRemoveDeadOwnerServer(nodeID)
+	}
+	// One last liveness check: a node can rejoin in the window between the
+	// orphan apply above and this removal (gossip/memberlist join callback
+	// clears the dead-owner tracking entry). Removing a node that is alive
+	// would strip it from the raft configuration — and, with the voter gate, it
+	// may never be re-promoted, silently shrinking the cluster.
+	if c.deadOwnerBack(nodeID, trackedAtStart) {
+		c.logger.Warn("cluster: dead owner is back; skipping raft removal",
+			"dead_node", nodeID)
+		return
 	}
 	c.removeDeadOwnerServer(nodeID)
 }

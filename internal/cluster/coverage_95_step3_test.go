@@ -102,7 +102,7 @@ func TestFSMPageScanAndPendingHelperEdges(t *testing.T) {
 	fsm.mu.Unlock()
 }
 
-func TestFSMRestoreFailStoreAndEmptySandboxID(t *testing.T) {
+func TestFSMRestoreFailingStoreFallsBackAndEmptySandboxID(t *testing.T) {
 	payload := fsmSnapshotPayload{
 		Version: 1,
 		Placements: map[string]Placement{
@@ -119,8 +119,11 @@ func TestFSMRestoreFailStoreAndEmptySandboxID(t *testing.T) {
 		t.Fatal(err)
 	}
 	fsm := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
-	if err := fsm.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err == nil {
-		t.Fatal("Restore should fail when recovery Put fails")
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatalf("Restore with failing recovery store = %v, want nil (inline fallback)", err)
+	}
+	if p, ok := fsm.get("sb1"); !ok || p.Spec == nil || p.Spec.Image != "from-rec" {
+		t.Fatalf("restored row after Put fallback = %+v ok=%v, want recovery payload from snapshot", p, ok)
 	}
 
 	// Decode failure (neither envelope nor legacy map).
@@ -433,8 +436,9 @@ func TestRemoveMemberLocalLastVoterAndForce(t *testing.T) {
 	defer cleanupLeader()
 	waitForLeader(t, leader, 10*time.Second)
 
-	// Last voter cannot be removed.
-	if err := leader.removeMemberLocal(context.Background(), leader.nodeID, true); !errors.Is(err, ErrLastVoter) {
+	// Self-removal is refused up front (this node is also the last voter —
+	// the self-guard fires before the last-voter check).
+	if err := leader.removeMemberLocal(context.Background(), leader.nodeID, true, false); !errors.Is(err, ErrSelfRemoval) {
 		t.Fatalf("remove self last voter=%v", err)
 	}
 
@@ -443,13 +447,13 @@ func TestRemoveMemberLocalLastVoterAndForce(t *testing.T) {
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 
 	// Alive without force.
-	if err := leader.removeMemberLocal(context.Background(), follower.nodeID, false); !errors.Is(err, ErrMemberStillAlive) {
+	if err := leader.removeMemberLocal(context.Background(), follower.nodeID, false, false); !errors.Is(err, ErrMemberStillAlive) {
 		t.Fatalf("alive without force=%v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := leader.removeMemberLocal(ctx, follower.nodeID, true); err != nil {
+	if err := leader.removeMemberLocal(ctx, follower.nodeID, true, false); err != nil {
 		t.Fatalf("force remove: %v", err)
 	}
 }

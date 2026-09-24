@@ -434,10 +434,10 @@ func TestLoadContainerForRefListError(t *testing.T) {
 
 type listFailTransport struct{ fakeTransport }
 
-func (listFailTransport) loadContainer(context.Context, string) (cntr.Container, error) {
+func (*listFailTransport) loadContainer(context.Context, string) (cntr.Container, error) {
 	return nil, errdefs.ErrNotFound
 }
-func (listFailTransport) listContainers(context.Context, ...string) ([]cntr.Container, error) {
+func (*listFailTransport) listContainers(context.Context, ...string) ([]cntr.Container, error) {
 	return nil, errors.New("list failed")
 }
 

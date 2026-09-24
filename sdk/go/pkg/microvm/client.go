@@ -3,6 +3,7 @@ package microvm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -36,6 +37,14 @@ type ExecStreamHandle struct {
 
 func NewClient() (*Client, error) {
 	return NewClientWithConfig(nil)
+}
+
+// String redacts patToken so Client is safe to log with %v / %+v.
+func (c *Client) String() string {
+	if c == nil {
+		return "microvm.Client(nil)"
+	}
+	return fmt.Sprintf("microvm.Client{apiURL: %q, patToken: %s}", c.apiURL, sdktypes.RedactToken(c.patToken))
 }
 
 func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
@@ -115,9 +124,10 @@ func (c *Client) BuildImage(ctx context.Context, image *Image) (string, error) {
 }
 
 // BuildImageWithOptions builds an Image and optionally pushes the result to a
-// remote registry. Push credentials are forwarded to the daemon as a one-shot
-// X-Registry-Auth header and never persisted server-side. Returns the local
-// content-addressed tag and (when push was requested) the pushed reference.
+// remote registry. Push credentials are forwarded to the daemon in the push
+// object of the POST /v1/images/build request body and never persisted
+// server-side. Returns the local content-addressed tag and (when push was
+// requested) the pushed reference.
 func (c *Client) BuildImageWithOptions(ctx context.Context, image *Image, opts sdktypes.BuildImageOptions) (sdktypes.BuildImageResult, error) {
 	if image == nil {
 		return sdktypes.BuildImageResult{}, errors.New("image is nil")
@@ -615,4 +625,18 @@ func wrapSandbox(client *Client, item *apiclient.Sandbox) *Sandbox {
 		Sandbox: item.Sandbox,
 		client:  client,
 	}
+}
+
+// String redacts the per-sandbox SSH private key (and the client's PAT) so
+// Sandbox is safe to log with %v / %+v.
+func (s *Sandbox) String() string {
+	if s == nil {
+		return "microvm.Sandbox(nil)"
+	}
+	sshKey := ""
+	if s.SSHPrivateKey != "" {
+		sshKey = "***"
+	}
+	return fmt.Sprintf("microvm.Sandbox{ID: %q, Image: %q, Status: %q, SSHPrivateKey: %s, client: %s}",
+		s.ID, s.Image, s.Status, sshKey, s.client.String())
 }

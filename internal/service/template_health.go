@@ -162,6 +162,9 @@ func (s *Service) RequestTemplateRebuild(ctx context.Context, templateID string)
 	if templateID == "" {
 		return nil, errors.New("template id is required")
 	}
+	// No TemplateIDValid gate: this is an operator read/repair of an existing
+	// row, so an id that predates the create-time validation must remain
+	// rebuildable. The id only feeds store lookups and the stored row's paths.
 	tpl, err := s.store.GetTemplate(ctx, templateID)
 	if err != nil {
 		return nil, err

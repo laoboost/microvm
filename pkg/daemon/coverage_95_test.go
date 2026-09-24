@@ -641,7 +641,14 @@ func isNetrulesHostUnavailable(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "iptables") ||
 		strings.Contains(msg, "netlink netrules") ||
-		strings.Contains(msg, "create netrules manager")
+		strings.Contains(msg, "create netrules manager") ||
+		// The Docker path now installs the link-local (IMDS) DROP into
+		// DOCKER-USER at boot, and that install (like EnsureChain) fails closed on
+		// netrules' IPv6 precondition. This suite neutralises the sandbox-IPv6-
+		// disable seam (TestMain), so on a dev/CI host that has IPv6 live on
+		// docker0 the probe reads the real sysctl and refuses boot — the same
+		// "this host can't run the enabled path" category as a missing iptables.
+		strings.Contains(msg, "IPv6 is not disabled")
 }
 
 func TestCoverage95IsolateBackgroundAndPoolSpawner(t *testing.T) {
