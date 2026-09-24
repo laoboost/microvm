@@ -77,6 +77,8 @@ func (failReassertBackend) Exists(string, string, ...string) (bool, error) { ret
 
 func (failReassertBackend) Insert(string, string, int, ...string) error { return nil }
 
+func (failReassertBackend) Append(string, string, ...string) error { return nil }
+
 func (failReassertBackend) Delete(string, string, ...string) error { return nil }
 
 func (failReassertBackend) EnsureUserChain(string) error {

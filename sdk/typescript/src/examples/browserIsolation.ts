@@ -100,11 +100,11 @@ function parseArgs(argv: string[]): CLIOptions {
 	}
 
 	const apiUrl = firstArg(args, "api-url") ?? process.env.SB_API_URL ?? "http://127.0.0.1:21212";
-	const patToken = firstArg(args, "pat-token") ?? process.env.SB_PAT_TOKEN ?? "";
+	const patToken = process.env.SB_PAT_TOKEN ?? "";
 	const image = firstArg(args, "image") ?? defaultImage;
 	const runtime = parseRuntime(firstArg(args, "runtime"));
 	if (patToken === "") {
-		throw new Error("PAT token is required. Pass --pat-token or set SB_PAT_TOKEN.");
+		throw new Error("PAT token is required. Set SB_PAT_TOKEN (do not pass it on the command line).");
 	}
 
 	return {

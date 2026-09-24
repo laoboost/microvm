@@ -32,7 +32,7 @@ func TestRemoveMemberLocalLastVoterAndForce(t *testing.T) {
 	waitForLeader(t, leader, 10*time.Second)
 
 	// Last voter cannot be removed.
-	if err := leader.removeMemberLocal(context.Background(), leader.nodeID, true); !errors.Is(err, ErrLastVoter) {
+	if err := leader.removeMemberLocal(context.Background(), leader.nodeID, true, true); !errors.Is(err, ErrLastVoter) {
 		t.Fatalf("remove self last voter=%v", err)
 	}
 
@@ -41,13 +41,13 @@ func TestRemoveMemberLocalLastVoterAndForce(t *testing.T) {
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 
 	// Alive without force.
-	if err := leader.removeMemberLocal(context.Background(), follower.nodeID, false); !errors.Is(err, ErrMemberStillAlive) {
+	if err := leader.removeMemberLocal(context.Background(), follower.nodeID, false, false); !errors.Is(err, ErrMemberStillAlive) {
 		t.Fatalf("alive without force=%v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := leader.removeMemberLocal(ctx, follower.nodeID, true); err != nil {
+	if err := leader.removeMemberLocal(ctx, follower.nodeID, true, true); err != nil {
 		t.Fatalf("force remove: %v", err)
 	}
 }
@@ -89,7 +89,7 @@ func TestRemoveMemberLocalExpiredDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
 	time.Sleep(time.Millisecond)
-	_ = leader.removeMemberLocal(ctx, follower.nodeID, true)
+	_ = leader.removeMemberLocal(ctx, follower.nodeID, true, true)
 }
 
 func TestClientCloseStopFuncs(t *testing.T) {

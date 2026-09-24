@@ -696,7 +696,7 @@ test("MicroVM health maps ssh gateway state", async () => {
   assert.equal(health.sshGateway, "disabled");
 });
 
-test("Sandbox execStream uses sandbox bearer subprotocol", async () => {
+test("Sandbox execStream authenticates via Authorization header", async () => {
   const originalWebSocket = globalThis.WebSocket;
   const stdoutChunks: Uint8Array[] = [];
   const stderrChunks: Uint8Array[] = [];
@@ -706,14 +706,24 @@ test("Sandbox execStream uses sandbox bearer subprotocol", async () => {
 
     readonly url: string;
     readonly protocols: string[];
+    readonly init: { headers?: Record<string, string> } | undefined;
     binaryType = "blob";
     sent: Array<string | Uint8Array> = [];
     closed = false;
     private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
 
-    constructor(url: string, protocols?: string | string[]) {
+    constructor(url: string, protocolsOrInit?: string | string[] | { protocols?: string[]; headers?: Record<string, string> }) {
       this.url = url;
-      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      if (Array.isArray(protocolsOrInit)) {
+        this.protocols = protocolsOrInit;
+        this.init = undefined;
+      } else if (typeof protocolsOrInit === "string") {
+        this.protocols = [protocolsOrInit];
+        this.init = undefined;
+      } else {
+        this.protocols = protocolsOrInit?.protocols ?? [];
+        this.init = protocolsOrInit;
+      }
       FakeWebSocket.instances.push(this);
     }
 
@@ -775,7 +785,8 @@ test("Sandbox execStream uses sandbox bearer subprotocol", async () => {
     const ws = FakeWebSocket.instances[0];
     assert.ok(ws);
     assert.equal(ws.url, "wss://api.example.com/v1/sandboxes/sb-stream/toolbox/process/exec/stream");
-    assert.deepEqual(ws.protocols, ["sandbox.bearer", "pat-token"]);
+    assert.deepEqual(ws.protocols, []);
+    assert.equal(ws.init?.headers?.Authorization, "Bearer pat-token");
 
     ws.emit("open");
     assert.equal(ws.sent[0], JSON.stringify({ command: "npm install", tty: false, cols: 0, rows: 0 }));
@@ -793,7 +804,7 @@ test("Sandbox execStream uses sandbox bearer subprotocol", async () => {
   }
 });
 
-test("MicroVM execStream uses sandbox bearer subprotocol", async () => {
+test("MicroVM execStream authenticates via Authorization header", async () => {
   const originalWebSocket = globalThis.WebSocket;
 
   class FakeWebSocket {
@@ -801,13 +812,23 @@ test("MicroVM execStream uses sandbox bearer subprotocol", async () => {
 
     readonly url: string;
     readonly protocols: string[];
+    readonly init: { headers?: Record<string, string> } | undefined;
     binaryType = "blob";
     sent: Array<string | Uint8Array> = [];
     private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
 
-    constructor(url: string, protocols?: string | string[]) {
+    constructor(url: string, protocolsOrInit?: string | string[] | { protocols?: string[]; headers?: Record<string, string> }) {
       this.url = url;
-      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      if (Array.isArray(protocolsOrInit)) {
+        this.protocols = protocolsOrInit;
+        this.init = undefined;
+      } else if (typeof protocolsOrInit === "string") {
+        this.protocols = [protocolsOrInit];
+        this.init = undefined;
+      } else {
+        this.protocols = protocolsOrInit?.protocols ?? [];
+        this.init = protocolsOrInit;
+      }
       FakeWebSocket.instances.push(this);
     }
 
@@ -841,7 +862,8 @@ test("MicroVM execStream uses sandbox bearer subprotocol", async () => {
     const ws = FakeWebSocket.instances[0];
     assert.ok(ws);
     assert.equal(ws.url, "wss://api.example.com/v1/sandboxes/sb-stream/toolbox/process/exec/stream");
-    assert.deepEqual(ws.protocols, ["sandbox.bearer", "pat-token"]);
+    assert.deepEqual(ws.protocols, []);
+    assert.equal(ws.init?.headers?.Authorization, "Bearer pat-token");
 
     ws.emit("open");
     assert.deepEqual(JSON.parse(String(ws.sent[0])), {
@@ -855,7 +877,7 @@ test("MicroVM execStream uses sandbox bearer subprotocol", async () => {
   }
 });
 
-test("Sandbox attachSession uses sandbox bearer subprotocol", async () => {
+test("Sandbox attachSession authenticates via Authorization header", async () => {
   const originalWebSocket = globalThis.WebSocket;
   const stdoutChunks: Uint8Array[] = [];
   const stderrChunks: Uint8Array[] = [];
@@ -866,14 +888,24 @@ test("Sandbox attachSession uses sandbox bearer subprotocol", async () => {
 
     readonly url: string;
     readonly protocols: string[];
+    readonly init: { headers?: Record<string, string> } | undefined;
     binaryType = "blob";
     sent: Array<string | Uint8Array> = [];
     closed = false;
     private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
 
-    constructor(url: string, protocols?: string | string[]) {
+    constructor(url: string, protocolsOrInit?: string | string[] | { protocols?: string[]; headers?: Record<string, string> }) {
       this.url = url;
-      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      if (Array.isArray(protocolsOrInit)) {
+        this.protocols = protocolsOrInit;
+        this.init = undefined;
+      } else if (typeof protocolsOrInit === "string") {
+        this.protocols = [protocolsOrInit];
+        this.init = undefined;
+      } else {
+        this.protocols = protocolsOrInit?.protocols ?? [];
+        this.init = protocolsOrInit;
+      }
       FakeWebSocket.instances.push(this);
     }
 
@@ -937,7 +969,8 @@ test("Sandbox attachSession uses sandbox bearer subprotocol", async () => {
     const ws = FakeWebSocket.instances[0];
     assert.ok(ws);
     assert.equal(ws.url, "wss://api.example.com/v1/sandboxes/sb-stream/sessions/ses-1/attach");
-    assert.deepEqual(ws.protocols, ["sandbox.bearer", "pat-token"]);
+    assert.deepEqual(ws.protocols, []);
+    assert.equal(ws.init?.headers?.Authorization, "Bearer pat-token");
 
     ws.emit("open");
     assert.equal(ws.sent[0], JSON.stringify({ type: "resize", cols: 120, rows: 40 }));

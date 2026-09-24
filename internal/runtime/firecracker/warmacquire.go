@@ -89,7 +89,6 @@ func (d *Driver) tryAcquireWarm(
 	req models.CreateSandboxRequest,
 	sandboxID string,
 	snap *TemplateResolution,
-	tapSlot *TapSlot,
 	overlayPath string,
 ) (*models.SandboxRuntimeState, bool, error) {
 	if d.warmPool == nil || req.TemplateID == "" || snap == nil || !snap.HasSnapshot {
@@ -140,7 +139,13 @@ func (d *Driver) tryAcquireWarm(
 		}
 		return nil, false, fmt.Errorf("firecracker runtime: warm tap transfer %s -> %s: %w", slot.ID, sandboxID, err)
 	}
-	tapSlot = transferredSlot
+	// The warm path runs on the pool-transferred TAP (the warm slot's own
+	// TAP, re-owned to this sandbox). No caller-allocated TAP is involved —
+	// Create consults the pool BEFORE its cold-path tap Allocate, so a warm
+	// hit has nothing extra to release. (An earlier tapSlot parameter was
+	// dead — overwritten here before any read — and silently dropped any
+	// slot a caller passed in.)
+	tapSlot := transferredSlot
 	if setter, ok := handle.(warmTapOwnerSetter); ok {
 		setter.setTapOwner(sandboxID)
 	}

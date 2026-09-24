@@ -44,6 +44,11 @@ type recordingWorkerClient struct {
 	stopped         bool
 	instantiateCaps []wasmengine.Capabilities
 	resolvedPort    int
+	// backgroundInvokeCh receives the export of each long-lived (serve) invoke.
+	// It is a channel, not a slice: the serve invoke is fired from a goroutine,
+	// so recording it must not race — and it keeps the struct lock-free, since
+	// other fakes in this package copy recordingWorkerClient by value.
+	backgroundInvokeCh chan string
 }
 
 func (c *recordingWorkerClient) Ping(string) error { return nil }
@@ -59,7 +64,16 @@ func (c *recordingWorkerClient) Instantiate(_ string, caps wasmengine.Capabiliti
 	return nil
 }
 func (c *recordingWorkerClient) Invoke(string, string) error { return nil }
-func (c *recordingWorkerClient) Exec(string, wasmengine.Capabilities, string) (wasmengine.RunResult, error) {
+func (c *recordingWorkerClient) InvokeBackground(_ string, export string) error {
+	if c.backgroundInvokeCh != nil {
+		select {
+		case c.backgroundInvokeCh <- export:
+		default:
+		}
+	}
+	return nil
+}
+func (c *recordingWorkerClient) Exec(context.Context, string, wasmengine.Capabilities, string) (wasmengine.RunResult, error) {
 	return wasmengine.RunResult{}, nil
 }
 func (c *recordingWorkerClient) StopInstance(string) error {

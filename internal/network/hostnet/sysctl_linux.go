@@ -3,6 +3,7 @@
 package hostnet
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -64,7 +65,8 @@ func flushConntrackForIP(ip string) error {
 	return nil
 }
 
-func writeSysctl(path, value string) error {
+// writeSysctl is a test seam over raw sysctl writes.
+var writeSysctl = func(path, value string) error {
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -73,6 +75,62 @@ func writeSysctl(path, value string) error {
 	}
 	if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+// readSysctl is a test seam over raw sysctl reads (verification half of the
+// write+read-back pair ensureForwardingSysctls established).
+var readSysctl = func(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// ensureSandboxIPv6Disabled hard-disables IPv6 on the named sandbox bridge and
+// on every container interface (all = existing, default = created later) via
+// net.ipv6.conf.*.disable_ipv6=1. The egress policy netrules enforces is
+// IPv4-only, so any interface that comes up with IPv6 live fails that policy
+// OPEN — v6 traffic would bypass every per-IP DROP. disable_ipv6 is the cheap
+// correct fix; ip6tables parity is deliberately out of scope. Verified by
+// read-back like ensureForwardingSysctls: a write that silently did not take
+// must not be treated as success.
+func ensureSandboxIPv6Disabled(bridge string) error {
+	bridge = strings.TrimSpace(bridge)
+	if strings.ContainsAny(bridge, "/\\ \t\n") {
+		return fmt.Errorf("bridge name %q contains path separators", bridge)
+	}
+	targets := []string{
+		"/proc/sys/net/ipv6/conf/all/disable_ipv6",
+		"/proc/sys/net/ipv6/conf/default/disable_ipv6",
+	}
+	if bridge != "" {
+		// Per-iface first: it must take effect even if all/default are
+		// already 1 from a previous boot.
+		targets = append([]string{"/proc/sys/net/ipv6/conf/" + bridge + "/disable_ipv6"}, targets...)
+	}
+	for _, path := range targets {
+		if err := writeSysctl(path, "1"); err != nil {
+			return fmt.Errorf("disable ipv6 via %s: %w", path, err)
+		}
+	}
+	// Verify like ensureForwardingSysctls: fail loud rather than ship
+	// sandboxes whose egress policy silently fails open over IPv6. An
+	// absent path means IPv6 is compiled out — there is nothing to fail
+	// open over, so that is a pass (writeSysctl already no-ops on it).
+	for _, path := range targets {
+		got, err := readSysctl(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("verify %s: %w", path, err)
+		}
+		if got != "1" {
+			return fmt.Errorf("sysctl %s = %q after write, want 1; IPv6 would fail the egress policy open", path, got)
+		}
 	}
 	return nil
 }

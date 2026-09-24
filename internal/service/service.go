@@ -1079,6 +1079,13 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 	if id == "" {
 		return nil, errors.New("CreateSandboxWithID: id required")
 	}
+	// The id is caller-supplied (X-Cluster-Create-ID) and is later joined into
+	// host paths (mounts rootfs dirs, runtime state dirs). Reject traversal /
+	// separators here at the service boundary — every runtime path below
+	// trusts this value.
+	if err := mounts.ValidateSandboxID(id); err != nil {
+		return nil, err
+	}
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
 		// The fast path returns a fully-hydrated row — toolbox token included
 		// — so it must never answer a caller that does not own it. A facade
@@ -6329,9 +6336,11 @@ func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandbo
 	if req.DiskGB <= 0 {
 		req.DiskGB = models.DefaultDiskGB
 	}
-	if req.OSUser == "" {
-		req.OSUser = "root"
-	}
+	// OSUser is deliberately NOT defaulted. An empty value means "use the
+	// image's own USER", which is distinct from an explicit "root"; defaulting
+	// to root forced images shipping a non-root USER to run as root and
+	// diverged from warm-pool park slots (pkg/docker/client.go only sends a
+	// User field when the caller asked for one).
 	if req.Env == nil {
 		req.Env = map[string]string{}
 	}

@@ -564,7 +564,7 @@ func TestBuild_WorkDirErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		b, _ := New(cfg)
-		_, err := b.Build(context.Background(), BuildRequest{ImageRef: "ref", OutPath: filepath.Join(t.TempDir(), "out.ext4")})
+		_, err := b.Build(context.Background(), BuildRequest{ImageRef: "docker://ref", OutPath: filepath.Join(t.TempDir(), "out.ext4")})
 		if err == nil || !strings.Contains(err.Error(), "mkdir workdir") {
 			t.Fatalf("Build = %v, want mkdir workdir error", err)
 		}
@@ -578,7 +578,7 @@ func TestBuild_WorkDirErrors(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(work, 0o755) })
 		cfg.WorkDir = work
 		b, _ := New(cfg)
-		_, err := b.Build(context.Background(), BuildRequest{ImageRef: "ref", OutPath: filepath.Join(t.TempDir(), "out.ext4")})
+		_, err := b.Build(context.Background(), BuildRequest{ImageRef: "docker://ref", OutPath: filepath.Join(t.TempDir(), "out.ext4")})
 		if err == nil || !strings.Contains(err.Error(), "mkdtemp") {
 			t.Fatalf("Build = %v, want mkdtemp error", err)
 		}

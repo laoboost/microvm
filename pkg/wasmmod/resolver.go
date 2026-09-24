@@ -3,7 +3,6 @@ package wasmmod
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -73,16 +72,25 @@ func (r *Resolver) resolvePath(ref string) (string, error) {
 	if r.ModulesDir == "" {
 		return "", fmt.Errorf("relative module ref %q requires modules dir", ref)
 	}
+	joined := filepath.Join(r.ModulesDir, ref)
 	// A relative ref must stay under ModulesDir: a module lives there, so "../"
 	// traversal is never legitimate. (Absolute paths remain the explicit
-	// operator escape hatch handled above.) filepath.Join cleans the result, so
-	// a traversing ref resolves above ModulesDir and fails the prefix check.
-	cleaned := filepath.Join(r.ModulesDir, ref)
-	base := filepath.Clean(r.ModulesDir)
-	if cleaned != base && !strings.HasPrefix(cleaned, base+string(os.PathSeparator)) {
-		return "", fmt.Errorf("module ref %q escapes modules dir", ref)
+	// operator escape hatch handled above.) filepath.Join cleans the result,
+	// so a traversing ref resolves above ModulesDir and fails the check below.
+	rel, err := filepath.Rel(r.ModulesDir, joined)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: %q escapes the modules directory", ErrUnsafeModuleRef, ref)
 	}
-	return cleaned, nil
+	return joined, nil
+}
+
+// IsHostPathRef reports whether ref names a host filesystem location
+// (file:// URL or absolute path) rather than a name resolved under the
+// modules directory or a registry ref. Callers on the API path use this to
+// keep host-file access operator-only.
+func IsHostPathRef(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	return strings.HasPrefix(ref, "file://") || filepath.IsAbs(ref)
 }
 
 func (r *Resolver) digestFor(path string) (hexDigest string, size int64, err error) {

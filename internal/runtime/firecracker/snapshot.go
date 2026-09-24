@@ -423,11 +423,17 @@ func (d *Driver) sendVsockOp(ctx context.Context, socketPath string, guestCID ui
 	// arrive until the conn's read deadline fired — burning the full
 	// PostResumeTimeout (~2s) on EVERY post_resume. That single stall was
 	// ~98% of firecracker snapshot-clone create latency (server p50 2030ms,
-	// fc_post_resume 2000ms, measured single-node-fc). The conn already carries
-	// the dial-context read deadline (vsock_dial_linux.go SetDeadline), so a
-	// genuinely hung guest still bails at the bound instead of hanging forever.
-	// We only care that the ack arrived; its content is discarded.
-	_, _ = bufio.NewReader(conn).ReadString('\n')
+	// fc_post_resume 2000ms, measured single-node-fc).
+	//
+	// The read is BOUNDED: the previous bufio.Reader.ReadString buffered a
+	// guest-controlled newline-free stream without limit (the dial deadline
+	// bounds it in time, not bytes). readBoundedLine rejects a line past
+	// maxVsockLineBytes, so a hostile/broken guest cannot OOM the daemon; a
+	// genuinely hung guest still bails on the conn's read deadline
+	// (vsock_dial_linux.go SetDeadline). The ack content itself is discarded.
+	if _, err := readBoundedLine(bufio.NewReader(conn), maxVsockLineBytes); err != nil {
+		return fmt.Errorf("read ack: %w", err)
+	}
 	return nil
 }
 

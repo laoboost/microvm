@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -794,6 +796,57 @@ func TestPersistSandboxMetaMarshalErrorNotPossible(t *testing.T) {
 	}
 }
 
+func TestRuntimeProxyEmptyPublicPath(t *testing.T) {
+	// secure:false + the operator flag: the subject under test is the
+	// empty-publicPath→/envd/ rewrite, not auth (pinned in
+	// runtime_proxy_auth_test.go).
+	t.Setenv("SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME", "1")
+
+	toolboxServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/envd/" {
+			t.Fatalf("path = %q, want /envd/", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer toolboxServer.Close()
+
+	host, portText, err := net.SplitHostPort(strings.TrimPrefix(toolboxServer.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split host: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	runtime := newFakeE2BRuntime()
+	runtime.containerIP = host
+	_, _, handler := newE2BHandlerTestEnvWithRuntime(t, runtime, config.Config{
+		PublicHost:  "sandbox.test",
+		EnableCaddy: false,
+		ToolboxPort: port,
+	})
+
+	createReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","secure":false}`))
+	createResp := httptest.NewRecorder()
+	handler.ServeHTTP(createResp, createReq)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create status = %d", createResp.Code)
+	}
+	var created sandboxResponse
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/e2b/runtime", nil)
+	req.Header.Set("E2b-Sandbox-Id", created.SandboxID)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("runtime root status = %d", rr.Code)
+	}
+}
+
 func TestResolveTemplateAliasLookupStoreError(t *testing.T) {
 	svc, st, _ := newE2BHandlerTestEnv(t)
 	h := newHandlers(Deps{Service: svc})
@@ -940,6 +993,105 @@ func TestCreateSandboxClusterReservedLocalPath(t *testing.T) {
 		strings.NewReader(`{"templateID":"base","timeout":120}`)))
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreateRequestFingerprintAndMetadataHelpers(t *testing.T) {
+	fp, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{Image: "ubuntu:22.04"}, sandboxMeta{
+		TemplateID: "base", TimeoutSeconds: 120, OnTimeout: "kill",
+	})
+	if err != nil || fp == "" {
+		t.Fatalf("fingerprint = %q err=%v", fp, err)
+	}
+	if got := sandboxIDFromFingerprint(fp); got == "" {
+		t.Fatal("expected deterministic sandbox id")
+	}
+	filter, err := parseMetadataFilter("env=prod")
+	if err != nil || filter["env"] != "prod" {
+		t.Fatalf("filter = %v err=%v", filter, err)
+	}
+}
+
+func TestRuntimeProxyWasmRuntimeBranch(t *testing.T) {
+	// secure:false + the operator flag: the subject under test is the wasm
+	// proxy branch, not auth (pinned in runtime_proxy_auth_test.go).
+	t.Setenv("SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME", "1")
+
+	svc, st, handler := newE2BHandlerTestEnv(t)
+	id := createE2BSandbox(t, handler)
+
+	sb, err := svc.GetSandbox(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetSandbox: %v", err)
+	}
+	sb.Runtime = models.RuntimeWasm
+	if err := st.Upsert(context.Background(), sb); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	stateBlob, _ := json.Marshal(compatBlob{Secure: false, OnTimeout: "kill"})
+	if err := st.UpsertCompatState(context.Background(), id, models.FacadeE2B, string(stateBlob)); err != nil {
+		t.Fatalf("UpsertCompatState: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/e2b/runtime/health", nil)
+	req.Header.Set("E2b-Sandbox-Id", id)
+	handler.ServeHTTP(rr, req)
+	if rr.Code == http.StatusOK {
+		t.Fatalf("wasm proxy without driver should fail, got %d", rr.Code)
+	}
+}
+
+func TestRuntimeProxyPublicPathWithoutLeadingSlash(t *testing.T) {
+	// secure:false + the operator flag: the subject under test is the
+	// publicPath→/envd/foo rewrite, not auth (which is pinned in
+	// runtime_proxy_auth_test.go).
+	t.Setenv("SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME", "1")
+
+	toolboxServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/envd/foo" {
+			t.Fatalf("path = %q, want /envd/foo", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer toolboxServer.Close()
+
+	host, portText, err := net.SplitHostPort(strings.TrimPrefix(toolboxServer.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split host: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	runtime := newFakeE2BRuntime()
+	runtime.containerIP = host
+	svc, _, handler := newE2BHandlerTestEnvWithRuntime(t, runtime, config.Config{
+		PublicHost:  "sandbox.test",
+		EnableCaddy: false,
+		ToolboxPort: port,
+	})
+
+	createReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","secure":false}`))
+	createResp := httptest.NewRecorder()
+	handler.ServeHTTP(createResp, createReq)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create status = %d", createResp.Code)
+	}
+	var created sandboxResponse
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	h := newHandlers(Deps{Service: svc})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/e2b/runtimefoo", nil)
+	req.URL.Path = "/e2b/runtimefoo"
+	req.Header.Set("E2b-Sandbox-Id", created.SandboxID)
+	h.runtimeProxy(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("runtime proxy status = %d, body=%s", rr.Code, rr.Body.String())
 	}
 }
 

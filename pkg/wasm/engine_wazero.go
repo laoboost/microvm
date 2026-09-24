@@ -23,6 +23,10 @@ var compileModule = func(r wazero.Runtime, ctx context.Context, b []byte) (wazer
 	return r.CompileModule(ctx, b)
 }
 
+// errEngineClosed is returned by guest-entry calls once Close has begun; the
+// runtime is being torn down and cannot accept new work.
+var errEngineClosed = errors.New("engine closed")
+
 type wazeroEngine struct {
 	// lifecycleMu serializes operations that replace or release runtime state.
 	// callMu/callWG form a publication barrier between InvokeExport and
@@ -97,16 +101,27 @@ func wazeroCompileCacheDir() string {
 // MultiInstanceEngine (engine_multi.go) so both get identical runtime config —
 // notably the same compilation cache, which is what makes a warm compile cheap.
 func newBaseRuntime(ctx context.Context, pages uint32) (wazero.Runtime, error) {
-	// Guests are untrusted. WithCloseOnContextDone is wazero's supported
-	// concurrent Module.Close path: cancellation/deadlines can preempt
-	// CPU-bound guest code rather than pinning an OS thread indefinitely.
+	cfg := wazero.NewRuntimeConfig()
+	// Enable wazero's context-done termination so a guest invocation can be
+	// interrupted (and its module closed from within the call goroutine, where
+	// resource teardown is synchronized) instead of leaving Close to close the
+	// module under a still-running guest. This is what makes the invocation
+	// deadline real for CPU-bound guests and lets Close/StopInstance stop an
+	// in-flight guest before tearing the module down.
 	//
-	// Cost: wazero hashes this flag into the module ID (AssignModuleID),
-	// so enabling it misses every on-disk compile-cache entry compiled
-	// without it. First create of each module on each node after the flip
-	// pays the 2–3s cold compile once, then the new key is cached. Do not
-	// turn the flag off to "fix" that miss — Stop would no longer be safe.
-	cfg := wazero.NewRuntimeConfig().WithCloseOnContextDone(true)
+	// Only ONE-SHOT invocations carry that deadline (see wasm.InvocationContext).
+	// The long-lived serve — a guest _start that blocks in its HTTP accept loop
+	// for the sandbox's whole lifetime — is invoked with a deadline-free context
+	// and is instead bounded by the sandbox lifecycle: StopInstance/Close cancel
+	// it through beginCall/stopInFlight below. Do not wrap the serve in the caps
+	// wall timeout again; it would kill a healthy server at that budget.
+	//
+	// Cost: wazero hashes this flag into the module ID (AssignModuleID), so
+	// enabling it misses every on-disk compile-cache entry compiled without it.
+	// First create of each module on each node after the flip pays the 2–3s cold
+	// compile once, then the new key is cached. Do not turn the flag off to "fix"
+	// that miss — Stop would no longer be safe.
+	cfg = cfg.WithCloseOnContextDone(true)
 	if pages > 0 {
 		cfg = cfg.WithMemoryLimitPages(pages)
 	}
@@ -248,7 +263,7 @@ func (e *wazeroEngine) ensureOpenLocked() error {
 	closed := e.closed
 	e.callMu.Unlock()
 	if closed {
-		return fmt.Errorf("engine is closed")
+		return errEngineClosed
 	}
 	return nil
 }
@@ -267,12 +282,13 @@ func (e *wazeroEngine) publishModule(mod api.Module) {
 // returned callback must always be called. stopActiveLocked first prevents new
 // admissions, then uses wazero's supported concurrent Close path to interrupt
 // the guest, and finally waits for all admitted calls before releasing runtime
-// or compiled-module state.
+// or compiled-module state. Once teardown has begun it fails fast with
+// errEngineClosed rather than racing the release.
 func (e *wazeroEngine) beginCall(ctx context.Context) (api.Module, context.Context, func(), error) {
 	e.callMu.Lock()
 	if e.closed {
 		e.callMu.Unlock()
-		return nil, nil, nil, fmt.Errorf("engine is closed")
+		return nil, nil, nil, errEngineClosed
 	}
 	if e.stopping || e.module == nil {
 		e.callMu.Unlock()
@@ -292,6 +308,11 @@ func (e *wazeroEngine) beginCall(ctx context.Context) (api.Module, context.Conte
 	return mod, callCtx, done, nil
 }
 
+// stopActiveLocked interrupts and awaits any in-flight guest call before
+// releasing the module: wazero closes the module from inside the call goroutine
+// when the call's context is canceled, so stopInFlight waits for a synchronized
+// teardown rather than racing one. Callers hold lifecycleMu, which serializes
+// this against LoadModule/Instantiate.
 func (e *wazeroEngine) stopActiveLocked(ctx context.Context) error {
 	e.callMu.Lock()
 	mod := e.module
@@ -300,7 +321,6 @@ func (e *wazeroEngine) stopActiveLocked(ctx context.Context) error {
 		return nil
 	}
 	e.stopping = true
-	instanceEnd := e.instanceEnd
 	e.callMu.Unlock()
 
 	// Host-network reads do not necessarily observe a Go context while blocked.
@@ -312,10 +332,7 @@ func (e *wazeroEngine) stopActiveLocked(ctx context.Context) error {
 	if e.netHost != nil {
 		e.netHost.closeConns()
 	}
-	if instanceEnd != nil {
-		instanceEnd()
-	}
-	e.callWG.Wait()
+	e.stopInFlight()
 	err := mod.Close(ctx)
 
 	e.callMu.Lock()
@@ -332,6 +349,10 @@ func (e *wazeroEngine) stopActiveLocked(ctx context.Context) error {
 }
 
 func (e *wazeroEngine) InvokeExport(ctx context.Context, name string) error {
+	// No deadline is applied here: the caller decides. The worker passes the
+	// caps wall timeout for a one-shot invoke and a deadline-free context for
+	// the long-lived serve (wasm.InvocationContext). Either way the call is
+	// registered, so StopInstance/Close can interrupt it.
 	mod, callCtx, done, err := e.beginCall(ctx)
 	if err != nil {
 		return err
@@ -383,6 +404,12 @@ func (e *wazeroEngine) Run(ctx context.Context, caps Capabilities, export string
 	if export == "" {
 		export = "_start"
 	}
+	// Run is the one-shot path (MsgExec): it always carries the wall timeout.
+	// The long-lived serve goes through InvokeExport with a caller-supplied
+	// deadline-free context instead.
+	// The call itself is registered by callExport below; registering here would
+	// make the instantiate path wait on this very call while stopping the active
+	// module.
 	invokeCtx, cancel := WithInvocationDeadline(ctx, caps)
 	defer cancel()
 	start := time.Now()
@@ -568,7 +595,27 @@ func (e *wazeroEngine) ResolvedListenPort() (int, bool) {
 
 func (e *wazeroEngine) SupportsListen() bool { return true }
 
+// stopInFlight cancels every in-flight guest invocation and blocks until each
+// has returned. Cancellation makes wazero unwind the call and close the module
+// from within its own goroutine, so the wait is bounded and cannot deadlock:
+// callMu is never held across a guest call, and no host function the guest may
+// be blocked in requires callMu. Cancelling the instance context is what
+// reaches the calls admitted by beginCall, which derive their context from it.
+func (e *wazeroEngine) stopInFlight() {
+	e.callMu.Lock()
+	instanceEnd := e.instanceEnd
+	e.callMu.Unlock()
+
+	if instanceEnd != nil {
+		instanceEnd()
+	}
+	e.callWG.Wait()
+}
+
 func (e *wazeroEngine) Close(ctx context.Context) error {
+	// Refuse new calls, then stop and observe-complete any in-flight guest before
+	// closing the module/runtime — closing wazero state under a running guest
+	// races its descriptor table (the pre-fix data race).
 	e.lifecycleMu.Lock()
 	defer e.lifecycleMu.Unlock()
 	e.callMu.Lock()

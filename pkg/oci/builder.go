@@ -42,10 +42,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 )
+
+// validOCITag matches the OCI tag charset ([A-Za-z0-9_][A-Za-z0-9._-]{0,127}).
+// Tags land unescaped in the skopeo destination ref, so anything looser is an
+// injection surface.
+var validOCITag = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
 
 // stderrTailCap caps how many bytes of subprocess stderr we hold in
 // memory per stage. Head-keep — the first error from a misconfigured
@@ -73,6 +79,11 @@ type Config struct {
 	// Should be on a filesystem with at least 2x the largest image size
 	// in free space (skopeo + umoci both materialize layers).
 	WorkDir string
+	// SkopeoPolicyPath: optional operator-supplied containers-policy.json
+	// passed to skopeo via --policy. Empty means the builder generates an
+	// explicit accept-anything policy under WorkDir (documented as the
+	// trust decision for tenant images).
+	SkopeoPolicyPath string
 }
 
 // Builder is a Config-bound handle for kicking off image builds. The
@@ -178,6 +189,17 @@ func (b *Builder) Build(ctx context.Context, req BuildRequest) (*Result, error) 
 	if req.Tag == "" {
 		req.Tag = "latest"
 	}
+	// ImageRef is tenant-derived and skopeo speaks many transports
+	// (oci-archive:/dir:/docker-archive:/…). Only docker:// may be passed
+	// through: the rest would read local host paths or reach arbitrary
+	// registries over the daemon's network. Bare refs are rejected too —
+	// callers must be explicit about the transport.
+	if !strings.HasPrefix(req.ImageRef, "docker://") {
+		return nil, fmt.Errorf("oci: ImageRef must use the docker:// transport (got %q)", req.ImageRef)
+	}
+	if !validOCITag.MatchString(req.Tag) {
+		return nil, fmt.Errorf("oci: Tag %q is not a valid OCI tag ([A-Za-z0-9_][A-Za-z0-9._-]{0,127})", req.Tag)
+	}
 	if err := os.MkdirAll(b.cfg.WorkDir, 0o755); err != nil {
 		return nil, fmt.Errorf("oci: mkdir workdir: %w", err)
 	}
@@ -224,19 +246,44 @@ func (b *Builder) Build(ctx context.Context, req BuildRequest) (*Result, error) 
 	}, nil
 }
 
-// runSkopeo wraps stage 1. The "--insecure-policy" flag bypasses
-// skopeo's host signature-policy file — production hosts ship a policy
-// that allows-all (signature verification is upstream of this pipeline);
-// the flag keeps the daemon working even when /etc/containers/policy.json
-// is missing (common on minimal base images).
+// runSkopeo wraps stage 1. Signature policy is supplied explicitly via
+// --policy pointing at a generated policy file (visible and replaceable by
+// the operator), instead of the bare --insecure-policy flag which silently
+// disabled skopeo's host policy for every pull. The generated default is
+// accept-anything: signature verification for tenant images is not a
+// feature of this pipeline yet, but the trust decision is now an auditable
+// artifact rather than a flag buried in code.
 func (b *Builder) runSkopeo(ctx context.Context, ref, ociDir, tag string) error {
+	policyPath, err := b.ensurePolicyFile(ociDir)
+	if err != nil {
+		return err
+	}
 	args := []string{
-		"--insecure-policy",
+		"--policy", policyPath,
 		"copy",
 		ref,
 		"oci:" + ociDir + ":" + tag,
 	}
 	return runStage(ctx, "skopeo", b.cfg.SkopeoBin, args)
+}
+
+// defaultSkopeoPolicy is written when the operator has not supplied
+// Config.SkopeoPolicyPath. Kept in sync with the historical
+// --insecure-policy behavior.
+const defaultSkopeoPolicy = `{"default":[{"type":"insecureAcceptAnything"}]}`
+
+// ensurePolicyFile materializes the --policy file. Without an operator
+// Supplied Config.SkopeoPolicyPath the file is written into the per-build
+// staging tree (parent of ociDir) so it is cleaned up with the build.
+func (b *Builder) ensurePolicyFile(ociDir string) (string, error) {
+	if b.cfg.SkopeoPolicyPath != "" {
+		return b.cfg.SkopeoPolicyPath, nil
+	}
+	path := filepath.Join(filepath.Dir(ociDir), "skopeo-policy.json")
+	if err := os.WriteFile(path, []byte(defaultSkopeoPolicy), 0o600); err != nil {
+		return "", fmt.Errorf("oci: write skopeo policy: %w", err)
+	}
+	return path, nil
 }
 
 // runUmoci wraps stage 2. --rootless lets the unpack work without

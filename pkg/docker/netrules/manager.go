@@ -38,9 +38,14 @@ func ruleNotExist(err error) bool {
 // Production always wraps *go-iptables' IPTables; tests substitute an
 // in-memory backend so rule-state semantics (which rules survive an adopt,
 // a clear, a reapply) are assertable without root or a linux host.
+//
+// Insert targets a chain position (per-IP DROPs and policy rules go to the
+// top); Append always lands at the END of the chain (the bridge ACCEPTs —
+// see ensureBridgeForwardAccept for why they must never leapfrog a DROP).
 type RuleBackend interface {
 	Exists(table, chain string, rulespec ...string) (bool, error)
 	Insert(table, chain string, pos int, rulespec ...string) error
+	Append(table, chain string, rulespec ...string) error
 	Delete(table, chain string, rulespec ...string) error
 }
 
@@ -75,6 +80,84 @@ type Manager struct {
 	// bridge + NAT but not FORWARD ACCEPTs (libnetwork did that for docker0),
 	// so it is ours (plan §4 item #5).
 	bridgeSubnet string
+	// bridgeName, when set (SetBridgeName — the docker bridge known from
+	// SB_DOCKER_NETWORK, or the CNI bridge derived from bridgeSubnet), is the
+	// sandbox bridge these rules are installed for. The IPv6 precondition then
+	// probes that bridge's own disable_ipv6 sysctl instead of trusting the
+	// host-wide all/default pair, which cannot see an interface whose IPv6 was
+	// (re-)enabled on its own. Empty = host-wide probe only.
+	bridgeName string
+	// ipv6Disabled verifies the precondition every rule in this package rests
+	// on: the policy is IPv4-only, so if IPv6 is live on the sandbox interfaces
+	// the per-IP DROP/ACCEPT, the bridge ACCEPTs and the link-local (IMDS) DROP
+	// are all bypassable over v6. It is checked on the per-sandbox rule installs
+	// (BlockAllEgressReport / ApplyEgressPolicy — the create-time choke point)
+	// and on the boot-time rule installs: EnsureChain (containerd) and
+	// EnsureLinkLocalDrop (docker). The daemon hard-disables IPv6 on the sandbox
+	// bridges BEFORE any chain work (see daemon.bootSandboxNetworkIsolation), so
+	// gating those installs cannot fail boot on an IPv6-enabled host — and if
+	// that ordering ever regresses, they refuse instead of installing rules whose
+	// isolation silently fails open.
+	//
+	// Set by the production constructors (newEnabledManager); nil means "not
+	// checked" so test seams (NewWithBackend, hand-built Managers) stay
+	// independent of host sysctls.
+	ipv6Disabled func() error
+}
+
+// verifyIPv6Disabled fails closed when the IPv4-only precondition does not
+// hold. A nil probe (test-constructed Manager) is a no-op. See
+// ipv6_precondition.go.
+func (m *Manager) verifyIPv6Disabled() error {
+	if m == nil || m.ipv6Disabled == nil {
+		return nil
+	}
+	if iface := m.sandboxBridgeIface(); iface != "" {
+		if err := verifyIPv6DisabledAt(ipv6DisableSysctlPath(iface)); err != nil {
+			return fmt.Errorf("sandbox bridge %q: %w", iface, err)
+		}
+	}
+	return m.ipv6Disabled()
+}
+
+// sandboxBridgeIface is the interface whose own disable_ipv6 sysctl the
+// precondition must read: the bridge this manager was told about, else the one
+// owning the configured bridge subnet (the containerd manager is built by the
+// engine wiring with the subnet only). Empty means the host-wide pair is all we
+// can check.
+func (m *Manager) sandboxBridgeIface() string {
+	if m == nil {
+		return ""
+	}
+	if m.bridgeName != "" {
+		return m.bridgeName
+	}
+	return bridgeIfaceForSubnet(m.bridgeSubnet)
+}
+
+// SetBridgeName records the sandbox bridge interface these rules are installed
+// for, so the IPv6 precondition reads that bridge's sysctl (see
+// sandboxBridgeIface). Called once at boot by the daemon wiring. A name with a
+// path separator is rejected outright — it is interpolated into a /proc path —
+// and leaves the manager on the host-wide probe.
+func (m *Manager) SetBridgeName(name string) {
+	if m == nil {
+		return
+	}
+	name = strings.TrimSpace(name)
+	if strings.ContainsAny(name, "/\\ \t\n") {
+		return
+	}
+	m.bridgeName = name
+}
+
+// BridgeName is the explicitly configured sandbox bridge interface (empty when
+// the manager was never told one). Read side of SetBridgeName.
+func (m *Manager) BridgeName() string {
+	if m == nil {
+		return ""
+	}
+	return m.bridgeName
 }
 
 // SetBridgeSubnet records the sandbox bridge subnet whose forwarded traffic
@@ -193,6 +276,9 @@ func (m *Manager) BlockAllEgressReport(containerIP string) (bool, error) {
 	if !m.Enabled() || containerIP == "" {
 		return false, nil
 	}
+	if err := m.verifyIPv6Disabled(); err != nil {
+		return false, err
+	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
 
@@ -286,6 +372,9 @@ const egressPolicyComment = "sbx-egress"
 func (m *Manager) ApplyEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
+	}
+	if err := m.verifyIPv6Disabled(); err != nil {
+		return err
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()

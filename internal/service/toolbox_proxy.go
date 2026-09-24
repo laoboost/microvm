@@ -41,6 +41,9 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 		}
 		req := r.Clone(ctx)
 		req.URL.Path = path
+		// Caller's PAT may ride in Sec-WebSocket-Protocol; the sandbox side
+		// authenticates with the per-sandbox token passed below.
+		req.Header.Del("Sec-WebSocket-Protocol")
 		host.ServeToolbox(ctx, sandboxID, sandbox.ToolboxToken, w, req)
 		return nil
 	}
@@ -54,6 +57,9 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 		}
 		req := r.Clone(ctx)
 		req.URL.Path = path
+		// Caller's PAT may ride in Sec-WebSocket-Protocol; the sandbox side
+		// authenticates with the per-sandbox token passed below.
+		req.Header.Del("Sec-WebSocket-Protocol")
 		host.ServeToolbox(ctx, sandboxID, sandbox.ToolboxToken, w, req)
 		return nil
 	}
@@ -76,6 +82,11 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 		if toolboxToken != "" {
 			req.Header.Set("Authorization", "Bearer "+toolboxToken)
 		}
+		// The gateway extracts the caller's PAT from
+		// Sec-WebSocket-Protocol: "sandbox.bearer, <PAT>". Forwarding it would
+		// leak the PAT into the sandbox; the upstream authenticates solely via
+		// the Authorization header set above (docs/exec-streaming.md).
+		req.Header.Del("Sec-WebSocket-Protocol")
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		if s.logger != nil {
@@ -140,6 +151,9 @@ func (s *Service) roundTripWasmToolbox(ctx context.Context, sandbox *models.Sand
 	if sandbox.ToolboxToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sandbox.ToolboxToken)
 	}
+	// Strip the gateway's PAT-carrying subprotocol header before the
+	// request reaches the sandbox side; see ServeToolboxReverseProxy.
+	req.Header.Del("Sec-WebSocket-Protocol")
 	rec := httptest.NewRecorder()
 	host.ServeToolbox(ctx, sandbox.ID, sandbox.ToolboxToken, rec, req)
 	return rec.Result(), nil
@@ -167,5 +181,8 @@ func (s *Service) newNetworkToolboxRequest(ctx context.Context, sandboxID, metho
 	if endpoint.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+endpoint.Token)
 	}
+	// Same trust boundary as the reverse-proxy Director: the caller's PAT may
+	// ride in Sec-WebSocket-Protocol and must never reach the sandbox.
+	req.Header.Del("Sec-WebSocket-Protocol")
 	return req, nil
 }

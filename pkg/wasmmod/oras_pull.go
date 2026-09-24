@@ -89,6 +89,12 @@ func PullSnapshotArtifact(ctx context.Context, cfg ORASPullConfig, registryRef, 
 	// Copy the manifest that was just VERIFIED, by digest. Copying by tag would
 	// resolve it a second time, and a tag that moved in between would restore
 	// a checkpoint nobody checked.
+	//
+	// Referencing the artifact by digest does not narrow what is accepted: the
+	// copy unpacks layers by filename and does not filter on media type, so
+	// both the current (v2) and the legacy (v1) artifact media types still pull
+	// and restore. That is what keeps a rolling upgrade from rejecting
+	// checkpoints written before the media-type bump.
 	if _, err := oras.Copy(ctx, repo, desc.Digest.String(), fs, tag, oras.DefaultCopyOptions); err != nil {
 		return fmt.Errorf("oras pull copy from %s: %w", registryRef, err)
 	}

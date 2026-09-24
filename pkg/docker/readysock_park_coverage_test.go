@@ -103,11 +103,12 @@ func TestCoverage95ParkedListenerExtraPaths(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = pl.Close() })
 		server, client := net.Pipe()
-		pl.connMu.Lock()
+		pl.mu.Lock()
 		pl.conn = server
-		pl.monitorDone = make(chan struct{})
-		pl.connMu.Unlock()
-		go pl.monitorParked(server)
+		monDone := make(chan struct{})
+		pl.monitorDone = monDone
+		pl.mu.Unlock()
+		go pl.monitorParked(server, monDone)
 		_ = client.Close()
 		deadline := time.Now().Add(time.Second)
 		for pl.Alive() && time.Now().Before(deadline) {

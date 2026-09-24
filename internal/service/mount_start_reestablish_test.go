@@ -140,10 +140,10 @@ func TestStartReReadsMountArgumentsFromSpecsAfterStop(t *testing.T) {
 		t.Fatalf("stopSandboxInternal: %v", err)
 	}
 
-	// The operator edits the stored spec while stopped (e.g. loosens the nfs
-	// mount options). The next start must build the mount command from the
-	// STORED spec, not reuse any cached plan.
-	f.specs[0].Options = map[string]string{"opts": "hard,nolock"}
+	// The operator edits the stored spec while stopped (e.g. changes the nfs
+	// mount options to an allowlisted one). The next start must build the
+	// mount command from the STORED spec, not reuse any cached plan.
+	f.specs[0].Options = map[string]string{"opts": "vers=4"}
 	sealed, err := f.svc.sealMounts(f.specs)
 	if err != nil {
 		t.Fatalf("sealMounts: %v", err)
@@ -171,7 +171,7 @@ func TestStartReReadsMountArgumentsFromSpecsAfterStop(t *testing.T) {
 	if !strings.Contains(lines[0], "-o rw") {
 		t.Fatalf("initial mount argv should carry the original opts: %q", lines[0])
 	}
-	if !strings.Contains(lines[1], "-o hard,nolock") {
+	if !strings.Contains(lines[1], "-o vers=4") {
 		t.Fatalf("re-established mount argv must be re-read from the stored spec: %q", lines[1])
 	}
 }

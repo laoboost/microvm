@@ -115,7 +115,7 @@ The same word is used the same way everywhere in the codebase and these docs.
 flowchart LR
     subgraph Host
         SD[sandboxd<br/>:21212 internal<br/>:7002 cluster RPC]
-        CD[caddy<br/>:443 :2019 admin]
+        CD[caddy<br/>:443 (unix admin sock)]
         DK[dockerd]
         SSH[SSH gateway<br/>:2220]
         subgraph Containers
@@ -176,7 +176,7 @@ flowchart TB
     Svc -->|create / start / stop| Docker
     Docker --> Sandbox
     Svc -->|configure routes| CaddyCfg
-    CaddyCfg -->|admin :2019| Caddy
+    CaddyCfg -->|admin unix sock| Caddy
     Svc -->|exec / fs ops| Sandbox
     Svc --> Mounts
     Mounts -.bind mount.-> Sandbox

@@ -15,3 +15,10 @@ func applyJail(*exec.Cmd, JailConfig, []string) (*jailRealized, error) {
 }
 
 func jailRealizable() bool { return false }
+
+// jailCoverage is the exact profile applyJail realizes off Linux: nothing.
+func jailCoverage() string { return "none — jail realization requires linux" }
+
+// seccompApplied is false off Linux; applyJail errors there anyway, so a
+// required jail fails closed before this is consulted.
+func seccompApplied() bool { return false }

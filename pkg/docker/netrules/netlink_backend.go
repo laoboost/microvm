@@ -16,6 +16,7 @@ import (
 type nftAPI interface {
 	GetRules(t *nftables.Table, c *nftables.Chain) ([]*nftables.Rule, error)
 	InsertRule(r *nftables.Rule) *nftables.Rule
+	AddRule(r *nftables.Rule) *nftables.Rule
 	DelRule(r *nftables.Rule) error
 	ListChains() ([]*nftables.Chain, error)
 	AddChain(c *nftables.Chain) *nftables.Chain
@@ -102,6 +103,28 @@ func (b *netlinkBackend) Insert(table, chain string, pos int, rulespec ...string
 	conn.InsertRule(rule)
 	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("nft insert: %w", err)
+	}
+	return nil
+}
+
+func (b *netlinkBackend) Append(table, chain string, rulespec ...string) error {
+	exprs, err := exprsFromRulespec(rulespec...)
+	if err != nil {
+		return err
+	}
+	tbl, ch, err := lookupTableChain(table, chain)
+	if err != nil {
+		return err
+	}
+	conn, err := b.newConn()
+	if err != nil {
+		return err
+	}
+	// AddRule (not InsertRule) puts the rule at the END of the chain — the
+	// bridge ACCEPTs must never leapfrog a per-IP DROP already present.
+	conn.AddRule(&nftables.Rule{Table: tbl, Chain: ch, Exprs: exprs})
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("nft append: %w", err)
 	}
 	return nil
 }

@@ -1,5 +1,7 @@
 package isolate
 
+import "os"
+
 // JailConfig is the OS-confinement request for a group's workerd process. It is
 // projected from the driver's JailSpec (internal/runtime/isolate/jail.go, which
 // this package cannot import), carrying only the primitives the spawner applies.
@@ -80,7 +82,8 @@ type SeccompArgRule struct {
 // JailRealizable is the exported platform-capability check the daemon logs at
 // boot so operators can see whether SB_ISOLATE_USE_JAIL can actually be honored
 // on this host (Linux) or whether isolate creates will fail closed until it is
-// disabled or the host is Linux.
+// disabled or the host is Linux. Realizable is NOT "fully jailed" — see
+// JailCoverage for exactly what is applied.
 func JailRealizable() bool { return jailRealizable() }
 
 // JailWorkerdPath is where the workerd binary lives inside every group chroot.
@@ -90,3 +93,21 @@ const JailWorkerdPath = "/workerd"
 // (sockets, generated config). The supervisor places the host-side RunDir at
 // ChrootDir/JailRunDirName so both sides name the same inodes.
 const JailRunDirName = "run"
+
+// JailCoverage names exactly what applyJail realizes on this platform, so boot
+// logs and Require-failure messages never over-promise. The platform-specific
+// bodies live in host_jail_linux.go / host_jail_other.go because the answer
+// differs: Linux realizes the full profile (chroot, cgroup v2, privilege
+// drop, no-new-privs, seccomp allowlist via the re-exec shim).
+func JailCoverage() string { return jailCoverage() }
+
+// allowWeakJail reports whether the operator explicitly accepted running with
+// Require=true while the seccomp allowlist is NOT actually applied, via
+// SB_ISOLATE_ALLOW_WEAK_JAIL=true. The override is opt-in and loud on purpose.
+func allowWeakJail() bool {
+	switch os.Getenv("SB_ISOLATE_ALLOW_WEAK_JAIL") {
+	case "true", "1":
+		return true
+	}
+	return false
+}

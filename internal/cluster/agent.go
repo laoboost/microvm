@@ -1401,6 +1401,7 @@ func (a *Agent) observePlacementVersion(version uint64) {
 }
 
 func (a *Agent) applyCommand(ctx context.Context, cmd command) error {
+	stampCommandTimes(&cmd)
 	if err := validateCommandRecoverySize(cmd); err != nil {
 		return err
 	}
@@ -1570,33 +1571,20 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		// Code-first sentinel restoration with string-match fallback (C6f);
+		// unmatched bodies keep the raw status error.
+		if classified := classifyInternalError(resp.StatusCode, msg); classified != nil {
+			return classified
+		}
 		message := strings.TrimSpace(string(msg))
-		if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(message, ErrCreateBackpressure.Error()) {
-			return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
-		}
-		if resp.StatusCode == http.StatusServiceUnavailable && (strings.Contains(message, ErrNotLeader.Error()) || strings.Contains(message, "not leader")) {
-			return ErrNotLeader
-		}
-		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrCapacityExceeded.Error()) {
-			return fmt.Errorf("%w: %s", ErrCapacityExceeded, message)
-		}
-		if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(message, ErrNoPlacementTarget.Error()) {
-			return fmt.Errorf("%w: %s", ErrNoPlacementTarget, message)
-		}
-		if resp.StatusCode == http.StatusNotFound && strings.Contains(message, ErrUnknownMember.Error()) {
-			return ErrUnknownMember
-		}
+		// ErrArtifactCatalogSuperseded has no wire code in sentinelErrorCodes
+		// (it is verdict-only, never a listener's own classification), so
+		// classifyInternalError above cannot restore it — match it here.
+		// A publisher has to be able to tell "your token is stale" from a
+		// transient apply failure: one re-seeds, the other retries unchanged.
+		// See ApplyErrorStatus in apply_verdict.go.
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrArtifactCatalogSuperseded.Error()) {
-			// A publisher has to be able to tell "your token is stale" from
-			// a transient apply failure: one re-seeds, the other retries
-			// unchanged. See ApplyErrorStatus in apply_verdict.go.
 			return fmt.Errorf("%w: %s", ErrArtifactCatalogSuperseded, message)
-		}
-		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
-			return ErrMemberStillAlive
-		}
-		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrLastVoter.Error()) {
-			return ErrLastVoter
 		}
 		return statusError{status: resp.StatusCode, message: message}
 	}

@@ -539,7 +539,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 	warmStart := time.Now()
-	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, earlySnap, nil, ""); err != nil {
+	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, earlySnap, ""); err != nil {
 		return nil, err
 	} else if hit {
 		// UC-98's warm-hit marker: fc_warm carries both the acquire
@@ -1224,10 +1224,11 @@ func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID
 	if _, err := conn.Write([]byte(`{"op":"ping"}` + "\n")); err != nil {
 		return fmt.Errorf("vsock write: %w", err)
 	}
-	// Read one line of response. bufio.Reader.ReadBytes('\n') matches
-	// the toolbox's newline-delimited JSON convention.
+	// Read one bounded line of response (the toolbox's newline-delimited
+	// JSON convention). ReadBytes would buffer a newline-free guest stream
+	// without bound; readBoundedLine rejects it at maxVsockLineBytes.
 	reader := bufio.NewReader(conn)
-	line, err := reader.ReadBytes('\n')
+	line, err := readBoundedLine(reader, maxVsockLineBytes)
 	if err != nil {
 		return fmt.Errorf("vsock read: %w", err)
 	}
@@ -1235,8 +1236,8 @@ func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID
 		Ok    bool   `json:"ok"`
 		Error string `json:"error"`
 	}
-	if err := json.Unmarshal(line, &resp); err != nil {
-		return fmt.Errorf("vsock decode: %w (raw=%q)", err, string(line))
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		return fmt.Errorf("vsock decode: %w (raw=%q)", err, line)
 	}
 	if !resp.Ok {
 		if resp.Error == "" {
@@ -1245,6 +1246,45 @@ func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID
 		return fmt.Errorf("vsock handshake rejected: %s", resp.Error)
 	}
 	return nil
+}
+
+// maxVsockLineBytes caps one guest-controlled vsock response line. Matches
+// readyproto.MaxLineBytes: the handshake reply is tiny newline-delimited JSON.
+const maxVsockLineBytes = 4 << 10
+
+// readBoundedLine reads one line like bufio.Reader.ReadBytes('\n') but rejects
+// input longer than max without buffering it in full. ReadSlice returns slices
+// of its fixed buffer instead of allocating on every chunk the way ReadBytes
+// does, so a newline-free stream from the guest is rejected at the cap without
+// ever being buffered in full (OOM hardening; same pattern as readyproto).
+func readBoundedLine(br *bufio.Reader, max int) (string, error) {
+	var raw []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if len(raw)+len(chunk) > max+1 {
+			return "", fmt.Errorf("line exceeds %d bytes", max)
+		}
+		raw = append(raw, chunk...)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(err, io.EOF) && len(raw) > 0 {
+			// Tolerate a final line without a trailing newline.
+			break
+		}
+		return "", err
+	}
+	line := raw
+	if n := len(line); n > 0 && line[n-1] == '\n' {
+		line = line[:n-1]
+	}
+	if len(line) > max {
+		return "", fmt.Errorf("line exceeds %d bytes", max)
+	}
+	return string(line), nil
 }
 
 // vcpuFromRequest rounds the user's fractional CPU request to a whole

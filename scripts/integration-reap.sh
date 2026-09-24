@@ -24,6 +24,9 @@ DEFAULT_TTL_HOURS=4
 now_epoch=$(date +%s)
 
 # Pull running/pending itest instances with their launch time + ttl tag.
+# The JMESPath --query below uses literal backticks; single quotes are required
+# so the shell does not treat them as command substitution.
+# shellcheck disable=SC2016
 instances=$(aws ec2 describe-instances --region "$REGION" \
   --filters "Name=tag:itest,Values=true" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
   --query 'Reservations[].Instances[].{Id:InstanceId,Launch:LaunchTime,Ttl:Tags[?Key==`ttl`]|[0].Value}' \
@@ -34,6 +37,10 @@ echo "$instances" | jq -c '.[]' | while read -r row; do
   launch=$(echo "$row" | jq -r '.Launch')
   ttl=$(echo "$row" | jq -r '.Ttl // empty')
   ttl_hours="${ttl:-$DEFAULT_TTL_HOURS}"
+  if ! [[ "$ttl_hours" =~ ^[0-9]+$ ]]; then
+    echo "skipping ${id}: non-numeric ttl tag $(printf '%q' "$ttl_hours"); reaping by default ttl ${DEFAULT_TTL_HOURS}h" >&2
+    ttl_hours="$DEFAULT_TTL_HOURS"
+  fi
 
   launch_epoch=$(date -d "$launch" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${launch%%.*}" +%s 2>/dev/null || echo 0)
   age_hours=$(( (now_epoch - launch_epoch) / 3600 ))

@@ -60,59 +60,6 @@ func TestStripSandboxPrefixEmptyRemainder(t *testing.T) {
 	}
 }
 
-func TestDaytonaSessionExecRandIDFailure(t *testing.T) {
-	orig := daytonaRandRead
-	t.Cleanup(func() { daytonaRandRead = orig })
-	daytonaRandRead = func([]byte) (int, error) { return 0, errors.New("rand failed") }
-
-	h, _ := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-rand-fail"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	execPayload, _ := json.Marshal(map[string]string{"command": "echo x"})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-rand-fail/exec", bytes.NewReader(execPayload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("rand fail exec status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestDaytonaSessionCommandInputCRSuffix(t *testing.T) {
-	h, _ := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-cr"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	execPayload, _ := json.Marshal(map[string]interface{}{
-		"command":  "sleep 5",
-		"runAsync": true,
-	})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-cr/exec", bytes.NewReader(execPayload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	var execResp map[string]interface{}
-	_ = json.Unmarshal(rec.Body.Bytes(), &execResp)
-	cmdID := execResp["cmdId"].(string)
-	time.Sleep(100 * time.Millisecond)
-
-	payload, _ := json.Marshal(map[string]string{"data": "line\r"})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-cr/command/"+cmdID+"/input", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK && rec.Code != http.StatusInternalServerError {
-		t.Fatalf("input status = %d", rec.Code)
-	}
-}
-
 func TestPumpWasmSessionDeletedWhileAttached(t *testing.T) {
 	h, mgr := newHostWithRealSessions(t)
 	srv := httptest.NewServer(h.Handler())

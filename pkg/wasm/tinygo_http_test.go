@@ -111,3 +111,119 @@ func TestTinygoHTTPModuleRequest(t *testing.T) {
 		t.Fatalf("body=%q", body)
 	}
 }
+
+// Close must interrupt an in-flight guest call and observe it exit before tearing
+// the module down. Closing wazero state under a still-running guest races its
+// descriptor table (TestTinygoHTTPModuleRequest caught that under -race); this
+// pins the contract directly by requiring Close to return instead of hanging
+// behind the guest's accept loop.
+func TestCloseInterruptsInFlightGuest(t *testing.T) {
+	modPath := ensureWasip1HTTPWasm(t)
+	ctx := context.Background()
+	e, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.LoadModule(ctx, modPath, LoadOptions{}); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	caps := Capabilities{
+		WASIListenPort: 0,
+		WASIListenHost: "127.0.0.1",
+		Args:           []string{"wasi", "http"},
+	}
+	if err := e.Instantiate(ctx, caps); err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	port, ok := ResolvedListenPort(e.module)
+	if !ok || port == 0 {
+		t.Fatalf("resolved listen port = %d ok=%v", port, ok)
+	}
+
+	// _start serves forever; leave it blocked in the accept loop, then close.
+	go func() { _ = e.InvokeExport(ctx, "_start") }()
+	resp, err := http.Post(
+		"http://"+net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+		"text/plain",
+		bytes.NewReader([]byte("wazero")),
+	)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp.Body.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- e.Close(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Close blocked behind an in-flight guest; the guest was not interrupted")
+	}
+}
+
+// StopInstance must interrupt the running serve just as Close does. The serve is
+// invoked with a deadline-free context (it is the server, not a request), so
+// nothing about the guest's own context will ever expire: the stop path is the
+// only thing that can end it, via the in-flight call registry (stopInFlight).
+func TestStopInstanceInterruptsInFlightGuest(t *testing.T) {
+	modPath := ensureWasip1HTTPWasm(t)
+	ctx := context.Background()
+	e, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close(ctx) }()
+	if err := e.LoadModule(ctx, modPath, LoadOptions{}); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	caps := Capabilities{
+		WASIListenPort: 0,
+		WASIListenHost: "127.0.0.1",
+		Args:           []string{"wasi", "http"},
+	}
+	if err := e.Instantiate(ctx, caps); err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	port, ok := ResolvedListenPort(e.module)
+	if !ok || port == 0 {
+		t.Fatalf("resolved listen port = %d ok=%v", port, ok)
+	}
+
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- e.InvokeExport(serveCtx, "_start") }()
+	resp, err := http.Post(
+		"http://"+net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+		"text/plain",
+		bytes.NewReader([]byte("wazero")),
+	)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_ = resp.Body.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- e.StopInstance(ctx) }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("StopInstance: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("StopInstance blocked behind the serving guest; the serve was not interrupted")
+	}
+	select {
+	case err := <-serveDone:
+		if err == nil {
+			t.Fatal("serve returned nil after StopInstance; expected the interrupted call to report an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve goroutine still running after StopInstance")
+	}
+}

@@ -26,9 +26,10 @@ import (
 //
 //   - The tick goroutine drains the pending map and executes each
 //     stored op exactly once per tick. Execution is sequential within
-//     a tick so Caddy's single-threaded admin write path is not
-//     hammered, but parallel callers Enqueueing into different (id,
-//     port) keys do not block each other.
+//     a tick AND across concurrent drains (Flush's drain vs. the tick),
+//     so Caddy's single-threaded admin write path is never hammered,
+//     but parallel callers Enqueueing into different (id, port) keys do
+//     not block each other.
 //
 //   - Flush waits for the coalesce window, drains, and waits for the result.
 //     Use for ordering-critical callsites that need a write visible to Caddy
@@ -47,6 +48,11 @@ type caddyCoalescer struct {
 
 	mu      sync.Mutex
 	pending map[coalesceKey]pendingOp
+	// drainMu serializes drain bodies so Caddy admin writes stay strictly
+	// sequential even when Flush's `go c.drain()` races Run's tick drain —
+	// Caddy's single-threaded admin write path must never see two writes
+	// in flight.
+	drainMu sync.Mutex
 
 	stop chan struct{}
 	done chan struct{}
@@ -177,8 +183,12 @@ func (c *caddyCoalescer) enqueue(id string, port int, do func() error, notify ch
 
 // drain takes a snapshot of the pending map, clears it, then executes
 // each op sequentially. The lock is held only while swapping the map
-// so concurrent Enqueues do not block on Caddy admin latency.
+// so concurrent Enqueues do not block on Caddy admin latency. The body
+// runs under drainMu: concurrent drains (Flush's `go c.drain()` vs. the
+// tick) queue up rather than issuing parallel admin writes.
 func (c *caddyCoalescer) drain() {
+	c.drainMu.Lock()
+	defer c.drainMu.Unlock()
 	c.mu.Lock()
 	if len(c.pending) == 0 {
 		c.mu.Unlock()

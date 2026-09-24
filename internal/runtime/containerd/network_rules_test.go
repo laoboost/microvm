@@ -111,6 +111,15 @@ func (m *netrulesMemBackend) Insert(table, chain string, _ int, spec ...string) 
 	return nil
 }
 
+func (m *netrulesMemBackend) Append(table, chain string, spec ...string) error {
+	key := table + "|" + chain
+	for _, s := range spec {
+		key += "|" + s
+	}
+	m.rules = append(m.rules, key)
+	return nil
+}
+
 func (m *netrulesMemBackend) Delete(table, chain string, spec ...string) error {
 	key := table + "|" + chain
 	for _, s := range spec {

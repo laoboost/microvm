@@ -463,7 +463,7 @@ test("internal client decodes API errors", async () => {
   await assert.rejects(() => client.create({ image: "ubuntu:22.04" }), /bad request/);
 });
 
-test("internal client execStream uses sandbox bearer subprotocol", async () => {
+test("internal client execStream authenticates via Authorization header", async () => {
   const originalWebSocket = globalThis.WebSocket;
   const stdoutChunks: Uint8Array[] = [];
   const stderrChunks: Uint8Array[] = [];
@@ -473,14 +473,24 @@ test("internal client execStream uses sandbox bearer subprotocol", async () => {
 
     readonly url: string;
     readonly protocols: string[];
+    readonly init: { headers?: Record<string, string> } | undefined;
     binaryType = "blob";
     sent: Array<string | Uint8Array> = [];
     closed = false;
     private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
 
-    constructor(url: string, protocols?: string | string[]) {
+    constructor(url: string, protocolsOrInit?: string | string[] | { protocols?: string[]; headers?: Record<string, string> }) {
       this.url = url;
-      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      if (Array.isArray(protocolsOrInit)) {
+        this.protocols = protocolsOrInit;
+        this.init = undefined;
+      } else if (typeof protocolsOrInit === "string") {
+        this.protocols = [protocolsOrInit];
+        this.init = undefined;
+      } else {
+        this.protocols = protocolsOrInit?.protocols ?? [];
+        this.init = protocolsOrInit;
+      }
       FakeWebSocket.instances.push(this);
     }
 
@@ -522,7 +532,8 @@ test("internal client execStream uses sandbox bearer subprotocol", async () => {
     const ws = FakeWebSocket.instances[0];
     assert.ok(ws);
     assert.equal(ws.url, "wss://api.example.com/v1/sandboxes/sb-stream/toolbox/process/exec/stream");
-    assert.deepEqual(ws.protocols, ["sandbox.bearer", "pat-token"]);
+    assert.deepEqual(ws.protocols, []);
+    assert.equal(ws.init?.headers?.Authorization, "Bearer pat-token");
 
     ws.emit("open");
     assert.equal(ws.sent[0], JSON.stringify({ command: "npm install", tty: false, cols: 0, rows: 0 }));
@@ -548,14 +559,24 @@ test("internal client execStream close keeps waiting for exit", async () => {
 
     readonly url: string;
     readonly protocols: string[];
+    readonly init: { headers?: Record<string, string> } | undefined;
     binaryType = "blob";
     sent: Array<string | Uint8Array> = [];
     closed = false;
     private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
 
-    constructor(url: string, protocols?: string | string[]) {
+    constructor(url: string, protocolsOrInit?: string | string[] | { protocols?: string[]; headers?: Record<string, string> }) {
       this.url = url;
-      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      if (Array.isArray(protocolsOrInit)) {
+        this.protocols = protocolsOrInit;
+        this.init = undefined;
+      } else if (typeof protocolsOrInit === "string") {
+        this.protocols = [protocolsOrInit];
+        this.init = undefined;
+      } else {
+        this.protocols = protocolsOrInit?.protocols ?? [];
+        this.init = protocolsOrInit;
+      }
       FakeWebSocket.instances.push(this);
     }
 
@@ -614,13 +635,23 @@ test("internal client execStream rejects when stream closes before exit", async 
 
     readonly url: string;
     readonly protocols: string[];
+    readonly init: { headers?: Record<string, string> } | undefined;
     binaryType = "blob";
     sent: Array<string | Uint8Array> = [];
     private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
 
-    constructor(url: string, protocols?: string | string[]) {
+    constructor(url: string, protocolsOrInit?: string | string[] | { protocols?: string[]; headers?: Record<string, string> }) {
       this.url = url;
-      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      if (Array.isArray(protocolsOrInit)) {
+        this.protocols = protocolsOrInit;
+        this.init = undefined;
+      } else if (typeof protocolsOrInit === "string") {
+        this.protocols = [protocolsOrInit];
+        this.init = undefined;
+      } else {
+        this.protocols = protocolsOrInit?.protocols ?? [];
+        this.init = protocolsOrInit;
+      }
       FakeWebSocket.instances.push(this);
     }
 
@@ -672,14 +703,24 @@ test("internal client attachSession close detaches transport", async () => {
 
     readonly url: string;
     readonly protocols: string[];
+    readonly init: { headers?: Record<string, string> } | undefined;
     binaryType = "blob";
     sent: Array<string | Uint8Array> = [];
     closed = false;
     private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
 
-    constructor(url: string, protocols?: string | string[]) {
+    constructor(url: string, protocolsOrInit?: string | string[] | { protocols?: string[]; headers?: Record<string, string> }) {
       this.url = url;
-      this.protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      if (Array.isArray(protocolsOrInit)) {
+        this.protocols = protocolsOrInit;
+        this.init = undefined;
+      } else if (typeof protocolsOrInit === "string") {
+        this.protocols = [protocolsOrInit];
+        this.init = undefined;
+      } else {
+        this.protocols = protocolsOrInit?.protocols ?? [];
+        this.init = protocolsOrInit;
+      }
       FakeWebSocket.instances.push(this);
     }
 
@@ -720,7 +761,8 @@ test("internal client attachSession close detaches transport", async () => {
     handle.close();
 
     assert.equal(ws.url, "wss://api.example.com/v1/sandboxes/sb-stream/sessions/ses-1/attach");
-    assert.deepEqual(ws.protocols, ["sandbox.bearer", "pat-token"]);
+    assert.deepEqual(ws.protocols, []);
+    assert.equal(ws.init?.headers?.Authorization, "Bearer pat-token");
     assert.equal(ws.sent[0], JSON.stringify({ type: "close" }));
     assert.equal(ws.closed, true);
   } finally {

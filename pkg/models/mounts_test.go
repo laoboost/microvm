@@ -11,8 +11,9 @@ func TestMountSpecValidate(t *testing.T) {
 		{Type: MountTypeS3, Source: "bare-bucket-name", Target: "/data"},
 		{Type: MountTypeNFS, Source: "nfs.internal:/exports/work", Target: "/mnt/nfs"},
 		{Type: MountTypeSSHFS, Source: "ubuntu@build-host:/home/ubuntu", Target: "/home/dev"},
-		// Relative remote paths and dashes inside the path stay legal.
-		{Type: MountTypeSSHFS, Source: "deploy@10.0.0.5:data/-cache", Target: "/home/dev"},
+		// Dashes inside an absolute remote path stay legal; a relative remote
+		// path is rejected (see mounts_sshfs_source_test.go).
+		{Type: MountTypeSSHFS, Source: "deploy@10.0.0.5:/data/-cache", Target: "/home/dev"},
 		{Type: MountTypeRclone, Source: "myremote:bucket/prefix", Target: "/workspace"},
 		{Type: MountTypeS3, Source: "s3://my-bucket/-odd-prefix", Target: "/workspace"},
 	}

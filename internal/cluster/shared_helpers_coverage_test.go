@@ -31,3 +31,22 @@ func ownerIndexTree(ids ...string) *btree.BTreeG[string] {
 	}
 	return t
 }
+
+// ownerIndexDigest flattens the btree-backed owner index into ordered slices
+// so a state digest can marshal it. The tree is already ordered, so the
+// encoding is stable across runs — which is what the digest compares.
+func ownerIndexDigest(idx map[string]*btree.BTreeG[string]) map[string][]string {
+	out := make(map[string][]string, len(idx))
+	for node, tree := range idx {
+		if tree == nil {
+			continue
+		}
+		ids := []string{}
+		tree.Ascend(func(id string) bool {
+			ids = append(ids, id)
+			return true
+		})
+		out[node] = ids
+	}
+	return out
+}

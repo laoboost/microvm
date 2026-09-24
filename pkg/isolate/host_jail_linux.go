@@ -24,6 +24,10 @@ import (
 // child between fork and exec — chroot, chdir, drop to uid/gid, no_new_privs,
 // install the filter — and execs workerd inside the chroot. The returned
 // realized describes what was applied so Stop can tear it down.
+//
+// IMPORTANT: this path executes only on Linux hosts and has NOT been exercised
+// in offline CI. It must be validated by the tagged real-host integration test
+// before the jail is trusted for untrusted multi-tenant code.
 func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string) (*jailRealized, error) {
 	if !runningAsRoot() {
 		return nil, errNotRoot
@@ -118,3 +122,15 @@ func jailCloneflags() uintptr { return syscall.CLONE_NEWPID }
 // non-root daemon that reported realizable=true would boot green and then
 // fail every isolate create.
 func jailRealizable() bool { return runningAsRoot() }
+
+// jailCoverage is the exact profile applyJail realizes on Linux.
+func jailCoverage() string {
+	return "chroot + cgroup v2 + uid/gid drop (no supplementary groups) + PR_SET_NO_NEW_PRIVS + seccomp allowlist via the re-exec jail shim"
+}
+
+// seccompApplied reports whether applyJail actually installs a seccomp filter.
+// On Linux it does: buildSeccompProgram resolves the allowlist for this
+// architecture and the shim installs it (seccomp(2), TSYNC) before execve, so
+// even the dynamic loader runs filtered. It is consulted by Host.Start so
+// Require=true can never run with the filter silently missing.
+func seccompApplied() bool { return true }

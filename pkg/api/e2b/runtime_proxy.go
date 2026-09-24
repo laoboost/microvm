@@ -1,10 +1,12 @@
 package e2b
 
 import (
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/store"
@@ -12,6 +14,31 @@ import (
 )
 
 const runtimeProxyPrefix = PathPrefix + "/runtime"
+
+// allowUnauthenticatedRuntime reports whether the operator has opted into
+// the pre-hardening behavior where meta.Secure=false sandboxes accept
+// /e2b/runtime calls with no X-Access-Token. Default (unset) is OFF: the
+// sandbox access token is mandatory because this surface is not wrapped in
+// d.Auth — every request is unauthenticated at the gateway — and the proxy
+// injects the real toolbox token upstream (envd file read/write, exec).
+func allowUnauthenticatedRuntime() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// accessTokenValid compares the request's X-Access-Token against the sandbox
+// toolbox token in constant time — a byte-wise `==` would leak match-prefix
+// length as a timing side channel. Length mismatch (including an empty token
+// on either side) is a non-match.
+func accessTokenValid(got, want string) bool {
+	if got == "" || want == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
 
 func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 	sandboxID := strings.TrimSpace(r.Header.Get("E2b-Sandbox-Id"))
@@ -34,9 +61,16 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	if meta.Secure {
+	// The access token is mandatory: this route is not wrapped in d.Auth, so
+	// the request is unauthenticated at the gateway and the proxy would
+	// otherwise inject the real toolbox token upstream for anyone. Checking
+	// only when meta.Secure is true left Secure=false sandboxes fully open to
+	// unauthenticated envd read/write/exec. The pre-hardening skip is
+	// available only behind the SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME operator
+	// flag (default off).
+	if !(allowUnauthenticatedRuntime() && !meta.Secure) {
 		accessToken := strings.TrimSpace(r.Header.Get("X-Access-Token"))
-		if accessToken == "" || accessToken != sandbox.ToolboxToken {
+		if !accessTokenValid(accessToken, sandbox.ToolboxToken) {
 			WriteError(w, http.StatusUnauthorized, "Unauthorized")
 			return
 		}

@@ -104,6 +104,9 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 		"jail_chroot_base", cfg.IsolateJailChrootBase,
 		"jail_cgroup_root", cfg.IsolateJailCgroupRoot,
 		"seccomp_mode", cfg.IsolateSeccompMode,
+		// Report the ACTUAL coverage (see pkg/isolate.JailCoverage) so
+		// operators never read jail_realizable=true as full confinement.
+		"jail_coverage", pkgisolate.JailCoverage(),
 		"jitless", cfg.IsolateJitless,
 		"idle_ttl", cfg.IsolateGroupIdleTTL,
 		"pool", cfg.IsolatePoolEnabled,

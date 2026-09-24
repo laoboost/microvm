@@ -37,6 +37,10 @@ func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, g
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
 		ClusterInternalListenAddr:     "127.0.0.1:0",
+		// Test clusters run plaintext gossip (no fleet key). Production only
+		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+		// opt-in here so voter-promotion subjects stay exercisable.
+		ClusterInsecureGossip: true,
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -71,6 +75,10 @@ func newTestAgentWithRole(t *testing.T, nodeID, role string, gossipPeers []strin
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
 		ClusterInternalListenAddr:     "127.0.0.1:0",
+		// Test clusters run plaintext gossip (no fleet key). Production only
+		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+		// opt-in here so voter-promotion subjects stay exercisable.
+		ClusterInsecureGossip: true,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a, err := NewAgent(cfg, logger, nil)

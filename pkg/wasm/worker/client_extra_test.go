@@ -268,8 +268,11 @@ func TestClient_ContextErrors_Blocks(t *testing.T) {
 	cancel()
 	_, _ = c.InstanceLoaded(ctx, "sb")
 
-	// Test block read
-	c.dial = func(string) (net.Conn, error) {
+	// Test block read. A second client, not a reassignment of c.dial: the call
+	// above already returned on the canceled ctx, and its dial goroutine may
+	// still be reading c.dial (Go runtime read at client.go roundTripContext).
+	blocked := NewClient("dummy")
+	blocked.dial = func(string) (net.Conn, error) {
 		c1, c2 := net.Pipe()
 		go func() {
 			_, _ = readFrame(c1)
@@ -279,7 +282,7 @@ func TestClient_ContextErrors_Blocks(t *testing.T) {
 	}
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	cancel2()
-	_, _ = c.InstanceLoaded(ctx2, "sb")
+	_, _ = blocked.InstanceLoaded(ctx2, "sb")
 }
 
 func TestClient_RoundTripContext_Canceled(t *testing.T) {

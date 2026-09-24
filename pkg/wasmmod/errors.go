@@ -29,4 +29,8 @@ var (
 	// copy is gone. We fail loudly rather than silently boot different code on
 	// restart/failover (codex C2).
 	ErrModuleDigestMismatch = errors.New("wasm module digest drift")
+	// ErrUnsafeModuleRef: a relative module ref cleaned to a path outside the
+	// configured modules directory. Path-traversal guard — a caller-supplied
+	// ref must never address host files outside the module cache root.
+	ErrUnsafeModuleRef = errors.New("wasm module ref is unsafe")
 )

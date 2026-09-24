@@ -25,12 +25,14 @@ type ParkedListener struct {
 	hostPath       string
 	bootstrapToken string
 	parkNonce      string
-	listener       net.Listener
-	conn           net.Conn
-	connMu         sync.Mutex
-	closed         bool
-	closeMu        sync.Mutex
-	registered     bool
+	// mu guards the whole lifecycle: listener, conn, closed, registered, dead,
+	// monitorDone. One mutex so Close and the readers (Alive/WaitParked/Adopt)
+	// can never interleave on split-lock boundaries.
+	mu         sync.Mutex
+	listener   net.Listener
+	conn       net.Conn
+	closed     bool
+	registered bool
 
 	// Held-connection liveness. The guest sends nothing between its parked
 	// hello and the adopt ack, so a background read on the held conn returns
@@ -118,16 +120,25 @@ func (l *ParkedListener) EnvVars() []string {
 
 // WaitParked accepts one valid parked hello and retains the connection.
 func (l *ParkedListener) WaitParked(ctx context.Context) error {
-	if l == nil || l.listener == nil {
+	if l == nil {
+		return errors.New("park listener is not configured")
+	}
+	l.mu.Lock()
+	ln := l.listener
+	closed := l.closed
+	l.mu.Unlock()
+	if ln == nil || closed {
 		return errors.New("park listener is not configured")
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(30 * time.Second)
 	}
-	_ = l.listener.(*net.UnixListener).SetDeadline(deadline)
+	if ul, ok := ln.(*net.UnixListener); ok {
+		_ = ul.SetDeadline(deadline)
+	}
 
-	conn, err := l.listener.Accept()
+	conn, err := ln.Accept()
 	if err != nil {
 		return fmt.Errorf("park socket accept: %w", err)
 	}
@@ -138,29 +149,35 @@ func (l *ParkedListener) WaitParked(ctx context.Context) error {
 	// verifyParked left a short deadline on the conn; the held connection must
 	// outlive it (the slot may stay parked for hours).
 	_ = conn.SetDeadline(time.Time{})
-	l.connMu.Lock()
+	done := make(chan struct{})
+	l.mu.Lock()
 	l.conn = conn
-	l.monitorDone = make(chan struct{})
-	l.connMu.Unlock()
-	go l.monitorParked(conn)
+	l.monitorDone = done
+	l.mu.Unlock()
+	go l.monitorParked(conn, done)
 	return nil
 }
 
 // monitorParked blocks on the held conn to detect guest death while parked.
-// Any read result other than Adopt's intentional deadline interrupt marks the
-// slot dead: EOF/err means the guest closed, and bytes are a protocol
-// violation (the guest is silent until the host sends the adopt frame, which
-// only happens after this goroutine has exited).
-func (l *ParkedListener) monitorParked(conn net.Conn) {
-	defer close(l.monitorDone)
+// Only Adopt's intentional deadline interrupt (a net.Error with Timeout())
+// leaves the slot alive; EOF/err means the guest closed and bytes are a
+// protocol violation (the guest is silent until the host sends the adopt
+// frame, which only happens after this goroutine has exited). A guest EOF
+// arriving during the adopting window is still death — swallowing it kept
+// dead connections reported Alive and the pool handed out dead warm slots.
+func (l *ParkedListener) monitorParked(conn net.Conn, done chan struct{}) {
+	defer close(done)
 	buf := make([]byte, 1)
 	n, err := conn.Read(buf)
 	if l.adopting.Load() && n == 0 && err != nil {
-		return
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return
+		}
 	}
-	l.connMu.Lock()
+	l.mu.Lock()
 	l.dead = true
-	l.connMu.Unlock()
+	l.mu.Unlock()
 }
 
 func (l *ParkedListener) verifyParked(conn net.Conn) error {
@@ -186,8 +203,8 @@ func (l *ParkedListener) Alive() bool {
 	if l == nil {
 		return false
 	}
-	l.connMu.Lock()
-	defer l.connMu.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.conn != nil && !l.closed && !l.dead
 }
 
@@ -196,10 +213,10 @@ func (l *ParkedListener) Adopt(ctx context.Context, sandboxID, token, adoptNonce
 	if l == nil {
 		return errors.New("park listener is nil")
 	}
-	l.connMu.Lock()
+	l.mu.Lock()
 	conn := l.conn
 	monitorDone := l.monitorDone
-	l.connMu.Unlock()
+	l.mu.Unlock()
 	if conn == nil {
 		return errors.New("park connection is not held")
 	}
@@ -212,9 +229,9 @@ func (l *ParkedListener) Adopt(ctx context.Context, sandboxID, token, adoptNonce
 	if monitorDone != nil {
 		<-monitorDone
 	}
-	l.connMu.Lock()
+	l.mu.Lock()
 	dead := l.dead
-	l.connMu.Unlock()
+	l.mu.Unlock()
 	if dead {
 		return errors.New("parked connection is dead")
 	}
@@ -245,9 +262,9 @@ func (l *ParkedListener) Adopt(ctx context.Context, sandboxID, token, adoptNonce
 		return errors.New("adopt ack token mismatch")
 	}
 	_ = conn.Close()
-	l.connMu.Lock()
+	l.mu.Lock()
 	l.conn = nil
-	l.connMu.Unlock()
+	l.mu.Unlock()
 	return nil
 }
 
@@ -256,18 +273,16 @@ func (l *ParkedListener) Close() error {
 	if l == nil {
 		return nil
 	}
-	l.closeMu.Lock()
-	defer l.closeMu.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.closed {
 		return nil
 	}
 	l.closed = true
-	l.connMu.Lock()
 	if l.conn != nil {
 		_ = l.conn.Close()
 		l.conn = nil
 	}
-	l.connMu.Unlock()
 	if l.registered {
 		activeReadySockets.Delete(l.hostPath)
 		l.registered = false
@@ -275,7 +290,8 @@ func (l *ParkedListener) Close() error {
 	var err error
 	if l.listener != nil {
 		err = l.listener.Close()
-		l.listener = nil
+		// Deliberately not nil-ed: WaitParked readers may still hold the
+		// pointer; closing the net.Listener is enough to unblock them.
 	}
 	_ = os.Remove(l.hostPath)
 	return err

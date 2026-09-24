@@ -116,15 +116,21 @@ func TestInspectAndListManagedSeeRegisteredState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
-	if state != want {
-		t.Fatalf("Inspect = %+v, want the registered state", state)
+	if state == want {
+		t.Fatal("Inspect returned the live record; must return a copy")
+	}
+	if *state != *want {
+		t.Fatalf("Inspect = %+v, want a copy of the registered state", state)
 	}
 	managed, err := d.ListManaged(context.Background())
 	if err != nil {
 		t.Fatalf("ListManaged: %v", err)
 	}
-	if len(managed) != 1 || managed["sb-1"] != want {
-		t.Fatalf("ListManaged = %+v, want the registered state under sb-1", managed)
+	if len(managed) != 1 || managed["sb-1"] == want {
+		t.Fatalf("ListManaged = %+v, want a copy of the registered state under sb-1", managed)
+	}
+	if *managed["sb-1"] != *want {
+		t.Fatalf("ListManaged = %+v, want a copy of the registered state under sb-1", managed)
 	}
 }
 

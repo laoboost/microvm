@@ -24,6 +24,10 @@ type Config struct {
 	// ResidentHostIdleTTL reaps a resident host holding zero instances for this
 	// long; 0 disables the reaper (SB_WASM_RESIDENT_HOST_IDLE_TTL).
 	ResidentHostIdleTTL time.Duration
+	// ToolboxHostExecEnabled turns on the in-process toolbox routes that spawn a
+	// real host process. Default false in production: the wasm runtime has no
+	// process jail, so those routes fail closed with 501.
+	ToolboxHostExecEnabled bool
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.

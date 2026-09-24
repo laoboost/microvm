@@ -21,7 +21,15 @@ type containerdNetnsPool struct {
 	host     *netns.Host
 }
 
-var ensureForwardingSysctls = hostnet.EnsureForwardingSysctls
+var (
+	ensureForwardingSysctls   = hostnet.EnsureForwardingSysctls
+	ensureSandboxIPv6Disabled = hostnet.EnsureSandboxIPv6Disabled
+)
+
+// containerdSandboxBridge is the CNI bridge the native netns slots attach to.
+// Kept as one constant so the IPv6 hard-disable below can never drift from the
+// bridge the conflist actually creates.
+const containerdSandboxBridge = "aerolvm0"
 
 func (p *containerdNetnsPool) Stop() {
 	if p == nil {
@@ -62,7 +70,7 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	// throughput-capped (jumbo uplink) or blackholed via PMTUD (sub-1500 uplink).
 	if err := cni.EnsureBridgeConflist(cfg.ContainerdCNIConfPath, cni.ConflistOptions{
 		Name:   "aerolvm",
-		Bridge: "aerolvm0",
+		Bridge: containerdSandboxBridge,
 		MTU:    cni.UplinkMTU(),
 	}); err != nil {
 		return nil, fmt.Errorf("ensure cni conflist: %w", err)
@@ -77,6 +85,10 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	if err := ensureForwardingSysctls(); err != nil {
 		return nil, fmt.Errorf("host forwarding sysctls: %w", err)
 	}
+	// The sandbox IPv6 hard-disable for this bridge now runs in
+	// bootSandboxNetworkIsolation, before any chain/rule work — and
+	// unconditionally on the rules gate, not only when the native netns pool is
+	// enabled (it used to be skipped entirely on hosts with the pool off).
 	host := &netns.Host{Runner: runner}
 	live := func(ctx context.Context, sandboxID string) bool {
 		if driver == nil {

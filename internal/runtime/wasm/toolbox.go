@@ -24,10 +24,11 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 		return
 	}
 	cfg := toolhost.Config{
-		SandboxID: sandboxID,
-		WorkDir:   inst.workDir,
-		AuthToken: token,
-		Exec:      sandboxExecutor{driver: d, id: sandboxID},
+		SandboxID:       sandboxID,
+		WorkDir:         inst.workDir,
+		AuthToken:       token,
+		Exec:            sandboxExecutor{driver: d, id: sandboxID},
+		HostExecEnabled: d.cfg.ToolboxHostExecEnabled,
 	}
 	if inst.durability == models.DurabilityDurable && d.stateKV != nil {
 		cfg.StateKV = d.stateKV

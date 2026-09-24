@@ -60,7 +60,9 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	}))
 	defer internalSrv.Close()
 
-	follower.setInternalClient(internalSrv.Client())
+	// The mTLS client New installed dials the test server over plain HTTP — the
+	// member index below points the leader's peerInternalURL at it, which is the
+	// internal-channel selection this test pins.
 	follower.gossip.memberIndex.upsert(Member{
 		NodeID:      leader.nodeID,
 		InternalURL: internalSrv.URL,
@@ -665,6 +667,10 @@ func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossi
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterTLSDir:                 tlsDir,
 		ClusterInternalListenAddr:     "127.0.0.1:0",
+		// Test clusters run plaintext gossip (no fleet key). Production only
+		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+		// opt-in here so voter-promotion subjects stay exercisable.
+		ClusterInsecureGossip: true,
 	}, logger, nil)
 	testClusterMu.Unlock()
 	if err != nil {
@@ -701,6 +707,10 @@ func newTestAgentWithTLS(t *testing.T, nodeID, role string, gossipPeers []string
 		ClusterCapacityGossipInterval: time.Second,
 		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
 		ClusterInternalListenAddr:     "127.0.0.1:0",
+		// Test clusters run plaintext gossip (no fleet key). Production only
+		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+		// opt-in here so voter-promotion subjects stay exercisable.
+		ClusterInsecureGossip: true,
 	}, logger, nil)
 	testClusterMu.Unlock()
 	if err != nil {

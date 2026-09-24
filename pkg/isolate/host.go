@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -241,6 +242,11 @@ func (h *Host) Start(ctx context.Context) error {
 	// realize it (or the spec is incomplete), refuse to spawn rather than run
 	// untrusted tenant JS unconfined while the operator believes it is jailed.
 	var realized *jailRealized
+	// LockOSThread keeps any PR_SET_NO_NEW_PRIVS set on this thread (it is a
+	// per-OS-thread attribute inherited at fork) from being lost if the fork
+	// lands on a different thread than the one that applied it.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if h.cfg.Jail.Require {
 		var err error
 		realized, err = applyJail(cmd, h.cfg.Jail, workerdArgs)
@@ -263,6 +269,19 @@ func (h *Host) Start(ctx context.Context) error {
 			_ = realized.teardown()
 			_ = h.stopServers()
 			return err
+		}
+		// Require=true means the FULL confinement. While applyJail realizes
+		// less than that, starting anyway would be false confinement —
+		// fail closed unless the operator explicitly accepted the weak jail.
+		if !seccompApplied() && !allowWeakJail() {
+			_ = realized.teardown()
+			_ = h.stopServers()
+			return fmt.Errorf("isolate: jail Require=true but applyJail realizes %s — refusing to spawn workerd (set SB_ISOLATE_ALLOW_WEAK_JAIL=true to explicitly accept this weak jail, or SB_ISOLATE_USE_JAIL=false to run unjailed)", jailCoverage())
+		}
+		if !seccompApplied() {
+			h.logger.Warn("isolate: running WEAK jail by explicit override",
+				"group", h.cfg.GroupKey, "coverage", jailCoverage(),
+				"override", "SB_ISOLATE_ALLOW_WEAK_JAIL=true")
 		}
 	}
 	if err := cmd.Start(); err != nil {

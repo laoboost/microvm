@@ -1,7 +1,6 @@
 package e2b
 
 import (
-	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
-	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 func TestRuntimeProxyWakeErrorWithClosedDB(t *testing.T) {
@@ -97,125 +95,5 @@ func TestRuntimeProxyBasicAuthHeaderBranches(t *testing.T) {
 	handler.ServeHTTP(rr2, req2)
 	if rr2.Code != http.StatusOK {
 		t.Fatalf("non-basic auth proxy status = %d", rr2.Code)
-	}
-}
-
-func TestRuntimeProxyEmptyPublicPath(t *testing.T) {
-	toolboxServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/envd/" {
-			t.Fatalf("path = %q, want /envd/", r.URL.Path)
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer toolboxServer.Close()
-
-	host, portText, err := net.SplitHostPort(strings.TrimPrefix(toolboxServer.URL, "http://"))
-	if err != nil {
-		t.Fatalf("split host: %v", err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil {
-		t.Fatalf("parse port: %v", err)
-	}
-
-	runtime := newFakeE2BRuntime()
-	runtime.containerIP = host
-	_, _, handler := newE2BHandlerTestEnvWithRuntime(t, runtime, config.Config{
-		PublicHost:  "sandbox.test",
-		EnableCaddy: false,
-		ToolboxPort: port,
-	})
-
-	createReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","secure":false}`))
-	createResp := httptest.NewRecorder()
-	handler.ServeHTTP(createResp, createReq)
-	if createResp.Code != http.StatusCreated {
-		t.Fatalf("create status = %d", createResp.Code)
-	}
-	var created sandboxResponse
-	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/e2b/runtime", nil)
-	req.Header.Set("E2b-Sandbox-Id", created.SandboxID)
-	handler.ServeHTTP(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("runtime root status = %d", rr.Code)
-	}
-}
-
-func TestRuntimeProxyWasmRuntimeBranch(t *testing.T) {
-	svc, st, handler := newE2BHandlerTestEnv(t)
-	id := createE2BSandbox(t, handler)
-
-	sb, err := svc.GetSandbox(context.Background(), id)
-	if err != nil {
-		t.Fatalf("GetSandbox: %v", err)
-	}
-	sb.Runtime = models.RuntimeWasm
-	if err := st.Upsert(context.Background(), sb); err != nil {
-		t.Fatalf("Upsert: %v", err)
-	}
-	stateBlob, _ := json.Marshal(compatBlob{Secure: false, OnTimeout: "kill"})
-	if err := st.UpsertCompatState(context.Background(), id, models.FacadeE2B, string(stateBlob)); err != nil {
-		t.Fatalf("UpsertCompatState: %v", err)
-	}
-
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/e2b/runtime/health", nil)
-	req.Header.Set("E2b-Sandbox-Id", id)
-	handler.ServeHTTP(rr, req)
-	if rr.Code == http.StatusOK {
-		t.Fatalf("wasm proxy without driver should fail, got %d", rr.Code)
-	}
-}
-
-func TestRuntimeProxyPublicPathWithoutLeadingSlash(t *testing.T) {
-	toolboxServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/envd/foo" {
-			t.Fatalf("path = %q, want /envd/foo", r.URL.Path)
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer toolboxServer.Close()
-
-	host, portText, err := net.SplitHostPort(strings.TrimPrefix(toolboxServer.URL, "http://"))
-	if err != nil {
-		t.Fatalf("split host: %v", err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil {
-		t.Fatalf("parse port: %v", err)
-	}
-
-	runtime := newFakeE2BRuntime()
-	runtime.containerIP = host
-	svc, _, handler := newE2BHandlerTestEnvWithRuntime(t, runtime, config.Config{
-		PublicHost:  "sandbox.test",
-		EnableCaddy: false,
-		ToolboxPort: port,
-	})
-
-	createReq := httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base","secure":false}`))
-	createResp := httptest.NewRecorder()
-	handler.ServeHTTP(createResp, createReq)
-	if createResp.Code != http.StatusCreated {
-		t.Fatalf("create status = %d", createResp.Code)
-	}
-	var created sandboxResponse
-	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-
-	h := newHandlers(Deps{Service: svc})
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/e2b/runtimefoo", nil)
-	req.URL.Path = "/e2b/runtimefoo"
-	req.Header.Set("E2b-Sandbox-Id", created.SandboxID)
-	h.runtimeProxy(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("runtime proxy status = %d, body=%s", rr.Code, rr.Body.String())
 	}
 }

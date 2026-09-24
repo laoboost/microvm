@@ -144,10 +144,10 @@ function parseArgs(argv: string[]): CLIOptions {
 	}
 
 	const apiUrl = firstArg(args, "api-url") ?? process.env.SB_API_URL ?? "https://sandbox.aerol.cloud";
-	const patToken = firstArg(args, "pat-token") ?? process.env.SB_PAT_TOKEN ?? "";
+	const patToken = process.env.SB_PAT_TOKEN ?? "";
 	const image = firstArg(args, "image") ?? defaultImage;
 	if (patToken === "") {
-		throw new Error("PAT token is required. Pass --pat-token or set SB_PAT_TOKEN.");
+		throw new Error("PAT token is required. Set SB_PAT_TOKEN (do not pass it on the command line).");
 	}
 
 	return {

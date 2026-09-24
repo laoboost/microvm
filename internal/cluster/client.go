@@ -57,6 +57,12 @@ type Cluster struct {
 	// internalServer is the mTLS HTTPS listener that accepts leader-forwarded
 	// raft applies from peers. nil when tls is nil. Owned by Close.
 	internalServer *internalServer
+	// gossipEncrypted records whether the gossip channel is AES encrypted +
+	// authenticated (a fleet key was configured at construction). Auto
+	// promotion to raft voter is gated on it: gossip claims are self-reported,
+	// so without the shared key any reachable host could otherwise announce
+	// itself and acquire a quorum vote.
+	gossipEncrypted bool
 	// internalClient is an HTTPS client preconfigured with the cluster CA +
 	// our node cert. Used to dial peers' InternalURL when both sides have
 	// TLS material. nil when tls is nil.
@@ -128,6 +134,11 @@ type Cluster struct {
 	// forever on a permanent local failure (image gone, runtime missing,
 	// disk full). Initialized in startOwnerWatcher.
 	recreateFailures *recreateFailureTracker
+	// deliberatelyDeleted is the short-lived tombstone set that stops the
+	// owner watcher from recreating sandboxes destroyed on purpose (C6b) —
+	// e.g. when local destroy succeeded but DeletePlacement failed and left a
+	// Placed row behind. See owner_watcher.go.
+	deliberatelyDeleted *deletedTombstones
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
@@ -187,17 +198,18 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	}
 
 	c := &Cluster{
-		cfg:           cfg,
-		logger:        logger,
-		nodeID:        nodeID,
-		apiURL:        cfg.SelfAPIAdvertiseURL,
-		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
-		fsm:           fsm,
-		raft:          rn,
-		patToken:      cfg.PATToken,
-		commitTimeout: commitTimeout,
-		deadOwners:    newDeadOwnerTracker(),
-		tls:           clusterTLS,
+		cfg:                 cfg,
+		logger:              logger,
+		nodeID:              nodeID,
+		apiURL:              cfg.SelfAPIAdvertiseURL,
+		dataPlaneHost:       cfg.DataPlaneAdvertiseHost,
+		fsm:                 fsm,
+		raft:                rn,
+		patToken:            cfg.PATToken,
+		commitTimeout:       commitTimeout,
+		deadOwners:          newDeadOwnerTracker(),
+		deliberatelyDeleted: newDeletedTombstones(),
+		tls:                 clusterTLS,
 	}
 	fsm.recoveryResolver = c.fetchRecoveryBlob
 
@@ -242,6 +254,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		// boot log shows the deviation from the secure default.
 		logger.Warn("cluster: gossip is unencrypted (SB_CLUSTER_INSECURE_GOSSIP=true); voter auto-promotion will admit any reachable peer — keep raft+gossip ports on a private network")
 	}
+	c.gossipEncrypted = len(secretKey) > 0
 
 	gn, err := setupGossip(gossipSetupConfig{
 		NodeID:         nodeID,
@@ -804,6 +817,15 @@ func (c *Cluster) ResolveCustomDomain(hostname string) (string, bool) {
 }
 
 // DeletePlacement removes sandboxID from the placement map. Idempotent.
+//
+// The deliberately-deleted tombstone is planted BEFORE the raft round-trip:
+// calling DeletePlacement is itself the statement of intent, so the destroy was
+// deliberate regardless of whether the placement row actually cleared. A
+// transient raft failure would otherwise leave the leftover Placed row visible
+// to the owner watcher, which would resurrect the just-deleted sandbox. Doing it
+// here (rather than at each call site) covers every current and future caller by
+// construction.
+//
 // The expected owner/incarnation come from the local FSM — the same source
 // RemoveCustomDomain uses — so a follower destroy does not POST to the Raft
 // leader before the write. applyCommand still commits on the leader; a stale
@@ -817,6 +839,7 @@ func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
 	if sandboxID == "" {
 		return nil
 	}
+	c.MarkDeliberatelyDeleted(sandboxID)
 	placement, ok := c.PlacementOf(sandboxID)
 	if !ok {
 		return nil
@@ -824,6 +847,10 @@ func (c *Cluster) DeletePlacement(ctx context.Context, sandboxID string) error {
 	return c.DeletePlacementExact(ctx, sandboxID, placement.OwnerNodeID, placement.IncarnationID)
 }
 
+// DeletePlacementExact is the fenced form of DeletePlacement. It plants the
+// same deliberately-deleted tombstone: an exact delete is only ever submitted
+// for a placement whose owner committed the destroy, so the intent holds here
+// too and every deliberate-delete caller stays covered.
 func (c *Cluster) DeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {
 	sandboxID = strings.TrimSpace(sandboxID)
 	expectedOwnerNodeID = strings.TrimSpace(expectedOwnerNodeID)
@@ -831,6 +858,7 @@ func (c *Cluster) DeletePlacementExact(ctx context.Context, sandboxID, expectedO
 	if c == nil || c.fsm == nil || sandboxID == "" {
 		return nil
 	}
+	c.MarkDeliberatelyDeleted(sandboxID)
 	if expectedIncarnationID == "" {
 		return fmt.Errorf("%w: exact placement delete requires current incarnation", ErrIncarnationConflict)
 	}
@@ -895,6 +923,19 @@ func (c *Cluster) PruneAuditACL(ctx context.Context, cutoff time.Time) error {
 		return nil
 	}
 	return c.applyCommand(ctx, command{Op: opPruneAuditACL, ExpiresUnix: cutoff.Unix()})
+}
+
+// MarkDeliberatelyDeleted records that sandboxID was destroyed on purpose so
+// the owner watcher will not recreate it, even while a leftover Placed row
+// survives (the destroy-succeeded/DeletePlacement-failed half of the destroy
+// race). Short-lived: the tombstone expires after
+// deliberatelyDeletedTombstoneTTL so a later re-create with the same id is
+// never blocked.
+func (c *Cluster) MarkDeliberatelyDeleted(sandboxID string) {
+	if c == nil {
+		return
+	}
+	c.deliberatelyDeleted.mark(sandboxID, time.Now())
 }
 
 // ReserveOnTarget commits a capacity-and-name reservation for sandboxID
@@ -1090,13 +1131,29 @@ func (c *Cluster) RemoveMember(ctx context.Context, nodeID string, force bool) e
 	if c.raft == nil || c.raft.raft == nil {
 		return ErrUnknownMember
 	}
+	// Self-removal is refused BEFORE the leadership branch so the guard applies
+	// on both paths. A follower that forwarded to the leader would otherwise
+	// have its target compared against the LEADER's id (never equal), pass the
+	// guard on the leader, and get the live follower force-removed — orphaning
+	// everything it owned.
+	if nodeID == c.nodeID {
+		return ErrSelfRemoval
+	}
 	if c.raft.raft.State() != raft.Leader {
 		return c.forwardRemoveMemberToLeader(ctx, nodeID, force)
 	}
-	return c.removeMemberLocal(ctx, nodeID, force)
+	return c.removeMemberLocal(ctx, nodeID, force, false)
 }
 
-func (c *Cluster) removeMemberLocal(ctx context.Context, nodeID string, force bool) error {
+func (c *Cluster) removeMemberLocal(ctx context.Context, nodeID string, force, allowSelf bool) error {
+	// Guard self and leader removal BEFORE any side effect: force-removing
+	// the live leader mid-term orphans every placement it coordinates.
+	if nodeID == c.nodeID && !allowSelf {
+		return ErrSelfRemoval
+	}
+	if leader := c.Leader(); leader != "" && nodeID == leader {
+		return ErrLeaderRemoval
+	}
 	srv, ok := c.configuredServer(nodeID)
 	if !ok {
 		return ErrUnknownMember
@@ -1192,6 +1249,10 @@ func (c *Cluster) doLeaderLifecycle(ctx context.Context, client *http.Client, en
 	}
 	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	message := strings.TrimSpace(string(msg))
+	// Code-first sentinel restoration with string-match fallback (C6f).
+	if classified := classifyInternalError(resp.StatusCode, msg); classified != nil {
+		return classified
+	}
 	switch resp.StatusCode {
 	case http.StatusServiceUnavailable:
 		if strings.Contains(message, ErrNotLeader.Error()) || strings.Contains(message, "not leader") {
@@ -1397,6 +1458,23 @@ func placementCanBeClaimedBy(p Placement, nodeID string) bool {
 	return p.OrphanedOwnerNodeID == "" || p.OrphanedOwnerNodeID == nodeID
 }
 
+// stampCommandTimes fills cmd.NowUnix (and each batch reservation's
+// NowUnix) with the proposer's wall clock when unset. This is the ONLY
+// place a produced raft command acquires its timestamps — Apply must never
+// read a clock, or replicas diverge (see fsm.go command docs). Called from
+// the Cluster/Agent applyCommand entry points, through which every produced
+// command passes.
+func stampCommandTimes(cmd *command) {
+	if cmd.NowUnix == 0 {
+		cmd.NowUnix = time.Now().Unix()
+	}
+	for i := range cmd.Reservations {
+		if cmd.Reservations[i].NowUnix == 0 {
+			cmd.Reservations[i].NowUnix = cmd.NowUnix
+		}
+	}
+}
+
 // applyCommand encodes and submits a raft log entry. On a follower the
 // command is forwarded over HTTP to the current leader's API; the leader
 // applies it on behalf of the caller. This makes mutating raft writes
@@ -1404,6 +1482,7 @@ func placementCanBeClaimedBy(p Placement, nodeID string) bool {
 // DeletePlacement) safe to call from any node — without it, every owner-side
 // caller would have to know whether it's the leader and forward by hand.
 func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
+	stampCommandTimes(&cmd)
 	if err := validateCommandRecoverySize(cmd); err != nil {
 		return err
 	}
@@ -1466,7 +1545,16 @@ func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []by
 	if err := c.admitReservationCommand(cmd); err != nil {
 		return err
 	}
-	return c.applyEncodedLocal(ctx, payload)
+	// Stamp the expired-overwrite decision against the FSM rows visible
+	// right now (under the admission lock, serialized with prior applies)
+	// and re-encode so the decision rides in the log entry. Apply itself
+	// stays a pure function of (prior state, command).
+	c.stampReservationOverwriteDecisions(&cmd)
+	stamped, err := encodeCommand(cmd)
+	if err != nil {
+		return fmt.Errorf("cluster: encode command: %w", err)
+	}
+	return c.applyEncodedLocal(ctx, stamped)
 }
 
 // applyEncodedLocal submits an already-encoded command to the local raft.
@@ -1511,12 +1599,50 @@ func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (
 	return response, nil
 }
 
+// forwardApplyMaxAttempts bounds how many times forwardApplyToLeader will
+// resolve-and-post to the leader for a single command before giving up.
+const forwardApplyMaxAttempts = 3
+
+// forwardApplyRetryable reports whether a failed forward is worth another
+// resolve-and-post: a stale-leader 503 (mapped to ErrNotLeader) or a transport
+// failure where no application-level answer came back (hard-down / mid-
+// handover leader). Definitive application errors (capacity, backpressure,
+// FSM rejection, other statuses) are NOT retried — repeating them cannot
+// change the outcome.
+func forwardApplyRetryable(err error) bool {
+	if errors.Is(err, ErrNotLeader) {
+		return true
+	}
+	var uerr *url.Error
+	return errors.As(err, &uerr)
+}
+
 // forwardApplyToLeader posts an encoded raft command to the current leader's
-// internal apply endpoint. Returns ErrNotLeader if no leader is known (so the
-// caller can surface the same retry semantics as a stale local leader-check).
+// internal apply endpoint. Bounded retry: up to forwardApplyMaxAttempts
+// resolve-and-post rounds, re-resolving the leader (which may have moved) on
+// each round and retrying on ErrNotLeader/transport failures. Returns
+// ErrNotLeader if no leader is known even after the retries (so the caller can
+// surface the same retry semantics as a stale local leader-check).
 //
 // The leader's InternalURL and a node-pinned mTLS client are required.
 func (c *Cluster) forwardApplyToLeader(ctx context.Context, payload []byte) error {
+	var lastErr error
+	for attempt := 1; attempt <= forwardApplyMaxAttempts; attempt++ {
+		err := c.forwardApplyToLeaderOnce(ctx, payload)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !forwardApplyRetryable(err) {
+			return err
+		}
+	}
+	return lastErr
+}
+
+// forwardApplyToLeaderOnce is a single resolve-and-post round of
+// forwardApplyToLeader.
+func (c *Cluster) forwardApplyToLeaderOnce(ctx context.Context, payload []byte) error {
 	leader := c.Leader()
 	if leader == "" {
 		return ErrNotLeader
@@ -1555,6 +1681,13 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	// Code-first sentinel restoration; forwardApplyStatus remains the fallback
+	// for code-less (older-peer / plain-text) bodies and carries the
+	// status-scoped quirks, including the 409 SUPERSEDED verdict that carries
+	// no wire code.
+	if classified := classifyInternalError(resp.StatusCode, body); classified != nil {
+		return classified
+	}
 	return forwardApplyStatus(resp.StatusCode, strings.TrimSpace(string(body)))
 }
 

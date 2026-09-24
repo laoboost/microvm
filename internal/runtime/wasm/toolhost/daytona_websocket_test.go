@@ -14,6 +14,7 @@ import (
 
 // Test handleDaytonaSessionCommandInput error cases.
 func TestDaytonaCommandInputErrors(t *testing.T) {
+	requireHostExec(t)
 	h, mgr := newHostWithRealSessions(t)
 
 	// Create a Daytona session
@@ -76,6 +77,7 @@ func TestDaytonaCommandInputErrors(t *testing.T) {
 
 // Test handleDaytonaSessionDelete and lookupDaytonaSession error cases.
 func TestDaytonaSessionDeleteAndLookupErrors(t *testing.T) {
+	requireHostExec(t)
 	h, mgr := newHostWithRealSessions(t)
 
 	// Create a Daytona session
@@ -125,6 +127,7 @@ func TestDaytonaSessionDeleteAndLookupErrors(t *testing.T) {
 
 // Test streamDaytonaSessionCommandLogs.
 func TestDaytonaStreamCommandLogs(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
@@ -180,6 +183,7 @@ func TestDaytonaStreamCommandLogs(t *testing.T) {
 }
 
 func TestDaytonaAdditionalErrorsAndEdgeCases(t *testing.T) {
+	requireHostExec(t)
 	h, mgr := newHostWithRealSessions(t)
 
 	// Create a Daytona session

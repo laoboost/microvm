@@ -1620,26 +1620,77 @@ func (p PlatformVolumesConfig) Validate() error {
 	return nil
 }
 
+// validateCaddyAdminURL rejects admin endpoints the daemon must never dial:
+// a unix URL with no (or a host-bearing) socket path, a non-loopback http(s)
+// host, or any other scheme. The Caddy admin API is unauthenticated, so the
+// only safe shapes are the unix socket and a loopback TCP address.
+func validateCaddyAdminURL(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return errors.New("SB_CADDY_ADMIN_URL must not be empty")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("SB_CADDY_ADMIN_URL=%q is not a valid URL: %w", raw, err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "unix":
+		// A host component means the operator wrote unix://run/x.sock and forgot
+		// a slash; the client would otherwise silently dial the wrong path.
+		if u.Host != "" {
+			return fmt.Errorf("SB_CADDY_ADMIN_URL=%q must be unix:///path (got a host component, e.g. unix:///run/caddy/caddy-admin.sock)", raw)
+		}
+		if p := strings.TrimSpace(u.Path); p == "" || p == "/" {
+			return fmt.Errorf("SB_CADDY_ADMIN_URL=%q has no unix socket path", raw)
+		}
+	case "http", "https":
+		host := u.Hostname()
+		if host == "" {
+			return fmt.Errorf("SB_CADDY_ADMIN_URL=%q has no host", raw)
+		}
+		if !strings.EqualFold(host, "localhost") {
+			if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+				return fmt.Errorf("SB_CADDY_ADMIN_URL=%q must be loopback (127.0.0.1, ::1, or localhost); the Caddy admin API is unauthenticated", raw)
+			}
+		}
+	default:
+		return fmt.Errorf("SB_CADDY_ADMIN_URL=%q has unsupported scheme %q (want unix:// or a loopback http(s) URL)", raw, u.Scheme)
+	}
+	return nil
+}
+
 func Load() (Config, error) {
 	exe, _ := os.Executable()
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
 	cfg := Config{
-		EnterpriseMode:                    getEnvBool("SB_ENTERPRISE_MODE", false),
-		PATToken:                          strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
-		APIHost:                           getEnv("SB_API_HOST", "0.0.0.0"),
-		APIPort:                           getEnvInt("SB_API_PORT", 21212),
-		Domain:                            normalizeHost(os.Getenv("SB_DOMAIN")),
-		PublicHost:                        normalizeHost(getEnv("SB_PUBLIC_HOST", "127.0.0.1")),
-		CaddyAdminURL:                     getEnv("SB_CADDY_ADMIN_URL", "http://127.0.0.1:2019"),
-		CaddyServerID:                     getEnv("SB_CADDY_SERVER_ID", "srv0"),
-		DBPath:                            getEnv("SB_DB_PATH", "/var/lib/sandboxd/state.db"),
-		DockerNetwork:                     getEnv("SB_DOCKER_NETWORK", "bridge"),
-		ToolboxBinaryPath:                 getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
-		ToolboxMountPath:                  getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
-		ToolboxPort:                       getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
-		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
-		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
+		EnterpriseMode: getEnvBool("SB_ENTERPRISE_MODE", false),
+		PATToken:       strings.TrimSpace(os.Getenv("SB_PAT_TOKEN")),
+		// The plaintext HTTP API carries bearer PATs, so an unset
+		// SB_API_HOST binds loopback only; Caddy reverse-proxies the public
+		// path and nothing else should ever see a PAT on the wire.
+		APIHost:    getEnv("SB_API_HOST", "127.0.0.1"),
+		APIPort:    getEnvInt("SB_API_PORT", 21212),
+		Domain:     normalizeHost(os.Getenv("SB_DOMAIN")),
+		PublicHost: normalizeHost(getEnv("SB_PUBLIC_HOST", "127.0.0.1")),
+		// The Caddy admin API is unauthenticated. The generated Caddyfile
+		// binds it to a unix socket, so that is the default; a loopback
+		// http(s) URL is accepted, anything else is rejected at load.
+		CaddyAdminURL:               getEnv("SB_CADDY_ADMIN_URL", "unix:///run/caddy/caddy-admin.sock"),
+		CaddyServerID:               getEnv("SB_CADDY_SERVER_ID", "srv0"),
+		DBPath:                      getEnv("SB_DB_PATH", "/var/lib/sandboxd/state.db"),
+		DockerNetwork:               getEnv("SB_DOCKER_NETWORK", "bridge"),
+		ToolboxBinaryPath:           getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
+		ToolboxMountPath:            getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
+		ToolboxPort:                 getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
+		IdleTimeoutMinutes:          getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
+		CreateSandboxTimeoutSeconds: getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
+		// SB_CONTAINER_PRIVILEGED runs every sandbox privileged (docker) or
+		// without the OCI restriction profile (containerd). This is a
+		// daemon-wide footgun that disables the whole hardening envelope
+		// (capability bounding, seccomp, device access) for EVERY sandbox on
+		// the node — breaks tenant isolation; never enable on multi-tenant
+		// nodes.
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
 		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 1024),
@@ -2000,6 +2051,9 @@ func Load() (Config, error) {
 
 	if cfg.DBPath == "" {
 		return Config{}, errors.New("SB_DB_PATH is required")
+	}
+	if err := validateCaddyAdminURL(cfg.CaddyAdminURL); err != nil {
+		return Config{}, err
 	}
 	if cfg.OTELMetricsEnabled && cfg.OTELMetricsInterval <= 0 {
 		return Config{}, errors.New("SB_OTEL_METRICS_INTERVAL must be > 0 when OTEL metrics are enabled")

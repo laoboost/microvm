@@ -124,10 +124,12 @@ ALLOW 22000-23000/TCP from anywhere     # Raw-TCP sandbox exposures (only if you
 One command:
 
 ```bash
+# Stage the PAT in a root-only file first — argv is visible in `ps` and shell history.
+sudo install -m 0600 /dev/null /root/pat-token   # then paste the PAT into it
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
   | sudo bash -s -- \
       --domain sandbox.example.com \
-      --pat-token your-secret-pat \
+      --pat-token-file /root/pat-token \
       --dns-provider cloudflare \
       --dns-api-token <cloudflare-token>
 ```
@@ -255,10 +257,12 @@ Re-run the installer with the same flags. The daemon restarts in place; the
 state DB and certs are preserved.
 
 ```bash
+# Stage the PAT in a root-only file first — argv is visible in `ps` and shell history.
+sudo install -m 0600 /dev/null /root/pat-token   # then paste the PAT into it
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
   | sudo bash -s -- \
       --domain sandbox.example.com \
-      --pat-token your-secret-pat \
+      --pat-token-file /root/pat-token \
       --dns-provider cloudflare \
       --dns-api-token <cloudflare-token>
 ```

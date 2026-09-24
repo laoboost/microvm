@@ -27,6 +27,15 @@ func loopbackInspectBody(hostIP string, hostPort int) string {
 
 func okToolbox(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
 
+// captureCreateBodyGetter adapts captureCreateBody to the getter shape several
+// tests expect: install the transport hook, return an accessor for the body.
+func captureCreateBodyGetter(t *testing.T, c *Client) func() []byte {
+	t.Helper()
+	var body []byte
+	captureCreateBody(t, c, &body)
+	return func() []byte { return body }
+}
+
 func captureCreateBody(t *testing.T, c *Client, dst *[]byte) {
 	t.Helper()
 	base := c.httpClient.Transport

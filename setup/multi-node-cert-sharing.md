@@ -175,7 +175,7 @@ sudo ./install.sh \
   --caddy-storage-s3 \
   --caddy-storage-s3-bucket my-caddy-certs \
   --caddy-storage-s3-region us-east-1 \
-  --caddy-storage-s3-encryption-key "$(cat /etc/caddy-shared.key)"
+  --caddy-storage-s3-encryption-key-file /etc/caddy-shared.key
 ```
 
 Pre-conditions:
@@ -187,7 +187,7 @@ Pre-conditions:
   cluster bootstrap, configuration management, secrets manager).
 - For non-EC2 hosts or buckets that don't honour the AWS default
   credential chain, also pass
-  `--caddy-storage-s3-access-key` / `--caddy-storage-s3-secret-key`.
+  `--caddy-storage-s3-access-key-file` / `--caddy-storage-s3-secret-key-file`.
 - For non-AWS endpoints, pass `--caddy-storage-s3-endpoint`.
 
 `install.sh --help` lists the full flag set.

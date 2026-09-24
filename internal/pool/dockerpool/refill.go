@@ -25,7 +25,9 @@ func (p *Pool) Run(ctx context.Context, cfg RefillConfig, spawner Spawner, gate 
 	if cfg.SpawnTimeout <= 0 {
 		cfg.SpawnTimeout = 30 * time.Second
 	}
-	p.SetSpawner(spawner)
+	// The spawner is installed by the daemon wiring (SetSpawner) BEFORE the
+	// loop starts so Acquire-driven discards can destroy containers from the
+	// first moment; a second SetSpawner write here raced with those readers.
 
 	ticker := time.NewTicker(cfg.RefillInterval)
 	idleTicker := time.NewTicker(cfg.RefillInterval)

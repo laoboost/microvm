@@ -40,10 +40,12 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
 Linux:
 
 ```bash
+# Stage the PAT in a root-only file first — argv is visible in `ps` and shell history.
+sudo install -m 0600 /dev/null /root/pat-token   # then paste the PAT into it
 curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
   | sudo bash -s -- \
       --local \
-      --pat-token your-secret-pat
+      --pat-token-file /root/pat-token
 ```
 
 From a source checkout, `./scripts/install.sh --local` builds the binaries

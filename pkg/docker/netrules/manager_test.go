@@ -199,7 +199,40 @@ func (m *memBackend) Exists(table, chain string, spec ...string) (bool, error) {
 	return slices.Contains(m.rules, memKey(table, chain, spec...)), nil
 }
 
-func (m *memBackend) Insert(table, chain string, _ int, spec ...string) error {
+func (m *memBackend) Insert(table, chain string, pos int, spec ...string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := memKey(table, chain, spec...)
+	if pos < 1 {
+		pos = 1
+	}
+	// Model `iptables -I chain pos` faithfully: the rule becomes the pos-th
+	// rule OF ITS CHAIN (1-based). Rule-order assertions depend on this —
+	// an append-only fake cannot express "inserted at position 1".
+	prefix := table + "|" + chain + "|"
+	idx := -1
+	seen := 0
+	for i, r := range m.rules {
+		if strings.HasPrefix(r, prefix) {
+			seen++
+			if seen == pos {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		m.rules = append(m.rules, key)
+		return nil
+	}
+	m.rules = append(m.rules, "")
+	copy(m.rules[idx+1:], m.rules[idx:])
+	m.rules[idx] = key
+	return nil
+}
+
+// Append models `iptables -A chain`: the rule goes to the END of the chain.
+func (m *memBackend) Append(table, chain string, spec ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.rules = append(m.rules, memKey(table, chain, spec...))
@@ -662,11 +695,13 @@ func contains(s, substr string) bool {
 type errBackend struct {
 	existsErr error
 	insertErr error
+	appendErr error
 	deleteErr error
 }
 
 func (e *errBackend) Exists(string, string, ...string) (bool, error) { return false, e.existsErr }
 func (e *errBackend) Insert(string, string, int, ...string) error    { return e.insertErr }
+func (e *errBackend) Append(string, string, ...string) error         { return e.appendErr }
 func (e *errBackend) Delete(string, string, ...string) error         { return e.deleteErr }
 
 func TestEnsureAndDeletePolicyRuleErrors(t *testing.T) {

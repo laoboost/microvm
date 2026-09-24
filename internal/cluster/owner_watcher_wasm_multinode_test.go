@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 // TestWasmDurableFailoverMultiNodeClusterSoak exercises durable WASM placement
@@ -60,6 +62,14 @@ func TestWasmDurableFailoverMultiNodeClusterSoak(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// Fake the follower's death in the leader's failure-detector view: since
+	// C6e the eviction re-checks liveness before every mutation and refuses
+	// to move placements of a node that is back (or never went away).
+	leader.deadOwners.markDead("fol-wasm-soak", time.Now())
+	leader.gossip.memberIndex.replace([]Member{
+		{NodeID: "ldr-wasm-soak", Alive: true, Role: config.NodeRoleMixed, APIURL: leader.apiURL},
+		{NodeID: "fol-wasm-soak", Alive: false, Role: config.NodeRoleMixed, APIURL: follower.apiURL},
+	})
 	leader.evictDeadOwner(ctx, "fol-wasm-soak")
 
 	owner, err := leader.OwnerOf(sandboxID)

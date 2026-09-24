@@ -141,8 +141,19 @@ nodes = {
 
 # --- Optional hardening / extras --------------------------------------------
 
-# Restrict admin access (SSH 22 and operator API 21212) to specific CIDRs.
-# admin_allowed_cidrs = ["203.0.113.42/32"]
+# REQUIRED: restrict admin access (SSH 22, operator API 21212, Grafana 3000) to
+# your operator CIDRs. There is no working default — an empty list fails plan,
+# 0.0.0.0/0 additionally requires allow_public_admin = true, and the RFC 5737
+# documentation value below is REJECTED by the variable validation.
+#
+# REPLACE 203.0.113.42/32 with your own operator CIDR (office or VPN egress)
+# before `terraform plan`: this placeholder is a TEST-NET-3 documentation
+# address and plans that keep it fail loudly rather than silently producing a
+# cluster whose SSH/API/Grafana are reachable from nowhere. See setup/cluster.md.
+admin_allowed_cidrs = ["203.0.113.42/32"]
+# allow_public_admin = true   # ONLY to acknowledge internet-open admin access
+#                              # (lets admin_allowed_cidrs contain 0.0.0.0/0).
+#                              # Keep false.
 
 # Override the public TCP ports opened on ingress-bearing nodes.
 # public_http_ports = [80, 443]

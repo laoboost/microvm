@@ -19,7 +19,17 @@
 #   {{DNS_PROVIDER}}          — DNS provider name passed to --dns-provider
 
 {
-    admin localhost:2019
+    # Admin API on a unix socket, NOT a TCP port. The previous
+    # `admin localhost:2019` was unauthenticated: any local process could
+    # rewrite routes or read cert keys through it.
+    # Permissions: Caddy (the admin listener) creates this socket inside its
+    # own runtime directory; gate access with the DIRECTORY mode — make
+    # /run/caddy 0700 (or 0750 root:caddy) via RuntimeDirectoryMode=0750 or
+    # an ExecStartPre chmod so only the caddy service user and root (sandboxd's
+    # pkg/caddy client) can reach the socket. Socket mode alone is not the
+    # gate. /run/sandboxd is deliberately NOT used: it holds mount credential
+    # keys (SB_MOUNTS_CRED_DIR) and is 0700 root:root.
+    admin unix//run/caddy/caddy-admin.sock
 }
 
 https://{{ROOT_SITE_ADDRESS}} {

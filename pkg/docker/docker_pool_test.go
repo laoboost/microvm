@@ -29,10 +29,14 @@ func TestPoolEligible(t *testing.T) {
 	if !poolEligible(base, nil, 0) {
 		t.Fatal("expected eligible base request")
 	}
-	// Default create path fills OSUser=root via normalizeCreateRequest; that
-	// must remain poolable or every warm-pool create falls through cold.
+	// An unspecified OSUser (the default create shape) runs the image's own
+	// user, exactly like a park slot, so it must stay poolable. An explicit
+	// root is also admitted as the common warmed-image default.
+	if !poolEligible(models.CreateSandboxRequest{Image: "alpine:3.20", DiskGB: 10}, nil, 10) {
+		t.Fatal("expected unspecified OSUser (default create) to be eligible")
+	}
 	if !poolEligible(models.CreateSandboxRequest{Image: "alpine:3.20", OSUser: "root", DiskGB: 10}, nil, 10) {
-		t.Fatal("expected root OSUser (normalize default) to be eligible")
+		t.Fatal("expected root OSUser to be eligible")
 	}
 	if !poolEligible(models.CreateSandboxRequest{Image: "alpine:3.20", OSUser: "ROOT", DiskGB: 10}, nil, 10) {
 		t.Fatal("expected case-insensitive root OSUser to be eligible")
@@ -137,6 +141,11 @@ func (m *memRuleBackend) Exists(table, chain string, spec ...string) (bool, erro
 }
 
 func (m *memRuleBackend) Insert(table, chain string, _ int, spec ...string) error {
+	m.rules = append(m.rules, ruleKey(table, chain, spec...))
+	return nil
+}
+
+func (m *memRuleBackend) Append(table, chain string, spec ...string) error {
 	m.rules = append(m.rules, ruleKey(table, chain, spec...))
 	return nil
 }

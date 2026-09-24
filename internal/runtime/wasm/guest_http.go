@@ -19,15 +19,15 @@ type GuestListenPortSyncer interface {
 // Port 0 requests an ephemeral guest bind; the resolved host port is stored on
 // the instance and ProxyHTTP dials via guestPort=0.
 func (d *Driver) SyncGuestListenPorts(ctx context.Context, sandboxID string, ports []int) error {
-	inst, err := d.instance(sandboxID)
+	inst, snap, err := d.snapshotInstance(sandboxID)
 	if err != nil {
 		return err
 	}
-	if inst.status != models.SandboxStatusStarted {
+	if snap.status != models.SandboxStatusStarted {
 		return nil
 	}
 	listenPort := wasip1ListenPort(ports)
-	if inst.fromResidentHost {
+	if snap.fromResidentHost {
 		if listenPort == wasmengine.WASIListenPortDisabled {
 			// Resident sandboxes are non-listen by construction — there is no
 			// listener to disable, so an unexpose is a no-op (do not send a
@@ -41,22 +41,22 @@ func (d *Driver) SyncGuestListenPorts(ctx context.Context, sandboxID string, por
 			return fmt.Errorf("migrate resident sandbox %q for expose: %w", sandboxID, err)
 		}
 	}
-	client := d.newWorkerClient(inst.socketPath)
+	client := d.newWorkerClient(snap.socketPath)
 	return d.syncGuestListenPort(ctx, inst, client, listenPort)
 }
 
 func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
-	inst, err := d.instance(sandboxID)
+	_, snap, err := d.snapshotInstance(sandboxID)
 	if err != nil {
 		return err
 	}
-	if inst.status != models.SandboxStatusStarted {
+	if snap.status != models.SandboxStatusStarted {
 		return fmt.Errorf("wasm sandbox %q is not started", sandboxID)
 	}
-	client := d.newWorkerClient(inst.socketPath)
+	client := d.newWorkerClient(snap.socketPath)
 	// Ephemeral wasip1 guests listen on resolvedListenPort; ProxyHTTP(0) dials caps.
 	proxyPort := guestPort
-	if inst.resolvedListenPort > 0 {
+	if snap.resolvedListenPort > 0 {
 		proxyPort = 0
 	}
 	return client.ProxyHTTP(sandboxID, proxyPort, w, r)

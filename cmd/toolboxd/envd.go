@@ -661,8 +661,7 @@ func (s *server) handleEnvdProcessConnect(w http.ResponseWriter, r *http.Request
 
 func (s *server) handleEnvdProcessUpdate(w http.ResponseWriter, r *http.Request) {
 	var req envdUpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeEnvdError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeEnvdError) {
 		return
 	}
 	_, sess, ok := s.lookupEnvdProcessSessionFromSelector(w, req.Process)
@@ -682,8 +681,7 @@ func (s *server) handleEnvdProcessUpdate(w http.ResponseWriter, r *http.Request)
 
 func (s *server) handleEnvdProcessSendInput(w http.ResponseWriter, r *http.Request) {
 	var req envdSendInputRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeEnvdError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeEnvdError) {
 		return
 	}
 	state, sess, ok := s.lookupEnvdProcessSessionFromSelector(w, req.Process)
@@ -716,8 +714,7 @@ func (s *server) handleEnvdProcessSendInput(w http.ResponseWriter, r *http.Reque
 
 func (s *server) handleEnvdProcessSendSignal(w http.ResponseWriter, r *http.Request) {
 	var req envdSendSignalRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeEnvdError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeEnvdError) {
 		return
 	}
 	_, sess, ok := s.lookupEnvdProcessSessionFromSelector(w, req.Process)
@@ -738,8 +735,7 @@ func (s *server) handleEnvdProcessSendSignal(w http.ResponseWriter, r *http.Requ
 
 func (s *server) handleEnvdProcessCloseStdin(w http.ResponseWriter, r *http.Request) {
 	var req envdCloseStdinRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeEnvdError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeEnvdError) {
 		return
 	}
 	state, sess, ok := s.lookupEnvdProcessSessionFromSelector(w, req.Process)
@@ -868,8 +864,7 @@ func (s *server) lookupEnvdProcessSessionFromSelector(w http.ResponseWriter, sel
 
 func (s *server) handleEnvdFilesystemStat(w http.ResponseWriter, r *http.Request) {
 	var req envdStatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeEnvdError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeEnvdError) {
 		return
 	}
 	targetPath, err := resolveDaytonaPath(req.Path, false)
@@ -887,8 +882,7 @@ func (s *server) handleEnvdFilesystemStat(w http.ResponseWriter, r *http.Request
 
 func (s *server) handleEnvdFilesystemMakeDir(w http.ResponseWriter, r *http.Request) {
 	var req envdMakeDirRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeEnvdError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeEnvdError) {
 		return
 	}
 	targetPath, err := resolveDaytonaPath(req.Path, false)
@@ -921,8 +915,7 @@ func (s *server) handleEnvdFilesystemMakeDir(w http.ResponseWriter, r *http.Requ
 
 func (s *server) handleEnvdFilesystemMove(w http.ResponseWriter, r *http.Request) {
 	var req envdMoveRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeEnvdError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeEnvdError) {
 		return
 	}
 	source, err := resolveDaytonaPath(req.Source, false)
@@ -953,8 +946,7 @@ func (s *server) handleEnvdFilesystemMove(w http.ResponseWriter, r *http.Request
 
 func (s *server) handleEnvdFilesystemListDir(w http.ResponseWriter, r *http.Request) {
 	var req envdListDirRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeEnvdError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeEnvdError) {
 		return
 	}
 	if req.Depth == 0 {
@@ -975,8 +967,7 @@ func (s *server) handleEnvdFilesystemListDir(w http.ResponseWriter, r *http.Requ
 
 func (s *server) handleEnvdFilesystemRemove(w http.ResponseWriter, r *http.Request) {
 	var req envdRemoveRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeEnvdError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req, writeEnvdError) {
 		return
 	}
 	targetPath, err := resolveDaytonaPath(req.Path, false)

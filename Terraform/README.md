@@ -35,7 +35,9 @@ repo root:
 cp config/terraform.tfvars.example config/terraform.tfvars
 cp config/secrets.example.yml      config/secrets.yml
 # then edit:
-#   config/terraform.tfvars  -> AWS placement, instance sizing, node list
+#   config/terraform.tfvars  -> admin_allowed_cidrs (REQUIRED; the shipped
+#                               RFC 5737 placeholder is rejected by validation),
+#                               AWS placement, instance sizing, node list
 #   config/cluster.yml       -> ingress.domain_name, ingress.acme_email, mirror/auto_import/...
 #   config/secrets.yml       -> cluster.pat_token, cloudflare.api_token, aocr.*, fleet.token
 scripts/terraform.sh init

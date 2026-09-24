@@ -976,6 +976,12 @@ func (c *slowInvokeClient) Invoke(string, string) error {
 	return nil
 }
 
+// startGuestEntryAsync runs the entry through the background (serve) invoke.
+func (c *slowInvokeClient) InvokeBackground(string, string) error {
+	close(c.done)
+	return nil
+}
+
 func TestStartGuestEntryAsyncCompletes(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
 	done := make(chan struct{})

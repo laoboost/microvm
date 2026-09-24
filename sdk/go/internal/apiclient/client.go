@@ -135,6 +135,13 @@ func (c *Client) versioned(suffix string) string {
 	return c.versionPrefix + suffix
 }
 
+// resourcePath percent-escapes a caller-supplied ID so it always stays a
+// single URL path segment. Without this, an ID like "x/../admin" traverses
+// out of its route when concatenated into a request path.
+func resourcePath(id string) string {
+	return url.PathEscape(id)
+}
+
 // VersionPrefix exposes the active version's URL prefix so files in the same
 // package (sessions.go, exec_stream.go) can build URLs without each
 // re-implementing the helper. It is intentionally not exported outside the
@@ -150,9 +157,8 @@ func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, stri
 }
 
 // BuildImagePushSpec is the wire shape of the per-request push directive
-// sent to /v1/images/build. Mirrors the v1 server DTO; credentials are
-// forwarded to the daemon as a one-shot X-Registry-Auth header on the
-// underlying push call and are never persisted on the server.
+// sent to /v1/images/build. Mirrors the v1 server DTO; credentials travel in
+// the request body and are never persisted on the server.
 type BuildImagePushSpec struct {
 	Registry string
 	Tag      string
@@ -387,7 +393,7 @@ func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
 // GetWithOptions fetches a sandbox; includeEnv appends ?include_env=true.
 func (c *Client) GetWithOptions(ctx context.Context, id string, includeEnv bool) (*Sandbox, error) {
 	var response models.Sandbox
-	path := c.versionPrefix + "/sandboxes/" + id + buildSandboxQuery(nil, includeEnv)
+	path := c.versionPrefix + "/sandboxes/" + resourcePath(id) + buildSandboxQuery(nil, includeEnv)
 	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
 		return nil, err
 	}
@@ -396,7 +402,7 @@ func (c *Client) GetWithOptions(ctx context.Context, id string, includeEnv bool)
 
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/start", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/start", nil, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -404,7 +410,7 @@ func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 
 func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/stop", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/stop", nil, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -412,7 +418,7 @@ func (c *Client) Stop(ctx context.Context, id string) (*Sandbox, error) {
 
 func (c *Client) CreateSnapshot(ctx context.Context, id, name string) (SandboxSnapshot, error) {
 	var response models.SandboxSnapshot
-	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/snapshot", models.CreateSandboxSnapshotRequest{Name: name}, &response)
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/snapshot", models.CreateSandboxSnapshotRequest{Name: name}, &response)
 	return response, err
 }
 
@@ -481,7 +487,7 @@ func (c *Client) RegisterSnapshot(ctx context.Context, opts RegisterSnapshotOpti
 }
 
 func (c *Client) Destroy(ctx context.Context, id string) error {
-	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/sandboxes/"+id, nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/sandboxes/"+resourcePath(id), nil, nil)
 }
 
 // CreateTemplate registers a Firecracker rootfs template. Returns a 202-shape
@@ -508,12 +514,12 @@ func (c *Client) ListTemplates(ctx context.Context) ([]models.Template, error) {
 
 func (c *Client) GetTemplate(ctx context.Context, id string) (models.Template, error) {
 	var response models.Template
-	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/templates/"+id, nil, &response)
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/templates/"+resourcePath(id), nil, &response)
 	return response, err
 }
 
 func (c *Client) DeleteTemplate(ctx context.Context, id string) error {
-	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/templates/"+id, nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/templates/"+resourcePath(id), nil, nil)
 }
 
 // CreateWasmModule resolves module_ref on this host and upserts the catalogue.
@@ -538,12 +544,12 @@ func (c *Client) ListWasmModules(ctx context.Context) ([]models.WasmModule, erro
 
 func (c *Client) GetWasmModule(ctx context.Context, id string) (models.WasmModule, error) {
 	var response models.WasmModule
-	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/wasm-modules/"+id, nil, &response)
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/wasm-modules/"+resourcePath(id), nil, &response)
 	return response, err
 }
 
 func (c *Client) DeleteWasmModule(ctx context.Context, id string) error {
-	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/wasm-modules/"+id, nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/wasm-modules/"+resourcePath(id), nil, nil)
 }
 
 // PushWasmModule uploads a compiled core-wasip1 module to the registry under
@@ -600,7 +606,7 @@ func (c *Client) PushWasmModule(ctx context.Context, opts models.PushWasmModuleO
 // failed — those need delete+recreate today).
 func (c *Client) RebuildTemplate(ctx context.Context, id string) (models.Template, error) {
 	var response models.Template
-	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/templates/"+id+"/rebuild", nil, &response)
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/templates/"+resourcePath(id)+"/rebuild", nil, &response)
 	return response, err
 }
 
@@ -610,7 +616,7 @@ func (c *Client) Reconcile(ctx context.Context) error {
 
 func (c *Client) Resize(ctx context.Context, id string, opts ResizeOptions) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/resize", opts, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/resize", opts, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -623,7 +629,7 @@ func (c *Client) Resize(ctx context.Context, id string, opts ResizeOptions) (*Sa
 func (c *Client) UpdateLifecycle(ctx context.Context, id string, lifecycle models.Lifecycle) (*Sandbox, error) {
 	var response models.Sandbox
 	body := models.UpdateLifecycleRequest{Lifecycle: lifecycle}
-	if err := c.doJSON(ctx, http.MethodPut, c.versionPrefix+"/sandboxes/"+id+"/lifecycle", body, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPut, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/lifecycle", body, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -633,7 +639,7 @@ func (c *Client) Mounts(ctx context.Context, id string) ([]models.MountSpecRedac
 	var response struct {
 		Mounts []models.MountSpecRedacted `json:"mounts"`
 	}
-	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/mounts", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/mounts", nil, &response); err != nil {
 		return nil, err
 	}
 	return response.Mounts, nil
@@ -647,13 +653,13 @@ type CloneGeneration struct {
 
 func (c *Client) CloneGeneration(ctx context.Context, id string) (CloneGeneration, error) {
 	var response CloneGeneration
-	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/toolbox/clone-generation", nil, &response)
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/toolbox/clone-generation", nil, &response)
 	return response, err
 }
 
 func (c *Client) GetNetworkUsage(ctx context.Context, id string) (models.NetworkUsage, error) {
 	var response models.NetworkUsage
-	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/network/usage", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/network/usage", nil, &response); err != nil {
 		return models.NetworkUsage{}, err
 	}
 	return response, nil
@@ -661,7 +667,7 @@ func (c *Client) GetNetworkUsage(ctx context.Context, id string) (models.Network
 
 func (c *Client) SetNetworkLimits(ctx context.Context, id string, request models.UpdateNetworkLimitsRequest) (models.NetworkUsage, error) {
 	var response models.NetworkUsage
-	if err := c.doJSON(ctx, http.MethodPatch, c.versionPrefix+"/sandboxes/"+id+"/network/limits", request, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPatch, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/network/limits", request, &response); err != nil {
 		return models.NetworkUsage{}, err
 	}
 	return response, nil
@@ -669,7 +675,7 @@ func (c *Client) SetNetworkLimits(ctx context.Context, id string, request models
 
 func (c *Client) Exec(ctx context.Context, id string, request ExecRequest) (ExecResult, error) {
 	var response ExecResult
-	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/toolbox/process/execute", request, &response)
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/toolbox/process/execute", request, &response)
 	return response, err
 }
 
@@ -688,14 +694,14 @@ func (c *Client) UploadFile(ctx context.Context, id, targetPath string, data []b
 		return err
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/upload", &body)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/toolbox/files/upload", &body)
 	if err != nil {
 		return err
 	}
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	c.addAuth(request)
 
-	response, err := c.httpClient.Do(request)
+	response, err := c.do(request)
 	if err != nil {
 		return err
 	}
@@ -733,7 +739,7 @@ func (c *Client) UploadFileStream(ctx context.Context, id, targetPath string, r 
 		}())
 	}()
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/upload", pr)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/toolbox/files/upload", pr)
 	if err != nil {
 		return err
 	}
@@ -756,7 +762,7 @@ func (c *Client) UploadFileStream(ctx context.Context, id, targetPath string, r 
 // first window of a large file, say) ends the transfer. The request retries
 // like any other GET until the response headers arrive.
 func (c *Client) DownloadFileStream(ctx context.Context, id, targetPath string) (io.ReadCloser, error) {
-	path := c.versionPrefix + "/sandboxes/" + id + "/toolbox/files/download?path=" + url.QueryEscape(targetPath)
+	path := c.versionPrefix + "/sandboxes/" + resourcePath(id) + "/toolbox/files/download?path=" + url.QueryEscape(targetPath)
 	response, err := c.doWithRetry(ctx, func() (*http.Request, error) {
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 		if err != nil {
@@ -777,13 +783,13 @@ func (c *Client) DownloadFileStream(ctx context.Context, id, targetPath string) 
 
 func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byte, error) {
 	encodedPath := url.QueryEscape(targetPath)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/download?path="+encodedPath, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/toolbox/files/download?path="+encodedPath, nil)
 	if err != nil {
 		return nil, err
 	}
 	c.addAuth(request)
 
-	response, err := c.httpClient.Do(request)
+	response, err := c.do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -804,12 +810,12 @@ func (c *Client) ExposePort(ctx context.Context, id string, port int, protocol s
 		body = map[string]string{"protocol": protocol}
 	}
 	var response ExposeResult
-	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", id, port), body, &response)
+	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", resourcePath(id), port), body, &response)
 	return response, err
 }
 
 func (c *Client) UnexposePort(ctx context.Context, id string, port int) error {
-	return c.doJSON(ctx, http.MethodDelete, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", id, port), nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", resourcePath(id), port), nil, nil)
 }
 
 // customDomainsEnvelope mirrors the {"custom_domains":[...]} shape used by
@@ -829,7 +835,7 @@ type customDomainsEnvelope struct {
 func (c *Client) AddCustomDomain(ctx context.Context, id, hostname string, targetPort int) ([]models.CustomDomain, error) {
 	body := models.AddCustomDomainRequest{Hostname: hostname, TargetPort: targetPort}
 	var response customDomainsEnvelope
-	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/custom-domains", body, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/custom-domains", body, &response); err != nil {
 		return nil, err
 	}
 	return response.CustomDomains, nil
@@ -839,14 +845,14 @@ func (c *Client) AddCustomDomain(ctx context.Context, id, hostname string, targe
 // and other DNS-legal characters survive the path round-trip; the server
 // re-normalizes (lowercase, trim trailing dot) before comparing.
 func (c *Client) RemoveCustomDomain(ctx context.Context, id, hostname string) error {
-	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/sandboxes/"+id+"/custom-domains/"+url.PathEscape(hostname), nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/custom-domains/"+resourcePath(hostname), nil, nil)
 }
 
 // ListCustomDomains returns the per-hostname rows attached to a sandbox. Same
 // envelope shape as AddCustomDomain so one decoder serves both routes.
 func (c *Client) ListCustomDomains(ctx context.Context, id string) ([]models.CustomDomain, error) {
 	var response customDomainsEnvelope
-	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/custom-domains", nil, &response); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/custom-domains", nil, &response); err != nil {
 		return nil, err
 	}
 	return response.CustomDomains, nil
@@ -868,7 +874,7 @@ func (c *Client) DNSTarget(ctx context.Context) (models.IngressTarget, error) {
 // without having to combine ListCustomDomains and DNSTarget themselves.
 func (c *Client) CustomDomainDNS(ctx context.Context, id string) (models.CustomDomainDNSRecords, error) {
 	var response models.CustomDomainDNSRecords
-	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/custom-domains/dns", nil, &response)
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/custom-domains/dns", nil, &response)
 	return response, err
 }
 
@@ -1067,7 +1073,7 @@ func (c *Client) doWithRetry(ctx context.Context, makeReq func() (*http.Request,
 			return nil, err // Can't even build the request, don't retry.
 		}
 
-		response, err := c.httpClient.Do(req)
+		response, err := c.do(req)
 
 		// If we got a response, check if the status code is transient.
 		if err == nil {
@@ -1105,6 +1111,64 @@ func (c *Client) doWithRetry(ctx context.Context, makeReq func() (*http.Request,
 func (c *Client) addAuth(request *http.Request) {
 	if c.patToken != "" {
 		request.Header.Set("Authorization", "Bearer "+c.patToken)
+	}
+}
+
+// do sends the request with a hardened redirect policy. Cross-origin
+// redirects (scheme/host/port change) never carry Authorization or the
+// X-Registry-* credentials, and a redirect that would replay a request body
+// to another origin (307/308) is refused instead of followed — both target
+// classes may be attacker-controlled via a 3xx from the daemon's front door.
+// Same-origin redirects keep headers and bodies as before. The policy is
+// installed on a copy of the caller's http.Client so user-supplied clients
+// are not mutated.
+func (c *Client) do(request *http.Request) (*http.Response, error) {
+	client := *c.httpClient
+	prev := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if isCrossOrigin(via[0].URL, req.URL) {
+			req.Header.Del("Authorization")
+			req.Header.Del("X-Registry-Token")
+			req.Header.Del("X-Registry-Username")
+			hasBody := req.ContentLength > 0 || (req.Body != nil && req.Body != http.NoBody)
+			if hasBody {
+				return errors.New("refusing to follow cross-origin redirect with a request body")
+			}
+		}
+		if prev != nil {
+			return prev(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return client.Do(request)
+}
+
+// isCrossOrigin reports whether two URLs differ in scheme, host, or effective
+// port. A missing port is normalized to the scheme default, so
+// "https://h/x" and "https://h:443/x" are the same origin and keep their
+// credentials across a redirect.
+func isCrossOrigin(a, b *url.URL) bool {
+	return !strings.EqualFold(a.Scheme, b.Scheme) ||
+		!strings.EqualFold(a.Hostname(), b.Hostname()) ||
+		effectivePort(a) != effectivePort(b)
+}
+
+// effectivePort returns the URL's explicit port, or the default for its
+// scheme.
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	default:
+		return ""
 	}
 }
 

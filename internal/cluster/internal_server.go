@@ -79,14 +79,19 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 			return
 		}
 		if applyErr := applyHandler(r.Context(), body); applyErr != nil {
-			// 503 on ErrNotLeader mirrors the public-API leader-forward
-			// semantics: the forwarder retries against a refreshed leader
-			// URL. The rest of the mapping is shared with the v1 apply
-			// handler so a verdict means the same thing on both listeners.
+			// The verdict mapping (503 on ErrNotLeader mirrors the public-API
+			// leader-forward semantics so the forwarder retries against a
+			// refreshed leader URL; 409 keeps a SUPERSEDED catalogue
+			// publication distinguishable from a transient failure) is shared
+			// with the v1 apply handler, so a verdict means the same thing on
+			// both listeners.
 			if retryAfter := ApplyErrorRetryAfterSeconds(applyErr); retryAfter > 0 {
 				w.Header().Set("Retry-After", fmt.Sprint(retryAfter))
 			}
-			http.Error(w, applyErr.Error(), ApplyErrorStatus(applyErr))
+			// writeInternalError emits the {"error","code"} envelope so the
+			// forwarding peer restores the exact sentinel by identity rather
+			// than sniffing message text.
+			writeInternalError(w, ApplyErrorStatus(applyErr), applyErr)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)

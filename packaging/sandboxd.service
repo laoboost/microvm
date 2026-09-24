@@ -1,3 +1,7 @@
+# Reference copy of the sandboxd systemd unit. Nothing installs this file:
+# scripts/install.sh renders the real installed unit (write_systemd_unit /
+# write_local_systemd_unit). This copy is the canonical source of the [Service]
+# hardening block and is kept in lockstep with systemd_hardening_block() there.
 [Unit]
 Description=AerolVM daemon
 After=docker.service caddy.service network-online.target
@@ -10,8 +14,12 @@ EnvironmentFile=/etc/sandboxd/sandboxd.env
 ExecStartPre=/bin/mkdir -p /var/lib/sandboxd/mounts /run/sandboxd
 ExecStartPre=/bin/chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd
 ExecStart=/usr/local/bin/sandboxd
-# MountFlags=shared lets bind-mounts created by sandboxd (FUSE mounts under
-# /var/lib/sandboxd/mounts/<id>/) propagate into the Docker daemon's view.
+# MountFlags=shared keeps the unit's mount namespace in the host's shared
+# propagation group so bind-mounts sandboxd creates (FUSE mounts under
+# /var/lib/sandboxd/mounts/<id>/) propagate into dockerd's view and containers
+# actually see the storage. This ONLY holds while the unit carries no
+# file-system-namespacing directive — see the Hardening block below for why
+# those would silently break it.
 MountFlags=shared
 Restart=always
 RestartSec=5
@@ -21,6 +29,54 @@ RestartSec=5
 # 1 M is the Linux soft default for systemd units and is well within
 # kernel-side caps.
 LimitNOFILE=1048576
+
+# --- Hardening ---------------------------------------------------------------
+# The daemon drives dockerd over its socket (no extra caps needed for that),
+# sets up sandbox networking, mounts FUSE/bind volumes, and runs the
+# Firecracker jailer (chroot + privilege drop).
+NoNewPrivileges=true
+#
+# Deliberately NO file-system-namespacing directives here (ProtectSystem=,
+# ProtectHome=, PrivateTmp=, ReadWritePaths=, ...). Why:
+#   sandboxd creates each per-sandbox external-storage mount under
+#   /var/lib/sandboxd/mounts/<id>/ and passes dockerd a plain "src:dst[:ro]"
+#   bind string (pkg/mounts + pkg/docker/client.go). dockerd runs in the host
+#   mount namespace and resolves that source path itself, so the mount has to
+#   propagate from sandboxd's namespace to the host.
+#   Every one of those directives instead puts the unit in a private mount
+#   namespace and remounts it MS_SLAVE, which turns OFF propagation towards
+#   the host. MountFlags=shared does not fix it — systemd.exec(5): "Setting
+#   this option to shared does not reestablish propagation in that case."
+#   Measured on a systemd host: a unit with only PrivateTmp=yes has root
+#   "shared:21 master:1" (a slave of the host's "shared:1"), and ProtectSystem=
+#   strict/full behave the same. In that namespace the FUSE mounts never reach
+#   dockerd: the container's bind source is an EMPTY directory — a silent,
+#   correct-looking data-shape failure for every external-storage sandbox on a
+#   hardened node (mount ok, bind ok, no error). So hardening that cannot
+#   silently break external storage stops at NoNewPrivileges= and the
+#   capability set below; neither creates a mount namespace. Do NOT reintroduce
+#   ProtectSystem/ProtectHome/PrivateTmp/ReadWritePaths without first proving
+#   end-to-end that a sandbox's external-storage bind is still non-empty.
+# Minimal capability set — each entry justified:
+#   CAP_NET_ADMIN        iptables/nftables rule programming (netrules) and
+#                        sandbox bridge/netns plumbing.
+#   CAP_NET_BIND_SERVICE host binds below 1024 when L4/SSH listen overrides
+#                        are configured (defaults stay high-ported).
+#   CAP_SYS_ADMIN        mount/umount of FUSE + bind volumes and network
+#                        namespace setup for sandboxes.
+#   CAP_SYS_CHROOT       Firecracker jailer / isolate chroot into their
+#                        per-VM / per-group roots.
+#   CAP_CHOWN            chown sandbox artifacts to the jailer uid/gid
+#                        (os.Chown in the firecracker driver; SB_JAILER_UID/GID
+#                        default 1000). Without it the chown is EPERM and
+#                        jailed VMs fail to boot.
+#   CAP_MKNOD            the Firecracker jailer mknods /dev/kvm and
+#                        /dev/net/tun inside each chroot.
+#   CAP_DAC_OVERRIDE     write sandbox artifacts regardless of the modes the
+#                        jailer/isolate trees carry.
+#   CAP_SETUID/CAP_SETGID jailer privilege drop to jailer_uid/jailer_gid.
+#   CAP_SETPCAP          jailer capability bounding while dropping privs.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_CHOWN CAP_MKNOD CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_SETPCAP
 
 [Install]
 WantedBy=multi-user.target

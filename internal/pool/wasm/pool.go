@@ -71,6 +71,8 @@ func New(runDir string, logger *slog.Logger) *Pool {
 // SetSpawner injects the worker spawner (production: SupervisorSpawner).
 func (p *Pool) SetSpawner(s Spawner) {
 	p.mu.Lock()
+	// A closed pool must not gain a new spawner: WarmOne would then hand work to a
+	// pool whose close has already been observed, reviving teardown.
 	if !p.closed {
 		p.spawner = s
 	}
@@ -287,6 +289,8 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 	p.mu.Lock()
 	spawner := p.spawner
 	memMB := p.defaultMemoryMB
+	// Refuse to spawn once Close has run: a slot created after teardown would
+	// outlive the pool.
 	closed := p.closed
 	p.mu.Unlock()
 	if closed {

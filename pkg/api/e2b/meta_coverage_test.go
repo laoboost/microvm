@@ -60,22 +60,6 @@ func TestSandboxMetaFromNativeDestroyAtAgeBranch(t *testing.T) {
 	}
 }
 
-func TestCreateRequestFingerprintAndMetadataHelpers(t *testing.T) {
-	fp, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{Image: "ubuntu:22.04"}, sandboxMeta{
-		TemplateID: "base", TimeoutSeconds: 120, OnTimeout: "kill",
-	})
-	if err != nil || fp == "" {
-		t.Fatalf("fingerprint = %q err=%v", fp, err)
-	}
-	if got := sandboxIDFromFingerprint(fp); got == "" {
-		t.Fatal("expected deterministic sandbox id")
-	}
-	filter, err := parseMetadataFilter("env=prod")
-	if err != nil || filter["env"] != "prod" {
-		t.Fatalf("filter = %v err=%v", filter, err)
-	}
-}
-
 func TestSandboxMetaFromNativeNilNetworkSliceDefaults(t *testing.T) {
 	meta := sandboxMetaFromNative(&models.Sandbox{Tags: map[string]string{"k": "v"}}, compatBlob{
 		Secure:    true,

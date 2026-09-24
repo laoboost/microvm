@@ -107,7 +107,7 @@ func TestLoadCases(t *testing.T) {
 				if cfg.PATToken != "token" {
 					t.Fatalf("expected PATToken to be set, got %+v", cfg)
 				}
-				if cfg.APIHost != "0.0.0.0" || cfg.APIPort != 21212 {
+				if cfg.APIHost != "127.0.0.1" || cfg.APIPort != 21212 {
 					t.Fatalf("unexpected listen defaults: %+v", cfg)
 				}
 				if cfg.PublicHost != "127.0.0.1" || cfg.DockerNetwork != "bridge" {

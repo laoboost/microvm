@@ -31,7 +31,15 @@ type WorkerClient interface {
 	LoadModule(sandboxID, path string, memoryMB int) (wasmengine.LoadTimings, error)
 	Instantiate(sandboxID string, caps wasmengine.Capabilities) error
 	Invoke(sandboxID, export string) error
-	Exec(sandboxID string, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error)
+	// InvokeBackground runs the long-lived guest entry (the HTTP serve loop),
+	// exempt from the per-request wall timeout. Only the serve path calls it —
+	// one-shot callers must use Invoke/Exec so a CPU-bound guest stays bounded.
+	InvokeBackground(sandboxID, export string) error
+	// Exec runs the sandbox entrypoint with the given caps. It must honor ctx:
+	// return promptly with ctx.Err() once ctx is done (see
+	// workerClientAdapter.Exec — the underlying worker RPC has no
+	// cancellation of its own).
+	Exec(ctx context.Context, sandboxID string, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error)
 	StopInstance(sandboxID string) error
 	Checkpoint(ctx context.Context, sandboxID, outDir string, meta wasmengine.SnapshotConfig) error
 	Restore(sandboxID, dir string, caps wasmengine.Capabilities) error
@@ -74,8 +82,29 @@ func (a workerClientAdapter) Invoke(sandboxID, export string) error {
 	return a.client.Invoke(sandboxID, export)
 }
 
-func (a workerClientAdapter) Exec(sandboxID string, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error) {
-	return a.client.Exec(sandboxID, caps, export)
+func (a workerClientAdapter) InvokeBackground(sandboxID, export string) error {
+	return a.client.InvokeBackground(sandboxID, export)
+}
+
+func (a workerClientAdapter) Exec(ctx context.Context, sandboxID string, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error) {
+	// worker.Client.Exec is a blocking RPC with no cancellation of its own;
+	// honor ctx by racing it — on cancel the in-flight call is abandoned and
+	// drains in the background.
+	type outcome struct {
+		run wasmengine.RunResult
+		err error
+	}
+	ch := make(chan outcome, 1)
+	go func() {
+		run, err := a.client.Exec(sandboxID, caps, export)
+		ch <- outcome{run, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return wasmengine.RunResult{}, ctx.Err()
+	case out := <-ch:
+		return out.run, out.err
+	}
 }
 
 func (a workerClientAdapter) StopInstance(sandboxID string) error {

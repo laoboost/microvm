@@ -108,6 +108,13 @@ func (h *Host) handleSessionsRoute(w http.ResponseWriter, r *http.Request) bool 
 }
 
 func (h *Host) handleSessionsCreate(w http.ResponseWriter, r *http.Request) {
+	// Fail closed while host-exec is disabled (Host.hostExecEnabled): session create spawns a
+	// host shell with user-controlled command/workdir/env, and the wasm
+	// runtime has no jail to contain it.
+	if !h.hostExecEnabled {
+		writeError(w, http.StatusNotImplemented, hostExecDisabledMsg)
+		return
+	}
 	if h.sessions == nil {
 		writeError(w, http.StatusServiceUnavailable, "sessions disabled")
 		return

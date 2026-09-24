@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/aerol-ai/microvm/pkg/mounts/adapters"
 )
 
 // ExecRunner is the production Runner: it executes the command (with extraEnv
@@ -116,8 +118,19 @@ func (r *Reclaimer) s3CredEnv() []string {
 // server:/export/tenant/name; we mount that exact subtree and empty it. Unmount
 // runs even when the delete failed so we never leak a mount.
 func (r *Reclaimer) reclaimNFS(ctx context.Context, source string) error {
+	// Volume.Source is stored at creation time and could predate validation
+	// (or be poisoned in the ledger); re-validate before it reaches mount(8).
+	if err := adapters.CheckNFSSource(source); err != nil {
+		return fmt.Errorf("reclaim nfs: %w", err)
+	}
 	if r.mountRoot == "" {
 		return fmt.Errorf("reclaim nfs: no mount root configured")
+	}
+	// Same option policy as the sandbox NFS adapter: allowlisted tokens only,
+	// nosuid,nodev forced onto the final opts.
+	opts, err := adapters.NFSMountOpts(r.backend.NFSOptions, false)
+	if err != nil {
+		return fmt.Errorf("reclaim nfs: %w", err)
 	}
 	tmp, err := os.MkdirTemp(r.mountRoot, "vol-reclaim-")
 	if err != nil {
@@ -125,11 +138,7 @@ func (r *Reclaimer) reclaimNFS(ctx context.Context, source string) error {
 	}
 	defer func() { _ = os.RemoveAll(tmp) }()
 
-	mountArgs := []string{"-t", "nfs"}
-	if opts := strings.TrimSpace(r.backend.NFSOptions); opts != "" {
-		mountArgs = append(mountArgs, "-o", opts)
-	}
-	mountArgs = append(mountArgs, source, tmp)
+	mountArgs := []string{"-t", "nfs", "-o", opts, source, tmp}
 	if err := r.run(ctx, nil, "mount", mountArgs...); err != nil {
 		return fmt.Errorf("reclaim nfs mount %q: %w", source, err)
 	}

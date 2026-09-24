@@ -151,9 +151,10 @@ resource "aws_instance" "obs" {
   }
 
   metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+    # Hop limit 1 (not 2) — see the seed resource: keeps sandboxes off IMDS.
+    http_put_response_hop_limit = 1
   }
 
   user_data_replace_on_change = true

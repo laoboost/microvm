@@ -1,6 +1,7 @@
 package wasm
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -52,6 +53,56 @@ type sandboxInstance struct {
 	runGeneration      uint64
 	guestServeGen      uint64
 	guestServeMu       sync.Mutex
+}
+
+// instanceSnapshot is a consistent copy of the sandboxInstance fields that may
+// change after the record is published: status flips on Start/Stop and worker
+// liveness probes, socketPath on resident→cold migration, resolvedListenPort on
+// guest-listen sync, memoryMB on Resize. sandboxInstance is owned by d.mu —
+// readers copy what they
+// need under the lock (snapshotOfLocked / snapshotInstance) and use only the
+// copy afterwards, never the live fields.
+type instanceSnapshot struct {
+	sandboxID          string
+	status             models.SandboxStatus
+	socketPath         string
+	workerKey          string
+	resolvedListenPort int
+	memoryMB           int
+	fromResidentHost   bool
+	fromWarmPool       bool
+	workerSpawnCount   int
+}
+
+// snapshotOfLocked copies inst's mutable fields. Caller must hold d.mu (or own
+// the unpublished instance exclusively).
+func snapshotOfLocked(inst *sandboxInstance) instanceSnapshot {
+	if inst == nil {
+		return instanceSnapshot{}
+	}
+	return instanceSnapshot{
+		sandboxID:          inst.sandboxID,
+		status:             inst.status,
+		socketPath:         inst.socketPath,
+		workerKey:          inst.workerKey,
+		resolvedListenPort: inst.resolvedListenPort,
+		memoryMB:           inst.memoryMB,
+		fromResidentHost:   inst.fromResidentHost,
+		fromWarmPool:       inst.fromWarmPool,
+		workerSpawnCount:   inst.workerSpawnCount,
+	}
+}
+
+// snapshotInstance looks sandboxID up and returns the live record (identity and
+// post-publish immutables only) plus a locked copy of its mutable fields.
+func (d *Driver) snapshotInstance(sandboxID string) (*sandboxInstance, instanceSnapshot, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	inst := d.byID[sandboxID]
+	if inst == nil {
+		return nil, instanceSnapshot{}, fmt.Errorf("wasm sandbox %q not found", sandboxID)
+	}
+	return inst, snapshotOfLocked(inst), nil
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {

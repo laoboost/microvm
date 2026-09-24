@@ -149,6 +149,15 @@ func TestWireContainerdNativeNetnsPoolSizeFloorIsDepth(t *testing.T) {
 	}
 }
 
+// The IPv6 hard-disable coverage that used to live here (F3g: the sysctl writer
+// was never invoked during wiring) now belongs to the boot step that owns it —
+// the disable moved out of this wiring to before any chain work, and its
+// assertions (every sandbox bridge named, fail-closed on a write that does not
+// take, gated on EnableNetworkRules) live in
+// TestBootSandboxNetworkIsolation* in docker_netns_wiring_test.go. Moving it
+// also closed a hole: with ContainerdNativeNetnsPoolEnabled=false this wiring
+// never ran at all, so containerd hosts had no IPv6 disable.
+
 func openDaemonTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/state.db")
