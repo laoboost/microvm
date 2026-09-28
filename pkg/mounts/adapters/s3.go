@@ -3,6 +3,7 @@ package adapters
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -83,6 +84,22 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 	}
 	argv = append(argv, s3StructuredFlags(spec.Options, spec.ReadOnly, extraTokens)...)
 	argv = append(argv, extraTokens...)
+
+	// Path-style addressing, always. mountpoint-s3 >= 1.24 defaults to
+	// virtual-hosted style, resolving <bucket>.<endpoint-host> — which does
+	// not exist for gateway-style custom endpoints (no DNS for it, and the
+	// speshu S3 policy gateway is path-style only: its request parser reads
+	// the bucket from the path). aws-c-io reports the NXDOMAIN as
+	// AWS_IO_DNS_INVALID_NAME, so the failure looked like a DNS problem.
+	// An operator who explicitly passes an addressing style via extra_args
+	// (--force-path-style / --virtual-hosted-style) keeps their choice.
+	//
+	// This must be appended before the "--" terminator below: anything after
+	// it is positional, and the tool would read the flag as the bucket name.
+	if !slices.Contains(argv, "--force-path-style") && !slices.Contains(argv, "--virtual-hosted-style") {
+		argv = append(argv, "--force-path-style")
+	}
+
 	argv = append(argv, "--", bucket, hostTarget)
 
 	if !useStaticCreds {
