@@ -517,3 +517,43 @@ func indexOf(items []string, want string) int {
 	}
 	return -1
 }
+
+// TestS3Build_PathStyleDefault is the regression guard for the mountpoint-s3
+// >= 1.24 default addressing-style change: virtual-hosted style resolves
+// <bucket>.<endpoint-host>, which does not exist for gateway-style custom
+// endpoints (NXDOMAIN surfaces as the misleading AWS_IO_DNS_INVALID_NAME),
+// and the speshu S3 policy gateway is path-style only. The adapter must
+// therefore pin --force-path-style unless the operator explicitly chose an
+// addressing style via extra_args.
+func TestS3Build_PathStyleDefault(t *testing.T) {
+	creds := map[string]string{
+		"access_key_id":     "AKIA...",
+		"secret_access_key": "secret",
+	}
+	withEndpoint := models.MountSpec{
+		Source:      "s3://bucket/prefix/",
+		Credentials: creds,
+		Options:     map[string]string{"endpoint": "https://s3-gateway.example.com"},
+	}
+	plan, err := (S3{}).Build("sb-1", 0, withEndpoint, "/mnt", "/creds")
+	if err != nil {
+		t.Fatalf("S3.Build: %v", err)
+	}
+	if !contains(plan.Argv, "--force-path-style") {
+		t.Fatalf("argv missing --force-path-style: %v", plan.Argv)
+	}
+
+	// An operator-supplied addressing style must not be duplicated.
+	withOverride := withEndpoint
+	withOverride.Options = map[string]string{
+		"endpoint":   "https://s3-gateway.example.com",
+		"extra_args": "--virtual-hosted-style",
+	}
+	plan, err = (S3{}).Build("sb-1", 0, withOverride, "/mnt", "/creds")
+	if err != nil {
+		t.Fatalf("S3.Build with override: %v", err)
+	}
+	if contains(plan.Argv, "--force-path-style") {
+		t.Fatalf("argv must not add --force-path-style when an addressing style is supplied: %v", plan.Argv)
+	}
+}

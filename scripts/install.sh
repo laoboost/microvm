@@ -322,28 +322,58 @@ verify_downloads() {
 	local tmp_dir="$1"
 	local sandboxd_asset="$2"
 	local toolboxd_asset="$3"
+	local sandboxd_url="$4"
+	local toolboxd_url="$5"
 
 	if [[ "$SKIP_CHECKSUM_VERIFY" == "true" ]]; then
 		echo "Warning: --skip-checksum-verify given; installing WITHOUT checksum verification" >&2
 		return 0
 	fi
 
-	# Fail closed from here on: a missing/unreachable checksums file or a
-	# missing hash entry must abort the install, not silently skip the
-	# verification (the old behavior — supply-chain hole).
-	if [[ -z "$CHECKSUMS_URL" ]]; then
-		echo "Error: CHECKSUMS_URL is empty; cannot verify downloads. Pass --checksums-url, or --skip-checksum-verify to override." >&2
-		return 1
-	fi
-
-	if ! download_asset "$CHECKSUMS_URL" "$tmp_dir/checksums.txt"; then
-		echo "Error: failed to download checksums from $CHECKSUMS_URL; refusing to install unverified binaries. Pass --skip-checksum-verify to override." >&2
-		return 1
-	fi
-
+	# Operator-supplied local binaries (file:// URLs) are hashed from the
+	# source path instead of a remote checksums file — there is nothing to
+	# verify them against, and fail-closing on a missing remote checksums
+	# entry would block the standard fork/offline install flow.
+	# Remote (http/https) downloads are always checked against the release
+	# checksums; if ANY asset is remote, the checksums file is mandatory.
 	(
 		cd "$tmp_dir"
-		grep -E "[[:space:]](${sandboxd_asset}|${toolboxd_asset})$" checksums.txt > selected-checksums.txt || true
+		: > selected-checksums.txt
+
+		local need_remote=false
+		local url asset
+		for pair in "${sandboxd_url} ${sandboxd_asset}" "${toolboxd_url} ${toolboxd_asset}"; do
+			url="${pair%% *}"
+			asset="${pair##* }"
+			if [[ "$url" == file://* ]]; then
+				local src="${url#file://}"
+				if [[ ! -f "$src" ]]; then
+					echo "Error: local asset not found: $src" >&2
+					exit 1
+				fi
+				sha256sum "$src" | awk -v name="$asset" '{print $1"  "name}' >> selected-checksums.txt
+			else
+				need_remote=true
+			fi
+		done
+
+		if [[ "$need_remote" == "true" ]]; then
+			# Fail closed from here on: a missing/unreachable checksums file or a
+			# missing hash entry must abort the install, not silently skip the
+			# verification (the old behavior — supply-chain hole).
+			if [[ -z "$CHECKSUMS_URL" ]]; then
+				echo "Error: CHECKSUMS_URL is empty; cannot verify downloads. Pass --checksums-url, or --skip-checksum-verify to override." >&2
+				exit 1
+			fi
+
+			if ! download_asset "$CHECKSUMS_URL" "$tmp_dir/checksums.txt"; then
+				echo "Error: failed to download checksums from $CHECKSUMS_URL; refusing to install unverified binaries. Pass --skip-checksum-verify to override." >&2
+				exit 1
+			fi
+
+			grep -E "[[:space:]](${sandboxd_asset}|${toolboxd_asset})$" checksums.txt >> selected-checksums.txt || true
+		fi
+
 		if [[ ! -s selected-checksums.txt ]]; then
 			echo "Error: no checksum entries found for downloaded assets; refusing to install unverified binaries. Pass --skip-checksum-verify to override." >&2
 			exit 1
@@ -851,7 +881,7 @@ install_binaries() {
 
 		download_asset "$SANDBOXD_URL" "$tmp_dir/$sandboxd_asset"
 		download_asset "$TOOLBOXD_URL" "$tmp_dir/$toolboxd_asset"
-		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset"
+		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset" "$SANDBOXD_URL" "$TOOLBOXD_URL"
 
 		install -m 0755 "$tmp_dir/$sandboxd_asset" "$INSTALL_PREFIX/sandboxd"
 		install -m 0755 "$tmp_dir/$toolboxd_asset" "$INSTALL_PREFIX/toolboxd"
@@ -1375,104 +1405,99 @@ install_amd_gpu() {
 	echo "Verify with: rocm-smi"
 }
 
-install_runsc_binary() {
-	# Download the latest runsc release from gVisor's official storage bucket
-	# and install it to /usr/local/bin. The bucket layout is:
-	#   storage.googleapis.com/gvisor/releases/release/latest/<arch>/{runsc,runsc.sha512}
-	# where <arch> is x86_64 or aarch64. We verify the SHA-512 published next
-	# to the binary before installing — the upstream-recommended pattern from
-	# https://gvisor.dev/docs/user_guide/install/.
-	local arch
+gvisor_arch() {
 	case "$(uname -m)" in
-		x86_64|amd64)   arch="x86_64" ;;
-		aarch64|arm64)  arch="aarch64" ;;
+		x86_64|amd64)   echo "x86_64" ;;
+		aarch64|arm64)  echo "aarch64" ;;
 		*)
-			echo "--with-gvisor: unsupported architecture $(uname -m) for runsc" >&2
+			echo "--with-gvisor: unsupported architecture $(uname -m) for gVisor" >&2
 			exit 1
 			;;
 	esac
+}
 
+install_gvisor_release() {
+	# Download the latest gVisor release tarball from the official storage
+	# bucket and install runsc + the containerd shim + the gvisor-bin/ sidecar
+	# directory to /usr/local/bin. Upstream bucket layout (since
+	# release-20260921.0 — the old per-binary runsc / containerd-shim-runsc-v1
+	# URLs were removed and now 404):
+	#   storage.googleapis.com/gvisor/releases/release/latest/<arch>/gvisor.tar.zstd
+	# The tarball contains runsc, containerd-shim-runsc-v1 and gvisor-bin/;
+	# runsc re-execs its helpers from gvisor-bin/ NEXT TO ITS OWN BINARY, so
+	# all three must land in the same directory. We verify the SHA-512
+	# published next to the tarball before installing — the
+	# upstream-recommended pattern from https://gvisor.dev/docs/user_guide/install/.
+	# Hosts without zstd fall back to the .tar.bz2 variant (tar needs bzip2).
+	local arch tarball extract_dir
+	arch="$(gvisor_arch)"
 	local base="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}"
+
+	if command -v zstd >/dev/null 2>&1; then
+		tarball="gvisor.tar.zstd"
+	else
+		tarball="gvisor.tar.bz2"
+	fi
+
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
 	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
 	trap "rm -rf '$tmp_dir'" RETURN
 
-	echo "Downloading runsc for ${arch} from ${base}"
-	if ! curl_download "${base}/runsc" -o "${tmp_dir}/runsc"; then
-		echo "--with-gvisor: failed to download runsc from ${base}/runsc" >&2
+	echo "Downloading gVisor ${tarball} for ${arch} from ${base}"
+	if ! curl_download "${base}/${tarball}" -o "${tmp_dir}/${tarball}"; then
+		echo "--with-gvisor: failed to download ${base}/${tarball}" >&2
 		exit 1
 	fi
-	if ! curl_download "${base}/runsc.sha512" -o "${tmp_dir}/runsc.sha512"; then
-		echo "--with-gvisor: failed to download runsc.sha512 from ${base}/runsc.sha512" >&2
+	if ! curl_download "${base}/${tarball}.sha512" -o "${tmp_dir}/${tarball}.sha512"; then
+		echo "--with-gvisor: failed to download ${base}/${tarball}.sha512" >&2
 		exit 1
 	fi
 
-	# gVisor's published checksum file uses the binary path under the bucket,
+	# gVisor's published checksum file uses the artifact path under the bucket,
 	# not just the basename. Rewrite it to match what we have on disk so
 	# sha512sum -c finds the file. Format is "<hash>  <path>".
 	(
 		cd "$tmp_dir"
-		awk '{print $1"  runsc"}' runsc.sha512 > runsc.sha512.local
-		if ! sha512sum -c runsc.sha512.local; then
-			echo "--with-gvisor: runsc checksum verification failed" >&2
+		awk -v name="${tarball}" '{print $1"  "name}' "${tarball}.sha512" > gvisor.sha512.local
+		if ! sha512sum -c gvisor.sha512.local; then
+			echo "--with-gvisor: gVisor ${tarball} checksum verification failed" >&2
 			exit 1
 		fi
 	)
 
-	install -m 0755 "${tmp_dir}/runsc" /usr/local/bin/runsc
-	echo "Installed runsc to /usr/local/bin/runsc"
+	extract_dir="${tmp_dir}/extract"
+	mkdir -p "$extract_dir"
+	if [[ "$tarball" == *.zstd ]]; then
+		tar --zstd -xf "${tmp_dir}/${tarball}" -C "$extract_dir"
+	else
+		tar -xjf "${tmp_dir}/${tarball}" -C "$extract_dir"
+	fi
+
+	local component
+	for component in runsc containerd-shim-runsc-v1 gvisor-bin; do
+		if [[ ! -e "${extract_dir}/${component}" ]]; then
+			echo "--with-gvisor: ${tarball} is missing ${component}" >&2
+			exit 1
+		fi
+		install -m 0755 "${extract_dir}/${component}" /usr/local/bin/"${component}"
+	done
+	echo "Installed runsc, containerd-shim-runsc-v1 and gvisor-bin/ to /usr/local/bin"
 }
 
 install_runsc_shim() {
 	# The containerd engine reaches gVisor through the io.containerd.runsc.v1
 	# shim (internal/runtime/containerd/runtime_gvisor.go): containerd resolves
 	# that runtime name by exec'ing containerd-shim-runsc-v1 from its PATH, so
-	# the daemon.json registration below covers dockerd only. Install the shim
-	# next to runsc so --with-gvisor works under both engines — without it a
-	# runtime:"gvisor" create on a containerd node fails at shim launch.
-	if command -v containerd-shim-runsc-v1 >/dev/null 2>&1; then
-		echo "containerd-shim-runsc-v1 already installed"
+	# the daemon.json registration covers dockerd only. Ensure the shim (and
+	# the gvisor-bin/ sidecars runsc re-execs) are installed next to runsc so
+	# --with-gvisor works under both engines — without it a runtime:"gvisor"
+	# create on a containerd node fails at shim launch.
+	if command -v containerd-shim-runsc-v1 >/dev/null 2>&1 && [[ -d /usr/local/bin/gvisor-bin ]]; then
+		echo "containerd-shim-runsc-v1 and gvisor-bin/ already installed"
 		return 0
 	fi
-
-	local arch
-	case "$(uname -m)" in
-		x86_64|amd64)   arch="x86_64" ;;
-		aarch64|arm64)  arch="aarch64" ;;
-		*)
-			echo "--with-gvisor: unsupported architecture $(uname -m) for containerd-shim-runsc-v1" >&2
-			exit 1
-			;;
-	esac
-
-	local base="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}"
-	local tmp_dir
-	tmp_dir="$(mktemp -d)"
-	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
-	trap "rm -rf '$tmp_dir'" RETURN
-
-	echo "Downloading containerd-shim-runsc-v1 for ${arch} from ${base}"
-	if ! curl_download "${base}/containerd-shim-runsc-v1" -o "${tmp_dir}/containerd-shim-runsc-v1"; then
-		echo "--with-gvisor: failed to download containerd-shim-runsc-v1 from ${base}/containerd-shim-runsc-v1" >&2
-		exit 1
-	fi
-	if ! curl_download "${base}/containerd-shim-runsc-v1.sha512" -o "${tmp_dir}/containerd-shim-runsc-v1.sha512"; then
-		echo "--with-gvisor: failed to download containerd-shim-runsc-v1.sha512" >&2
-		exit 1
-	fi
-
-	(
-		cd "$tmp_dir"
-		awk '{print $1"  containerd-shim-runsc-v1"}' containerd-shim-runsc-v1.sha512 > shim.sha512.local
-		if ! sha512sum -c shim.sha512.local; then
-			echo "--with-gvisor: containerd-shim-runsc-v1 checksum verification failed" >&2
-			exit 1
-		fi
-	)
-
-	install -m 0755 "${tmp_dir}/containerd-shim-runsc-v1" /usr/local/bin/containerd-shim-runsc-v1
-	echo "Installed containerd-shim-runsc-v1 to /usr/local/bin/containerd-shim-runsc-v1"
+	install_gvisor_release
 }
 
 install_workerd_binary() {
@@ -1577,7 +1602,7 @@ register_gvisor_runtime() {
 	elif command -v runsc >/dev/null 2>&1; then
 		runsc_bin="$(command -v runsc)"
 	else
-		install_runsc_binary
+		install_gvisor_release
 		runsc_bin="/usr/local/bin/runsc"
 	fi
 	if [[ ! -x "$runsc_bin" ]]; then
