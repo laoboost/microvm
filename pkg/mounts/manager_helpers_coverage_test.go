@@ -51,10 +51,10 @@ func TestKillMountNil(t *testing.T) {
 
 func TestWriteCredFileErrors(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.Chmod(dir, 0400); err != nil {
+	if err := os.Chmod(dir, 0o400); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chmod(dir, 0700)
+	defer os.Chmod(dir, 0o700)
 	err := writeCredFile(filepath.Join(dir, "newdir", "cred.json"), []byte("data"))
 	if err == nil {
 		t.Fatal("expected error")
@@ -62,7 +62,7 @@ func TestWriteCredFileErrors(t *testing.T) {
 
 	dir2 := t.TempDir()
 	path2 := filepath.Join(dir2, "cred.json")
-	os.Mkdir(path2, 0700)
+	os.Mkdir(path2, 0o700)
 	err = writeCredFile(path2, []byte("data"))
 	if err == nil {
 		t.Fatal("expected error")
@@ -73,7 +73,7 @@ func TestCleanupOrphanDirAndUnmountTree(t *testing.T) {
 	logger := slog.Default()
 	m, _ := New(logger, Config{RootDir: t.TempDir(), CredDir: t.TempDir()})
 	dir := filepath.Join(m.rootDir, "test-orphan")
-	os.Mkdir(dir, 0700)
+	os.Mkdir(dir, 0o700)
 	m.cleanupOrphanDir(dir)
 	unmountTree(logger, dir)
 }

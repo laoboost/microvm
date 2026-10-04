@@ -73,7 +73,7 @@ func TestSnapshotTemplate_Errors_Extra(t *testing.T) {
 	}
 
 	rootfsPath := filepath.Join(t.TempDir(), "rootfs")
-	os.WriteFile(rootfsPath, []byte("rootfs"), 0644)
+	os.WriteFile(rootfsPath, []byte("rootfs"), 0o644)
 	reqValid := reqBase()
 	reqValid.RootfsPath = rootfsPath
 
@@ -183,7 +183,7 @@ func TestSnapshotTemplate_Errors_Extra(t *testing.T) {
 		t.Errorf("expected hash memory error, got %v", err)
 	}
 
-	os.WriteFile(reqMem.OutMemoryPath, []byte("mem"), 0644)
+	os.WriteFile(reqMem.OutMemoryPath, []byte("mem"), 0o644)
 	if _, err := d.SnapshotTemplate(context.Background(), reqMem); err == nil || !strings.Contains(err.Error(), "hash state") {
 		t.Errorf("expected hash state error, got %v", err)
 	}

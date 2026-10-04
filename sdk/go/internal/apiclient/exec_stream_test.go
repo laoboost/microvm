@@ -8,9 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/gorilla/websocket"
-
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+	"github.com/gorilla/websocket"
 )
 
 func TestExecStreamReceivesFramesAndExit(t *testing.T) {

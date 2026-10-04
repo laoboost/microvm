@@ -57,7 +57,7 @@ func TestCreate_LoadSnapshot_ExtraRESTErrors(t *testing.T) {
 			tc.setup(f.client)
 
 			rootfsPath := filepath.Join(t.TempDir(), "rootfs")
-			os.WriteFile(rootfsPath, []byte("fake"), 0644)
+			os.WriteFile(rootfsPath, []byte("fake"), 0o644)
 
 			// Setup fake resolver to return a snapshot
 			f.driver.SetTemplateResolver(&fakeTemplateResolver{

@@ -55,10 +55,12 @@ func (c *recordingWorkerClient) Ping(string) error { return nil }
 func (c *recordingWorkerClient) InstanceLoaded(context.Context, string) (bool, error) {
 	return true, nil
 }
+
 func (c *recordingWorkerClient) LoadModule(_, path string, _ int) (wasmengine.LoadTimings, error) {
 	c.loadPath = path
 	return wasmengine.LoadTimings{}, nil
 }
+
 func (c *recordingWorkerClient) Instantiate(_ string, caps wasmengine.Capabilities) error {
 	c.instantiateCaps = append(c.instantiateCaps, caps)
 	return nil
@@ -73,13 +75,16 @@ func (c *recordingWorkerClient) InvokeBackground(_ string, export string) error 
 	}
 	return nil
 }
+
 func (c *recordingWorkerClient) Exec(context.Context, string, wasmengine.Capabilities, string) (wasmengine.RunResult, error) {
 	return wasmengine.RunResult{}, nil
 }
+
 func (c *recordingWorkerClient) StopInstance(string) error {
 	c.stopped = true
 	return nil
 }
+
 func (c *recordingWorkerClient) Checkpoint(context.Context, string, string, wasmengine.SnapshotConfig) error {
 	return nil
 }
@@ -91,6 +96,7 @@ func (c *recordingWorkerClient) SetListenPort(string, int, string) error        
 func (c *recordingWorkerClient) ResolvedListenPort(string) (int, error) {
 	return c.resolvedPort, nil
 }
+
 func (c *recordingWorkerClient) ProxyHTTP(string, int, http.ResponseWriter, *http.Request) error {
 	return nil
 }

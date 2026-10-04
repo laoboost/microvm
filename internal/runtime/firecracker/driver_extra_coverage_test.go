@@ -3,9 +3,10 @@ package firecracker
 import (
 	"context"
 	"errors"
-	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"strings"
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/firecracker"
 )
 
 type dummyClient struct {

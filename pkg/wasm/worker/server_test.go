@@ -58,7 +58,7 @@ func TestServeSocketPath(t *testing.T) {
 	// Create dummy wasm
 	wasmBytes, _ := hex.DecodeString("0061736d01000000010401600000030201000503010001071302066d656d6f72790200065f737461727400000a040102000b")
 	wasmPath := filepath.Join(t.TempDir(), "test.wasm")
-	_ = os.WriteFile(wasmPath, wasmBytes, 0644)
+	_ = os.WriteFile(wasmPath, wasmBytes, 0o644)
 
 	_, _ = client.LoadModule(sb, wasmPath, 0)
 

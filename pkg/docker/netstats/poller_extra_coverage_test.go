@@ -73,6 +73,7 @@ type errorReader struct{}
 func (errorReader) Read(p []byte) (n int, err error) {
 	return 0, errors.New("read error")
 }
+
 func (errorReader) Close() error {
 	return nil
 }

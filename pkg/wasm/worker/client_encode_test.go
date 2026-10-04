@@ -1,13 +1,13 @@
 package worker
 
 import (
-	"net/http/httptest"
-
 	"context"
 	"errors"
-	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"net"
+	"net/http/httptest"
 	"testing"
+
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 func TestClient_EncodeDecodeErrors(t *testing.T) {

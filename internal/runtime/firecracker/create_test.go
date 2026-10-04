@@ -317,6 +317,7 @@ func (v *fakeVMM) WaitSocket(_ context.Context, _ time.Duration) error {
 	v.waited = true
 	return v.waitErr
 }
+
 func (v *fakeVMM) Shutdown(_ context.Context, _ time.Duration) error {
 	v.shutdown = true
 	return v.shutdownErr

@@ -71,8 +71,8 @@ func TestTryAcquireWarm_ExtraCoverage(t *testing.T) {
 		rootfs := filepath.Join(tplDir, "rootfs.ext4")
 		snapMem := filepath.Join(tplDir, "snapshot.memory")
 		snapState := filepath.Join(tplDir, "snapshot.state")
-		os.WriteFile(snapMem, []byte("MEM"), 0600)
-		os.WriteFile(snapState, []byte("STATE"), 0600)
+		os.WriteFile(snapMem, []byte("MEM"), 0o600)
+		os.WriteFile(snapState, []byte("STATE"), 0o600)
 
 		f.driver.SetTemplateResolver(&fakeTemplateResolver{
 			rootfsPath:         rootfs, // doesn't exist

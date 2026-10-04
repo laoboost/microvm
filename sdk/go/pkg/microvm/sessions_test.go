@@ -10,10 +10,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/aerol-ai/microvm/pkg/models"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+	"github.com/gorilla/websocket"
 )
 
 func TestSessionClientAndSandboxWrappers(t *testing.T) {

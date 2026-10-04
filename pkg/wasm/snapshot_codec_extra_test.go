@@ -17,7 +17,7 @@ func TestSnapshotCodec_Errors(t *testing.T) {
 
 	// Write to invalid directory (e.g. parent is a file)
 	file := filepath.Join(tmp, "file")
-	os.WriteFile(file, []byte("test"), 0644)
+	os.WriteFile(file, []byte("test"), 0o644)
 	err = WriteSnapshotDir(filepath.Join(file, "snap"), SnapshotCapture{})
 	if err == nil {
 		t.Error("expected error")

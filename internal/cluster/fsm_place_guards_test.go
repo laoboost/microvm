@@ -39,9 +39,11 @@ func (s *spyRecoveryStore) Put(id string, rec placementRecovery) (string, error)
 	}
 	return s.inner.Put(id, rec)
 }
+
 func (s *spyRecoveryStore) Get(ref string) (placementRecovery, bool, error) {
 	return s.inner.Get(ref)
 }
+
 func (s *spyRecoveryStore) GetRecord(ref string) (placementRecoveryStoreRecord, bool, error) {
 	return s.inner.GetRecord(ref)
 }

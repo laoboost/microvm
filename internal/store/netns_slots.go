@@ -489,7 +489,8 @@ func (s *Store) GetContainerNetnsPoolStats(ctx context.Context) (ContainerNetnsP
 
 func scanContainerNetnsSlot(scanner interface {
 	Scan(dest ...any) error
-}, slot *ContainerNetnsSlot) error {
+}, slot *ContainerNetnsSlot,
+) error {
 	var sandboxID sql.NullString
 	if err := scanner.Scan(
 		&slot.SlotID,

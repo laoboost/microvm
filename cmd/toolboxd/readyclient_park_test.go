@@ -20,10 +20,11 @@ func TestParkedReadyOnConn(t *testing.T) {
 	}
 	t.Cleanup(func() { startUserCommandFn = oldStart })
 
-	srv := &server{authOptional: true,
-		logger:      slog.Default(),
-		deferredCmd: []string{"echo", "hi"},
-		parkedMode:  true,
+	srv := &server{
+		authOptional: true,
+		logger:       slog.Default(),
+		deferredCmd:  []string{"echo", "hi"},
+		parkedMode:   true,
 	}
 
 	guest, host := net.Pipe()

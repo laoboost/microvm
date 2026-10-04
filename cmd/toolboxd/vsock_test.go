@@ -45,6 +45,7 @@ func (h *recordingHandler) OnPing(context.Context) error { return h.record(OpPin
 func (h *recordingHandler) OnPreSnapshot(_ context.Context, _ json.RawMessage) error {
 	return h.record(OpPreSnapshot)
 }
+
 func (h *recordingHandler) OnPostResume(_ context.Context, _ json.RawMessage) error {
 	return h.record(OpPostResume)
 }

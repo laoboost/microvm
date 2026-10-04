@@ -10,7 +10,8 @@ import (
 
 func seedStartedSandbox(t *testing.T, st interface {
 	Create(context.Context, *models.Sandbox) error
-}, id string) {
+}, id string,
+) {
 	t.Helper()
 	now := time.Now().UTC()
 	if err := st.Create(context.Background(), &models.Sandbox{

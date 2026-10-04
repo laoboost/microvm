@@ -45,24 +45,31 @@ func (f *fakeHandlerRuntime) Create(ctx context.Context, req models.CreateSandbo
 	}
 	return f.createState, f.createErr
 }
+
 func (f *fakeHandlerRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	return "sha256:fake", nil
 }
+
 func (f *fakeHandlerRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	return f.startState, f.startErr
 }
+
 func (f *fakeHandlerRuntime) Stop(context.Context, string) error {
 	return f.stopErr
 }
+
 func (f *fakeHandlerRuntime) Destroy(context.Context, *models.Sandbox) error {
 	return f.destroyErr
 }
+
 func (f *fakeHandlerRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	return f.resizeErr
 }
+
 func (f *fakeHandlerRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
 	return f.inspectState, f.inspectErr
 }
+
 func (f *fakeHandlerRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	return f.listManaged, f.listManagedErr
 }

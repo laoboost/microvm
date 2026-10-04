@@ -520,7 +520,8 @@ func scanVolumeRow(row *sql.Row, op string) (*models.Volume, error) {
 
 func scanVolume(scanner interface {
 	Scan(dest ...any) error
-}) (*models.Volume, error) {
+},
+) (*models.Volume, error) {
 	var v models.Volume
 	if err := scanner.Scan(&v.ID, &v.Tenant, &v.Name, &v.Backend, &v.Source, &v.CreatedAt); err != nil {
 		return nil, err

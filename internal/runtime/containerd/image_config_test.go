@@ -55,6 +55,7 @@ func (c *configFakeImage) Size(context.Context) (int64, error)             { ret
 func (c *configFakeImage) Usage(context.Context, ...cntr.UsageOpt) (int64, error) {
 	return 0, nil
 }
+
 func (c *configFakeImage) Config(context.Context) (ocispec.Descriptor, error) {
 	// Real containerd returns the CONFIG descriptor here (index→manifest→config
 	// already resolved), not the manifest.

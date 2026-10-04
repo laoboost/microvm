@@ -326,10 +326,12 @@ type captureWarnHandler struct {
 func (h *captureWarnHandler) Enabled(_ context.Context, lvl slog.Level) bool {
 	return lvl >= slog.LevelWarn
 }
+
 func (h *captureWarnHandler) Handle(_ context.Context, r slog.Record) error {
 	*h.msgs = append(*h.msgs, r.Message)
 	return nil
 }
+
 func (h *captureWarnHandler) WithAttrs(_ []slog.Attr) slog.Handler {
 	return &captureWarnHandler{msgs: h.msgs}
 }

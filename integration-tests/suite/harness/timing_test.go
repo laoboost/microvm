@@ -175,7 +175,8 @@ func TestParseServerTimingStages(t *testing.T) {
 // the stage map on a 2xx create and that takeCreateStages consumes it.
 func TestServerTimingTransportRecordsStages(t *testing.T) {
 	tr := &serverTimingTransport{base: stubRoundTripper{
-		header: "create;dur=321.5, fc_driver;dur=300.0, fc_verify;dur=150.2", code: 201}}
+		header: "create;dur=321.5, fc_driver;dur=300.0, fc_verify;dur=150.2", code: 201,
+	}}
 	if _, err := tr.RoundTrip(newReq(t, http.MethodPost, "https://x/v1/sandboxes")); err != nil {
 		t.Fatalf("round trip: %v", err)
 	}

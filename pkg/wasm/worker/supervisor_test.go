@@ -1,9 +1,8 @@
 package worker
 
 import (
-	"errors"
-
 	"context"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"

@@ -61,15 +61,19 @@ func (r *fireRecordingRuntime) Destroy(context.Context, *models.Sandbox) error {
 	r.destroyCalls++
 	return nil
 }
+
 func (r *fireRecordingRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	return "", nil
 }
+
 func (r *fireRecordingRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	return nil
 }
+
 func (r *fireRecordingRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
 	return nil, nil
 }
+
 func (r *fireRecordingRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	return nil, nil
 }

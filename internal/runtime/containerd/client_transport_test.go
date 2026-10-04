@@ -94,6 +94,7 @@ func (v versionStub) Version(context.Context) (cntr.Version, error) {
 	}
 	return cntr.Version{Version: v.version}, nil
 }
+
 func (v versionStub) Close() error {
 	if v.closeErr != nil {
 		return v.closeErr

@@ -23,6 +23,7 @@ type fakeNetworkAwareEngine struct {
 func (f *fakeNetworkAwareEngine) LoadModule(ctx context.Context, path string, opts wasmengine.LoadOptions) error {
 	return nil
 }
+
 func (f *fakeNetworkAwareEngine) Instantiate(ctx context.Context, caps wasmengine.Capabilities) error {
 	return nil
 }
@@ -34,6 +35,7 @@ func (f *fakeNetworkAwareEngine) StopInstance(ctx context.Context) error { retur
 func (f *fakeNetworkAwareEngine) CaptureSnapshot(ctx context.Context) (wasmengine.SnapshotCapture, error) {
 	return wasmengine.SnapshotCapture{}, nil
 }
+
 func (f *fakeNetworkAwareEngine) RestoreSnapshot(ctx context.Context, snap wasmengine.SnapshotRestoreInput, caps wasmengine.Capabilities) error {
 	return nil
 }
@@ -45,6 +47,7 @@ func (f *fakeNetworkAwareEngine) SupportsListen() bool { return true }
 func (f *fakeNetworkAwareEngine) SetNetworkHook(hook *wasmengine.NetworkHook) {
 	f.setHook = true
 }
+
 func (f *fakeNetworkAwareEngine) ClearNetworkHook() {
 	f.clearHook = true
 }

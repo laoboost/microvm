@@ -294,6 +294,7 @@ func (w *warmHandle) setTapOwner(owner string) {
 	w.tapOwner = owner
 	w.ownerMu.Unlock()
 }
+
 func (w *warmHandle) Shutdown(ctx context.Context, grace time.Duration) error {
 	if w.driver != nil {
 		w.driver.rssUnregister(w.slotID)

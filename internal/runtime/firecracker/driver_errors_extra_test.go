@@ -37,8 +37,8 @@ func TestConfigureVMMForLoad_Errors_Extra(t *testing.T) {
 	// Write dummy files for checksum
 	mem := filepath.Join(t.TempDir(), "mem")
 	state := filepath.Join(t.TempDir(), "state")
-	os.WriteFile(mem, []byte("x"), 0644)
-	os.WriteFile(state, []byte("y"), 0644)
+	os.WriteFile(mem, []byte("x"), 0o644)
+	os.WriteFile(state, []byte("y"), 0o644)
 	if err := d.configureVMMForLoad(ctx, client, &TemplateResolution{
 		SnapshotMemoryPath: mem,
 		SnapshotStatePath:  state,
@@ -53,11 +53,11 @@ func TestLinkOrCopyRootfs_Errors_Extra(t *testing.T) {
 
 	// Create a valid source file
 	src := filepath.Join(dir, "src")
-	os.WriteFile(src, []byte("data"), 0644)
+	os.WriteFile(src, []byte("data"), 0o644)
 
 	// Make dst a directory
 	dstDir := filepath.Join(dir, "dstDir")
-	os.Mkdir(dstDir, 0755)
+	os.Mkdir(dstDir, 0o755)
 
 	// Link should fail with EEXIST (if dstDir exists) or similar, which is not EXDEV/EPERM
 	err := linkOrCopyRootfs(src, dstDir)
@@ -164,13 +164,13 @@ func TestDriver_Inspect_Ping_Extra(t *testing.T) {
 	d.cfg.FirecrackerBinary = filepath.Join(dir, "fc")
 	d.cfg.JailerBinary = filepath.Join(dir, "jail")
 	d.cfg.KernelImage = filepath.Join(dir, "kernel")
-	os.WriteFile(d.cfg.FirecrackerBinary, nil, 0755)
-	os.WriteFile(d.cfg.JailerBinary, nil, 0755)
+	os.WriteFile(d.cfg.FirecrackerBinary, nil, 0o755)
+	os.WriteFile(d.cfg.JailerBinary, nil, 0o755)
 
 	if err := d.Ping(ctx); err == nil || (!strings.Contains(err.Error(), "stat") && !strings.Contains(err.Error(), "no such file")) {
 		t.Errorf("expected stat error for KernelImage, got %v", err)
 	}
-	os.WriteFile(d.cfg.KernelImage, nil, 0755)
+	os.WriteFile(d.cfg.KernelImage, nil, 0o755)
 	if err := d.Ping(ctx); err != nil {
 		t.Errorf("expected nil error, got %v", err)
 	}

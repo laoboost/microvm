@@ -1,11 +1,10 @@
 package worker
 
 import (
-	"net/http/httptest"
-
 	"context"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -157,6 +156,7 @@ func TestClient_ContextErrors(t *testing.T) {
 		t.Error("expected error on canceled context")
 	}
 }
+
 func TestClient_AllMethods_Success(t *testing.T) {
 	c := NewClient("dummy")
 	c.dial = func(string) (net.Conn, error) {

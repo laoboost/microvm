@@ -18,8 +18,10 @@ import (
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
-const poolParkLabelKey = "aerol.pool"
-const poolParkLabelValue = "park"
+const (
+	poolParkLabelKey   = "aerol.pool"
+	poolParkLabelValue = "park"
+)
 
 // isParkedContainerLabels reports whether Docker labels mark a warm-pool
 // parked container (not a sandbox). Used by ListManaged so reconcile does

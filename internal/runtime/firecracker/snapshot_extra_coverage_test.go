@@ -101,7 +101,7 @@ func TestSnapshot_ExtraCoverage(t *testing.T) {
 
 	// mem digest mismatch
 	memPath := filepath.Join(dir, "mem")
-	os.WriteFile(memPath, []byte("mem content"), 0644)
+	os.WriteFile(memPath, []byte("mem content"), 0o644)
 	if err := verifySnapshotChecksum(memPath, "state", expected); err == nil || !strings.Contains(err.Error(), "memory file") {
 		t.Errorf("expected memory digest mismatch, got %v", err)
 	}
@@ -116,7 +116,7 @@ func TestSnapshot_ExtraCoverage(t *testing.T) {
 
 	// state digest mismatch
 	statePath := filepath.Join(dir, "state")
-	os.WriteFile(statePath, []byte("state content"), 0644)
+	os.WriteFile(statePath, []byte("state content"), 0o644)
 	if err := verifySnapshotChecksum(memPath, statePath, expected2); err == nil || !strings.Contains(err.Error(), "state file") {
 		t.Errorf("expected state digest mismatch, got %v", err)
 	}

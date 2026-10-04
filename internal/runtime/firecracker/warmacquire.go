@@ -342,6 +342,7 @@ func (h *warmDestroyHandle) Start(_ context.Context) error { return nil }
 func (h *warmDestroyHandle) WaitSocket(_ context.Context, _ time.Duration) error {
 	return nil
 }
+
 func (h *warmDestroyHandle) Shutdown(ctx context.Context, grace time.Duration) error {
 	return h.spawned.Shutdown(ctx, grace)
 }

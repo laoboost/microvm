@@ -95,8 +95,10 @@ func TestClusterSecretEnvelopeAndRedactionRoundTrip(t *testing.T) {
 			Password: "supersecret",
 		},
 		Mounts: []models.MountSpec{
-			{Type: models.MountTypeS3, Target: "/data", Source: "bucket",
-				Credentials: map[string]string{"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "shh"}},
+			{
+				Type: models.MountTypeS3, Target: "/data", Source: "bucket",
+				Credentials: map[string]string{"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "shh"},
+			},
 			{Type: models.MountTypeNFS, Target: "/srv", Source: "nfs.example:/export"},
 		},
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},

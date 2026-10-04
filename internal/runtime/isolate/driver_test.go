@@ -242,17 +242,20 @@ func (h *fakeGroupHost) isStopped() bool {
 	defer h.mu.Unlock()
 	return h.stopped
 }
+
 func (h *fakeGroupHost) Unload(id string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.loaded, id)
 	return len(h.loaded)
 }
+
 func (h *fakeGroupHost) LoadedCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return len(h.loaded)
 }
+
 func (h *fakeGroupHost) Invoke(ctx context.Context, id string, r *http.Request) (*http.Response, error) {
 	if h.invokeFn != nil {
 		return h.invokeFn(ctx, id, r)
@@ -272,6 +275,7 @@ func (h *fakeGroupHost) SetEgressPolicy(id string, p EgressPolicy) {
 	h.egress[id] = p
 	h.mu.Unlock()
 }
+
 func (h *fakeGroupHost) Stop() error {
 	h.mu.Lock()
 	h.stopped = true

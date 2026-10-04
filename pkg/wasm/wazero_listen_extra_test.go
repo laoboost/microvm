@@ -1,8 +1,9 @@
 package wasm
 
 import (
-	"github.com/tetratelabs/wazero/api"
 	"testing"
+
+	"github.com/tetratelabs/wazero/api"
 )
 
 type mockWazeroModNoSys struct{ api.Module }

@@ -382,8 +382,8 @@ func TestClusterOwnershipAssertBranches(t *testing.T) {
 
 	count, err := svc.assertClusterOwnership(ctx, []*models.Sandbox{
 		nil,
-		&models.Sandbox{},
-		&models.Sandbox{ID: "sb-destroyed", Status: models.SandboxStatusDestroyed},
+		{},
+		{ID: "sb-destroyed", Status: models.SandboxStatusDestroyed},
 		running,
 		stopped,
 	}, map[string]*models.SandboxRuntimeState{})
@@ -397,7 +397,7 @@ func TestClusterOwnershipAssertBranches(t *testing.T) {
 		t.Fatalf("asserted states = %+v, want only the stopped firecracker sandbox", rec.asserted)
 	}
 
-	count, err = svc.assertClusterOwnership(ctx, []*models.Sandbox{nil, &models.Sandbox{}}, nil)
+	count, err = svc.assertClusterOwnership(ctx, []*models.Sandbox{nil, {}}, nil)
 	if err != nil {
 		t.Fatalf("assertClusterOwnership empty = %v", err)
 	}

@@ -155,8 +155,12 @@ func TestFailWinsOverPass(t *testing.T) {
 
 func TestSummarize(t *testing.T) {
 	rs := []Result{
-		{Status: StatusPass}, {Status: StatusPass}, {Status: StatusFail},
-		{Status: StatusSkip}, {Status: StatusPending}, {Status: StatusInconclusive},
+		{Status: StatusPass},
+		{Status: StatusPass},
+		{Status: StatusFail},
+		{Status: StatusSkip},
+		{Status: StatusPending},
+		{Status: StatusInconclusive},
 	}
 	s := summarize(rs)
 	if s.Pass != 2 || s.Fail != 1 || s.Skip != 1 || s.Pending != 1 || s.Inconclusive != 1 || s.Total != 6 {

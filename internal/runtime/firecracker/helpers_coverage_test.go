@@ -202,9 +202,11 @@ func (s *stubWarmBaseHandle) Pid() int          { return 7 }
 func (s *stubWarmBaseHandle) Start(context.Context) error {
 	return nil
 }
+
 func (s *stubWarmBaseHandle) WaitSocket(context.Context, time.Duration) error {
 	return nil
 }
+
 func (s *stubWarmBaseHandle) Shutdown(_ context.Context, _ time.Duration) error {
 	s.shutdownCalls++
 	return s.shutdownErr

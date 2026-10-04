@@ -111,5 +111,4 @@ func TestE2BHandlerCreateSnapshotCoverage(t *testing.T) {
 	if rr2.Code != http.StatusCreated {
 		t.Errorf("expected 201, got %d", rr2.Code)
 	}
-
 }

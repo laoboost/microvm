@@ -16,7 +16,7 @@ func writeDummyWasm(t *testing.T, dir string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, b, 0644); err != nil {
+	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -326,7 +326,7 @@ func TestSnapshotCodecHelpers(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "config.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(dir, "config.json"), []byte("{}"), 0o644)
 	if !DirExists(dir) {
 		t.Fatal("expected true")
 	}

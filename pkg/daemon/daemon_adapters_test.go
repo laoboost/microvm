@@ -317,7 +317,6 @@ func TestFirecrackerRootfsAdapter_BuildSuccess(t *testing.T) {
 }
 
 func TestFirecrackerRootfsAdapter_BuildWithInjectFiles(t *testing.T) {
-
 	in := &tap.Slot{TapName: "fctap1", CIDR: "172.16.0.0/30", HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 33, GuestMAC: "02:00:00:00:00:03"}
 	got := adaptTapSlot(in)
 	if got == nil || got.TapName != in.TapName || got.CIDR != in.CIDR || got.HostIP != in.HostIP || got.GuestIP != in.GuestIP || got.VsockCID != in.VsockCID || got.GuestMAC != in.GuestMAC {
@@ -496,5 +495,5 @@ func TestTemplateBuilderAdapter_BuildSuccess(t *testing.T) {
 func TestVMMTemplateListerAdapter_TypeUses(t *testing.T) {
 	// Compile-time sanity check that adapter output remains aligned with vmmpool input type.
 	var _ vmmpool.TemplateWarmInput
-	var _ = fcruntime.TemplateResolution{}
+	_ = fcruntime.TemplateResolution{}
 }

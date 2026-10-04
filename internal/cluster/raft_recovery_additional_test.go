@@ -71,14 +71,14 @@ func TestMaybeRecoverRaftClusterFromPeersFile(t *testing.T) {
 	}
 
 	// 2. Invalid JSON -> error
-	_ = os.WriteFile(path, []byte("invalid"), 0600)
+	_ = os.WriteFile(path, []byte("invalid"), 0o600)
 	err = maybeRecoverRaftClusterFromPeersFile(raftSetupConfig{DataDir: dir}, raft.DefaultConfig(), fsm, nil, nil, nil, nil, logger)
 	if err == nil {
 		t.Errorf("expected error for invalid json")
 	}
 
 	// 3. Valid JSON but RecoverCluster fails (nil stores/transport)
-	_ = os.WriteFile(path, []byte(`[{"id":"n1","address":"1"}]`), 0600)
+	_ = os.WriteFile(path, []byte(`[{"id":"n1","address":"1"}]`), 0o600)
 	err = maybeRecoverRaftClusterFromPeersFile(raftSetupConfig{DataDir: dir}, raft.DefaultConfig(), fsm, nil, nil, nil, nil, logger)
 	if err == nil {
 		t.Errorf("expected error from RecoverCluster due to nil stores")
@@ -86,7 +86,7 @@ func TestMaybeRecoverRaftClusterFromPeersFile(t *testing.T) {
 
 	// 4. File read error (directory instead of file)
 	os.Remove(path)
-	os.Mkdir(path, 0700)
+	os.Mkdir(path, 0o700)
 	err = maybeRecoverRaftClusterFromPeersFile(raftSetupConfig{DataDir: dir}, raft.DefaultConfig(), fsm, nil, nil, nil, nil, logger)
 	if err == nil {
 		t.Errorf("expected error for unreadable peers file")
@@ -99,7 +99,7 @@ func TestSetupRaftStoreErrors(t *testing.T) {
 
 	// Bad log store
 	dir := t.TempDir()
-	os.Mkdir(filepath.Join(dir, "raft-log.bolt"), 0700) // directory where file should be
+	os.Mkdir(filepath.Join(dir, "raft-log.bolt"), 0o700) // directory where file should be
 	_, err := setupRaft(raftSetupConfig{NodeID: "n1", DataDir: dir, BindAddr: "127.0.0.1:0"}, fsm, logger)
 	if err == nil {
 		t.Errorf("expected error for bad log store")
@@ -107,7 +107,7 @@ func TestSetupRaftStoreErrors(t *testing.T) {
 
 	// Bad stable store
 	dir2 := t.TempDir()
-	os.Mkdir(filepath.Join(dir2, "raft-stable.bolt"), 0700)
+	os.Mkdir(filepath.Join(dir2, "raft-stable.bolt"), 0o700)
 	_, err = setupRaft(raftSetupConfig{NodeID: "n1", DataDir: dir2, BindAddr: "127.0.0.1:0"}, fsm, logger)
 	if err == nil {
 		t.Errorf("expected error for bad stable store")
@@ -115,7 +115,7 @@ func TestSetupRaftStoreErrors(t *testing.T) {
 
 	// Bad recovery file causes error
 	dir3 := t.TempDir()
-	os.Mkdir(raftRecoveryPeersPath(dir3), 0700) // directory where peers.json should be
+	os.Mkdir(raftRecoveryPeersPath(dir3), 0o700) // directory where peers.json should be
 	_, err = setupRaft(raftSetupConfig{NodeID: "n1", DataDir: dir3, BindAddr: "127.0.0.1:0"}, fsm, logger)
 	if err == nil {
 		t.Errorf("expected error for bad recovery peers file during setupRaft")

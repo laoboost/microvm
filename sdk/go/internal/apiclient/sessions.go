@@ -9,17 +9,18 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/gorilla/websocket"
 )
 
-type CreateSessionRequest = models.CreateSessionRequest
-type Session = models.Session
-type SessionList = models.SessionList
-type SessionStatus = models.SessionStatus
-type SessionSignalRequest = models.SessionSignalRequest
-type SessionResizeRequest = models.SessionResizeRequest
+type (
+	CreateSessionRequest = models.CreateSessionRequest
+	Session              = models.Session
+	SessionList          = models.SessionList
+	SessionStatus        = models.SessionStatus
+	SessionSignalRequest = models.SessionSignalRequest
+	SessionResizeRequest = models.SessionResizeRequest
+)
 
 // Frame stream prefixes match the toolboxd session protocol (sessions_handler.go).
 // Reused via the existing streamPrefixStdout/streamPrefixStderr in exec_stream.go.

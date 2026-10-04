@@ -56,36 +56,45 @@ func (f *fakeReconcileRuntime) RemoveImage(_ context.Context, _ string) error {
 func (f *fakeReconcileRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Create on reconcile destroyed path")
 }
+
 func (f *fakeReconcileRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	panic("unexpected CreateSnapshot on reconcile destroyed path")
 }
+
 func (f *fakeReconcileRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Start on reconcile destroyed path")
 }
+
 func (f *fakeReconcileRuntime) Stop(context.Context, string) error {
 	panic("unexpected Stop on reconcile destroyed path")
 }
+
 func (f *fakeReconcileRuntime) Destroy(context.Context, *models.Sandbox) error {
 	panic("unexpected Destroy on reconcile destroyed path: container is already gone")
 }
+
 func (f *fakeReconcileRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	panic("unexpected Resize on reconcile destroyed path")
 }
+
 func (f *fakeReconcileRuntime) Inspect(_ context.Context, ref string) (*models.SandboxRuntimeState, error) {
 	if st, ok := f.inspect[ref]; ok {
 		return st, nil
 	}
 	return nil, errors.New("container not found")
 }
+
 func (f *fakeReconcileRuntime) Ping(context.Context) error {
 	panic("unexpected Ping on reconcile destroyed path")
 }
+
 func (f *fakeReconcileRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	if !f.allowPushAllowedPorts {
 		panic("unexpected PushAllowedPorts on reconcile destroyed path")
 	}
 	return nil
 }
+
 func (f *fakeReconcileRuntime) ClearNetworkRules(string) error {
 	return nil
 }
@@ -107,12 +116,15 @@ func (f *fakeReconcileRuntime) ApplyNetworkBlockAllReport(containerIP string) (b
 	}
 	return f.networkBlockAllInserted, nil
 }
+
 func (f *fakeReconcileRuntime) ApplyNetworkBlockIngress(string) error {
 	return nil
 }
+
 func (f *fakeReconcileRuntime) ClearNetworkBlockIngress(string) error {
 	return nil
 }
+
 func (f *fakeReconcileRuntime) ClearNetworkBlockEgress(string) error {
 	return nil
 }

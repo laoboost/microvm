@@ -17,9 +17,9 @@ func TestCopyFile_Extra(t *testing.T) {
 
 	// dst create fails (e.g. dst is a directory)
 	src := filepath.Join(dir, "src")
-	os.WriteFile(src, []byte("data"), 0644)
+	os.WriteFile(src, []byte("data"), 0o644)
 	dstDir := filepath.Join(dir, "dstDir")
-	os.Mkdir(dstDir, 0755)
+	os.Mkdir(dstDir, 0o755)
 	if err := copyFile(src, dstDir); err == nil || !strings.Contains(err.Error(), "create") {
 		t.Errorf("expected create error, got %v", err)
 	}

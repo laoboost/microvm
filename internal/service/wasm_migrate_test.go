@@ -21,9 +21,7 @@ import (
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
-var (
-	_ wasmruntime.MigrationHost = (*fakeWasmMigrateRuntime)(nil)
-)
+var _ wasmruntime.MigrationHost = (*fakeWasmMigrateRuntime)(nil)
 
 type fakeWasmMigrateRuntime struct {
 	wasmModuleAPINoopRuntime

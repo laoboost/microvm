@@ -15,10 +15,10 @@ func TestReadWriteSandboxSnapshotManifest_Extra(t *testing.T) {
 
 	sbID := "test-manifest"
 	_, _, _, _, _, manifestPath := d.sandboxSnapshotPaths(sbID)
-	os.MkdirAll(filepath.Dir(manifestPath), 0755)
+	os.MkdirAll(filepath.Dir(manifestPath), 0o755)
 
 	// read error (invalid JSON)
-	os.WriteFile(manifestPath, []byte("not-json"), 0644)
+	os.WriteFile(manifestPath, []byte("not-json"), 0o644)
 	if _, err := d.readSandboxSnapshotManifest(sbID); err == nil || !strings.Contains(err.Error(), "decode sandbox") {
 		t.Errorf("expected decode error, got %v", err)
 	}
