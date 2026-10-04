@@ -12,17 +12,16 @@ import (
 	"testing"
 	"time"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	cntr "github.com/containerd/containerd"
+	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/images"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespecs "github.com/opencontainers/runtime-spec/specs-go"
 )
 

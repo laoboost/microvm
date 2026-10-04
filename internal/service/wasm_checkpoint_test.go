@@ -279,12 +279,15 @@ func (s *wasmCheckpointPusherStub) DestRefFor(sandboxID string) string { return 
 func (s *wasmCheckpointPusherStub) DestRefTagged(sandboxID, tag string) string {
 	return "test://sb:" + tag
 }
+
 func (s *wasmCheckpointPusherStub) PushOnceTo(ctx context.Context, sandboxID, memSnapDir, destRef string) (WasmCheckpointPushResult, error) {
 	return WasmCheckpointPushResult{RegistryRef: destRef, Digest: "sha256:123"}, nil
 }
+
 func (s *wasmCheckpointPusherStub) PullOnce(ctx context.Context, registryRef, destDir string) error {
 	return nil
 }
+
 func (s *wasmCheckpointPusherStub) DeleteRef(ctx context.Context, registryRef string) error {
 	return nil
 }
@@ -295,6 +298,7 @@ func (f failingWasmCheckpointPusher) DestRefFor(string) string { return "test://
 func (f failingWasmCheckpointPusher) DestRefTagged(sandboxID, tag string) string {
 	return "test://" + sandboxID + ":" + tag
 }
+
 func (f failingWasmCheckpointPusher) PushOnceTo(context.Context, string, string, string) (WasmCheckpointPushResult, error) {
 	return WasmCheckpointPushResult{}, errors.New("push failed")
 }

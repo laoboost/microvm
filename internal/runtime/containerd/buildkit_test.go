@@ -11,9 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	cntr "github.com/containerd/containerd"
-
 	"github.com/aerol-ai/microvm/pkg/docker"
+	cntr "github.com/containerd/containerd"
 )
 
 func TestNewBuildKitBuilderDefaults(t *testing.T) {

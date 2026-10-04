@@ -22,7 +22,7 @@ func TestSandboxSnapshot_CopyFile_ExtraCoverage(t *testing.T) {
 
 	// dst creation fails (e.g. dst is a directory)
 	srcPath := filepath.Join(dir, "src")
-	os.WriteFile(srcPath, []byte("test"), 0600)
+	os.WriteFile(srcPath, []byte("test"), 0o600)
 	if err := copyFile(srcPath, dir); err == nil || !strings.Contains(err.Error(), "create ") {
 		t.Errorf("expected create error, got %v", err)
 	}

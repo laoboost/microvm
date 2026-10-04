@@ -41,8 +41,10 @@ func TestSandboxBridgeInterfaces(t *testing.T) {
 		{name: "docker_default_network", cfg: config.Config{DockerNetwork: "bridge"}, want: []string{"docker0"}},
 		{name: "docker_zero_value_network", cfg: config.Config{}, want: []string{"docker0"}},
 		{name: "docker_custom_network", cfg: config.Config{DockerNetwork: "aerolvm-net"}, want: []string{""}},
-		{name: "containerd", cfg: config.Config{ContainerEngine: models.ContainerEngineContainerd, DockerNetwork: "bridge"},
-			want: []string{"aerolvm0", "docker0"}},
+		{
+			name: "containerd", cfg: config.Config{ContainerEngine: models.ContainerEngineContainerd, DockerNetwork: "bridge"},
+			want: []string{"aerolvm0", "docker0"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -6,10 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/singleflight"
-
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"golang.org/x/sync/singleflight"
 )
 
 // Config holds containerd-driver settings projected from daemon config.
@@ -122,6 +121,7 @@ func New(cfg Config, rules *netrules.Manager, logger *slog.Logger) *Driver {
 func (d *Driver) SetNetnsHandoff(h NetnsHandoff) {
 	d.netns = h
 }
+
 func (d *Driver) SetClient(c *Client) {
 	d.clientMu.Lock()
 	defer d.clientMu.Unlock()

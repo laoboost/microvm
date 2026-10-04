@@ -12,8 +12,10 @@ import (
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
-const defaultAPIURL = "http://127.0.0.1:21212"
-const authRequiredErrorMessage = "PAT token is required. Set PATToken or SB_PAT_TOKEN."
+const (
+	defaultAPIURL            = "http://127.0.0.1:21212"
+	authRequiredErrorMessage = "PAT token is required. Set PATToken or SB_PAT_TOKEN."
+)
 
 type Client struct {
 	apiURL   string

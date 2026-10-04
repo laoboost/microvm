@@ -39,7 +39,7 @@ func testEngineErrorPaths(t *testing.T, eng Engine) {
 
 	// Error on LoadModule (invalid wasm)
 	badWasm := filepath.Join(t.TempDir(), "bad.wasm")
-	os.WriteFile(badWasm, []byte("not a wasm file"), 0644)
+	os.WriteFile(badWasm, []byte("not a wasm file"), 0o644)
 	if err := eng.LoadModule(ctx, badWasm, LoadOptions{}); err == nil {
 		t.Fatalf("expected error on LoadModule bad wasm")
 	}
@@ -76,7 +76,7 @@ func testEngineErrorPaths(t *testing.T, eng Engine) {
 	// Create a dummy wasm to test Instantiate error paths
 	goodWasm := filepath.Join(t.TempDir(), "good.wasm")
 	// Valid wasm module with 1 page memory exported:
-	os.WriteFile(goodWasm, []byte("\x00\x61\x73\x6d\x01\x00\x00\x00\x05\x03\x01\x00\x01\x07\x0a\x01\x06\x6d\x65\x6d\x6f\x72\x79\x02\x00"), 0644)
+	os.WriteFile(goodWasm, []byte("\x00\x61\x73\x6d\x01\x00\x00\x00\x05\x03\x01\x00\x01\x07\x0a\x01\x06\x6d\x65\x6d\x6f\x72\x79\x02\x00"), 0o644)
 	if err := eng.LoadModule(ctx, goodWasm, LoadOptions{MemoryMB: 16}); err != nil {
 		t.Fatalf("failed to load good wasm: %v", err)
 	}
@@ -99,7 +99,7 @@ func testEngineErrorPaths(t *testing.T, eng Engine) {
 	// Test CaptureSnapshot on module with no memory (goodWasm has no memory now)
 	engNoMem, _ := newWazeroEngine(ctx)
 	noMemWasm := filepath.Join(t.TempDir(), "nomem.wasm")
-	os.WriteFile(noMemWasm, []byte("\x00\x61\x73\x6d\x01\x00\x00\x00"), 0644)
+	os.WriteFile(noMemWasm, []byte("\x00\x61\x73\x6d\x01\x00\x00\x00"), 0o644)
 	_ = engNoMem.LoadModule(ctx, noMemWasm, LoadOptions{})
 	_ = engNoMem.Instantiate(ctx, Capabilities{})
 	if _, err := engNoMem.CaptureSnapshot(ctx); err == nil {
@@ -120,13 +120,14 @@ func testEngineErrorPaths(t *testing.T, eng Engine) {
 	_, _ = eng.Run(ctx, Capabilities{}, "")
 	_, _ = eng.Run(ctx, Capabilities{}, "")
 }
+
 func TestRunBadExport(t *testing.T) {
 	ctx := context.Background()
 	eng, _ := newWazeroEngine(ctx)
 	defer eng.Close(ctx)
 
 	goodWasm := filepath.Join(t.TempDir(), "good.wasm")
-	os.WriteFile(goodWasm, []byte("\x00\x61\x73\x6d\x01\x00\x00\x00\x05\x03\x01\x00\x01\x07\x0a\x01\x06\x6d\x65\x6d\x6f\x72\x79\x02\x00"), 0644)
+	os.WriteFile(goodWasm, []byte("\x00\x61\x73\x6d\x01\x00\x00\x00\x05\x03\x01\x00\x01\x07\x0a\x01\x06\x6d\x65\x6d\x6f\x72\x79\x02\x00"), 0o644)
 	eng.LoadModule(ctx, goodWasm, LoadOptions{MemoryMB: 16})
 	eng.Instantiate(ctx, Capabilities{})
 
@@ -134,6 +135,7 @@ func TestRunBadExport(t *testing.T) {
 		t.Fatalf("expected error on Run with bad export")
 	}
 }
+
 func TestWazeroEngine_EnsureWasiCompatHosts(t *testing.T) {
 	ctx := context.Background()
 	eng, err := newWazeroEngine(ctx)

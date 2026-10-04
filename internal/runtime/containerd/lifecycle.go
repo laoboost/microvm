@@ -11,18 +11,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
+	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/remotes/docker"
 	refdocker "github.com/distribution/reference"
 	"github.com/opencontainers/runtime-spec/specs-go"
-
-	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
-	"github.com/aerol-ai/microvm/pkg/createtiming"
-	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
-	"github.com/aerol-ai/microvm/pkg/models"
-	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
 // Create provisions and starts a managed task in the aerolvm namespace.

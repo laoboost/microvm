@@ -51,8 +51,10 @@ func (d *Driver) runscRuntimeOpts() (interface{}, error) {
 // by the first cluster-3-mixed-gvisor bench; reproduces with plain ctr too).
 // Every AerolVM sandbox is one container == one gvisor sandbox, so declaring
 // it a sandbox container is semantically exact.
-const criContainerTypeAnnotation = "io.kubernetes.cri.container-type"
-const criContainerTypeSandbox = "sandbox"
+const (
+	criContainerTypeAnnotation = "io.kubernetes.cri.container-type"
+	criContainerTypeSandbox    = "sandbox"
+)
 
 // runscSandboxAnnotationOpt returns the spec opt every runsc container needs.
 func runscSandboxAnnotationOpt() oci.SpecOpts {

@@ -37,8 +37,10 @@ type OTELTracesConfig struct {
 
 const defaultOTELMetricsInterval = 30 * time.Second
 
-type MetricsShutdown func(context.Context) error
-type TracesShutdown func(context.Context) error
+type (
+	MetricsShutdown func(context.Context) error
+	TracesShutdown  func(context.Context) error
+)
 
 // Exporter constructors / gauge helpers are package vars so tests can force
 // the New()/gauge error arms — otlp*http.New is permissive of malformed

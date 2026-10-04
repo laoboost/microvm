@@ -24,6 +24,7 @@ type wasmModuleAPINoopRuntime struct{}
 func (wasmModuleAPINoopRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	return nil, nil
 }
+
 func (wasmModuleAPINoopRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	return nil, nil
 }
@@ -31,15 +32,19 @@ func (wasmModuleAPINoopRuntime) Stop(context.Context, string) error { return nil
 func (wasmModuleAPINoopRuntime) Destroy(context.Context, *models.Sandbox) error {
 	return nil
 }
+
 func (wasmModuleAPINoopRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	return "", nil
 }
+
 func (wasmModuleAPINoopRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	return nil
 }
+
 func (wasmModuleAPINoopRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
 	return nil, nil
 }
+
 func (wasmModuleAPINoopRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	return nil, nil
 }

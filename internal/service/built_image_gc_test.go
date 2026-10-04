@@ -70,15 +70,19 @@ func (*recordingRemoveRuntime) Stop(context.Context, string) error { panic("Stop
 func (*recordingRemoveRuntime) Destroy(context.Context, *models.Sandbox) error {
 	panic("Destroy not used")
 }
+
 func (*recordingRemoveRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	panic("CreateSnapshot not used")
 }
+
 func (*recordingRemoveRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	panic("Resize not used")
 }
+
 func (*recordingRemoveRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("Inspect not used")
 }
+
 func (*recordingRemoveRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	panic("ListManaged not used")
 }

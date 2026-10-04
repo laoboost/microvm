@@ -23,7 +23,7 @@ func TestLoadClusterTLS(t *testing.T) {
 	}
 
 	// Invalid CA
-	os.WriteFile(filepath.Join(dir, tlsCAFile), []byte("invalid"), 0644)
+	os.WriteFile(filepath.Join(dir, tlsCAFile), []byte("invalid"), 0o644)
 	_, err = loadClusterTLS(dir)
 	if err == nil {
 		t.Errorf("expected error invalid CA")

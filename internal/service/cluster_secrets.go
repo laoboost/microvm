@@ -69,8 +69,10 @@ type clusterSealedSecretsEnvelope struct {
 	Payload    []byte   `json:"payload"`
 }
 
-const clusterSecretVersion = 1
-const clusterSecretEnvelopeVersion = 3
+const (
+	clusterSecretVersion         = 1
+	clusterSecretEnvelopeVersion = 3
+)
 
 // SealClusterSecrets extracts the secret-bearing portions of req, marshals
 // them as JSON, and encrypts the result with the service cipher. The output

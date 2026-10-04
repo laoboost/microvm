@@ -471,12 +471,15 @@ type errStateKV struct{}
 func (e *errStateKV) Get(_ context.Context, _, _ string) ([]byte, bool, error) {
 	return nil, false, errors.New("get error")
 }
+
 func (e *errStateKV) Set(_ context.Context, _, _ string, _ []byte) error {
 	return errors.New("set error")
 }
+
 func (e *errStateKV) Delete(_ context.Context, _, _ string) error {
 	return errors.New("delete error")
 }
+
 func (e *errStateKV) ListKeys(_ context.Context, _ string) ([]string, error) {
 	return nil, errors.New("list error")
 }

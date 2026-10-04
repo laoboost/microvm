@@ -21,11 +21,11 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 	d.tapHost = &fakeTapHost{}
 	d.vsockDial = newFakeVsockDialer()
 	base, _ := d.sandboxSnapshotBase()
-	os.MkdirAll(base, 0755)
+	os.MkdirAll(base, 0o755)
 
 	sbID := "test-start-errs"
 	dir, memPath, statePath, rootfsPath, overlayPath, manifestPath := d.sandboxSnapshotPaths(sbID)
-	os.MkdirAll(dir, 0755)
+	os.MkdirAll(dir, 0o755)
 
 	// Manifest missing
 	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "read sandbox snapshot manifest") {
@@ -41,7 +41,7 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 		CreatedAt:        time.Now(),
 	}
 	b, _ := json.Marshal(manifest)
-	os.WriteFile(manifestPath, b, 0644)
+	os.WriteFile(manifestPath, b, 0o644)
 
 	// Verify fail (missing mem/state)
 	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "snapshot integrity") {
@@ -49,27 +49,27 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 	}
 
 	// Fix checksum
-	os.WriteFile(memPath, []byte("mem"), 0644)
-	os.WriteFile(statePath, []byte("state"), 0644)
+	os.WriteFile(memPath, []byte("mem"), 0o644)
+	os.WriteFile(statePath, []byte("state"), 0o644)
 	memD, _, _ := hashFile(memPath)
 	stateD, _, _ := hashFile(statePath)
 	manifest.SnapshotChecksum = formatSnapshotChecksum(memD, stateD)
 	b, _ = json.Marshal(manifest)
-	os.WriteFile(manifestPath, b, 0644)
+	os.WriteFile(manifestPath, b, 0o644)
 
 	// Rootfs missing
 	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "snapshot rootfs missing") {
 		t.Errorf("expected rootfs missing error, got %v", err)
 	}
 
-	os.WriteFile(rootfsPath, []byte("rootfs"), 0644)
+	os.WriteFile(rootfsPath, []byte("rootfs"), 0o644)
 
 	// Overlay missing
 	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "snapshot overlay missing") {
 		t.Errorf("expected overlay missing error, got %v", err)
 	}
 
-	os.WriteFile(overlayPath, []byte("overlay"), 0644)
+	os.WriteFile(overlayPath, []byte("overlay"), 0o644)
 
 	// Tap slot missing (fakePool doesn't have it allocated)
 	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "tap slot missing") {

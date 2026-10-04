@@ -36,14 +36,16 @@ var pathPrefixes = map[APIVersion]string{
 	APIVersionV1: apiv1.PathPrefix,
 }
 
-type CreateOptions = models.CreateSandboxRequest
-type ResizeOptions = models.ResizeSandboxRequest
-type ExecRequest = models.ExecRequest
-type ExecResult = models.ExecResult
-type ExposedPort = models.ExposedPort
-type ExposeResult = models.ExposePortResponse
-type SandboxSnapshot = models.SandboxSnapshot
-type HealthStatus = models.HealthStatus
+type (
+	CreateOptions   = models.CreateSandboxRequest
+	ResizeOptions   = models.ResizeSandboxRequest
+	ExecRequest     = models.ExecRequest
+	ExecResult      = models.ExecResult
+	ExposedPort     = models.ExposedPort
+	ExposeResult    = models.ExposePortResponse
+	SandboxSnapshot = models.SandboxSnapshot
+	HealthStatus    = models.HealthStatus
+)
 
 type Client struct {
 	baseURL       string

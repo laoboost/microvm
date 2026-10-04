@@ -53,6 +53,7 @@ func (p *Pool) SetSpawner(s Spawner) {
 	p.spawner = s
 	p.mu.Unlock()
 }
+
 func (p *Pool) SetParkReleaser(fn func(slotID string)) {
 	p.mu.Lock()
 	p.onReleasePark = fn
@@ -93,16 +94,19 @@ func (p *Pool) destroySlots(ctx context.Context, slots []*ParkedSlot) {
 		p.releasePark(slot.ID)
 	}
 }
+
 func (p *Pool) SetDefaultDepth(n int) {
 	p.mu.Lock()
 	p.defaultDepth = n
 	p.mu.Unlock()
 }
+
 func (p *Pool) SetMaxImages(n int) {
 	p.mu.Lock()
 	p.maxImages = n
 	p.mu.Unlock()
 }
+
 func (p *Pool) SetIdleTTL(d time.Duration) {
 	p.mu.Lock()
 	p.idleTTL = d

@@ -58,7 +58,6 @@ func TestSetupRaftSuccessAndClose(t *testing.T) {
 		DataDir:  dir,
 		BindAddr: "127.0.0.1:0", // random port
 	}, fsm, logger)
-
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

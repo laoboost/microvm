@@ -1129,6 +1129,7 @@ func (f fakeConnMetadata) ServerVersion() []byte { return []byte("ssh-2.0-server
 func (f fakeConnMetadata) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222}
 }
+
 func (f fakeConnMetadata) LocalAddr() net.Addr {
 	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 22}
 }
@@ -1270,7 +1271,6 @@ func TestFindOrCreateSessionErrors(t *testing.T) {
 }
 
 func TestFindOrCreateSessionHttp(t *testing.T) {
-
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		if r.Method == "GET" {

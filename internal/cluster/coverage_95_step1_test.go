@@ -523,6 +523,7 @@ func (f *step1RecoveryStore) Put(string, placementRecovery) (string, error) { re
 func (f *step1RecoveryStore) Get(string) (placementRecovery, bool, error) {
 	return placementRecovery{}, false, nil
 }
+
 func (f *step1RecoveryStore) GetRecord(string) (placementRecoveryStoreRecord, bool, error) {
 	return placementRecoveryStoreRecord{}, false, nil
 }

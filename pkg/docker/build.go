@@ -16,9 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sync/singleflight"
-
 	"github.com/aerol-ai/microvm/pkg/models"
+	"golang.org/x/sync/singleflight"
 )
 
 // buildGroup deduplicates concurrent BuildImage calls. Two requests landing

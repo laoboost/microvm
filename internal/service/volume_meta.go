@@ -52,27 +52,35 @@ type sqliteVolumeMeta struct{ store *store.Store }
 func (m sqliteVolumeMeta) GetOrCreate(ctx context.Context, v *models.Volume, maxPerTenant int) (*models.Volume, bool, error) {
 	return m.store.GetOrCreateVolume(ctx, v, maxPerTenant)
 }
+
 func (m sqliteVolumeMeta) ByID(ctx context.Context, tenant, id string) (*models.Volume, error) {
 	return m.store.GetVolumeByID(ctx, tenant, id)
 }
+
 func (m sqliteVolumeMeta) ByName(ctx context.Context, tenant, name string) (*models.Volume, error) {
 	return m.store.GetVolume(ctx, tenant, name)
 }
+
 func (m sqliteVolumeMeta) List(ctx context.Context, tenant string) ([]models.Volume, error) {
 	return m.store.ListVolumes(ctx, tenant)
 }
+
 func (m sqliteVolumeMeta) DeleteRow(ctx context.Context, tenant, id string) error {
 	return m.store.DeleteVolume(ctx, tenant, id)
 }
+
 func (m sqliteVolumeMeta) ExistsForSource(ctx context.Context, source string) (bool, error) {
 	return m.store.LiveVolumeExistsForSource(ctx, source)
 }
+
 func (m sqliteVolumeMeta) AttachmentCount(ctx context.Context, tenant, id string) (int, error) {
 	return m.store.CountVolumeAttachments(ctx, tenant, id)
 }
+
 func (m sqliteVolumeMeta) PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
 	return m.store.PutVolumeAttachments(ctx, attachments)
 }
+
 func (m sqliteVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
 	return m.store.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID)
 }
@@ -92,6 +100,7 @@ func (m clusterVolumeMeta) GetOrCreate(ctx context.Context, v *models.Volume, ma
 	}
 	return &row, created, nil
 }
+
 func (m clusterVolumeMeta) ByID(ctx context.Context, tenant, id string) (*models.Volume, error) {
 	row, err := m.c.VolumeByID(ctx, tenant, id)
 	if err != nil {
@@ -99,6 +108,7 @@ func (m clusterVolumeMeta) ByID(ctx context.Context, tenant, id string) (*models
 	}
 	return &row, nil
 }
+
 func (m clusterVolumeMeta) ByName(ctx context.Context, tenant, name string) (*models.Volume, error) {
 	row, err := m.c.VolumeByName(ctx, tenant, name)
 	if err != nil {
@@ -106,24 +116,30 @@ func (m clusterVolumeMeta) ByName(ctx context.Context, tenant, name string) (*mo
 	}
 	return &row, nil
 }
+
 func (m clusterVolumeMeta) List(ctx context.Context, tenant string) ([]models.Volume, error) {
 	return m.c.VolumesForTenant(ctx, tenant)
 }
+
 func (m clusterVolumeMeta) DeleteRow(ctx context.Context, tenant, id string) error {
 	return mapVolumeNotFound(m.c.VolumeDelete(ctx, tenant, id))
 }
+
 func (m clusterVolumeMeta) ExistsForSource(ctx context.Context, source string) (bool, error) {
 	return m.c.VolumeExistsForSource(ctx, source)
 }
+
 func (m clusterVolumeMeta) AttachmentCount(ctx context.Context, tenant, id string) (int, error) {
 	return m.c.VolumeAttachmentCount(ctx, tenant, id)
 }
+
 func (m clusterVolumeMeta) PutAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
 	if err := m.c.PutVolumeAttachments(ctx, attachments); err != nil {
 		return mapVolumeNotFound(err)
 	}
 	return nil
 }
+
 func (m clusterVolumeMeta) DeleteAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
 	return m.c.DeleteVolumeAttachmentsForSandbox(ctx, sandboxID)
 }

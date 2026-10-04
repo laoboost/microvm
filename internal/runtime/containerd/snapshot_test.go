@@ -7,14 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/models"
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	runtimeoptions "github.com/containerd/containerd/pkg/runtimeoptions/v1"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
-	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 func TestSplitSnapshotImageRef(t *testing.T) {
@@ -177,24 +176,28 @@ func (f *fakeSnapshotBackend) loadContainer(context.Context, *Client, string) (c
 	}
 	return f.container, nil
 }
+
 func (f *fakeSnapshotBackend) createDiff(context.Context, string, string, cntr.Container) (ocispec.Descriptor, error) {
 	if f.createDiffErr != nil {
 		return ocispec.Descriptor{}, f.createDiffErr
 	}
 	return f.diffDesc, nil
 }
+
 func (f *fakeSnapshotBackend) baseManifestAndConfig(context.Context, ocispec.Descriptor) (ocispec.Manifest, ocispec.Image, error) {
 	if f.manifestErr != nil {
 		return ocispec.Manifest{}, ocispec.Image{}, f.manifestErr
 	}
 	return f.baseManifest, f.baseConfig, nil
 }
+
 func (f *fakeSnapshotBackend) diffID(context.Context, ocispec.Descriptor) (digest.Digest, error) {
 	if f.diffIDErr != nil {
 		return "", f.diffIDErr
 	}
 	return f.diffIDVal, nil
 }
+
 func (f *fakeSnapshotBackend) writeBlob(_ context.Context, mediaType string, data []byte, labels map[string]string) (ocispec.Descriptor, error) {
 	if f.writeBlobErr != nil {
 		return ocispec.Descriptor{}, f.writeBlobErr
@@ -208,6 +211,7 @@ func (f *fakeSnapshotBackend) writeBlob(_ context.Context, mediaType string, dat
 	f.blobTypes[desc.Digest.String()] = mediaType
 	return desc, nil
 }
+
 func (f *fakeSnapshotBackend) createImage(_ context.Context, img images.Image) (images.Image, error) {
 	f.createdArg = img
 	if f.createErr != nil {
@@ -218,12 +222,14 @@ func (f *fakeSnapshotBackend) createImage(_ context.Context, img images.Image) (
 	}
 	return img, nil
 }
+
 func (f *fakeSnapshotBackend) getImage(context.Context, string) (images.Image, error) {
 	if f.getErr != nil {
 		return images.Image{}, f.getErr
 	}
 	return f.getImg, nil
 }
+
 func (f *fakeSnapshotBackend) unpack(context.Context, string, string) error {
 	f.unpacked = true
 	return f.unpackErr

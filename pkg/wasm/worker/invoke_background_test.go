@@ -51,6 +51,7 @@ func (e *ctxRecordingEngine) InvokeExport(ctx context.Context, export string) er
 	e.record(export, ctx)
 	return nil
 }
+
 func (e *ctxRecordingEngine) Run(context.Context, wasmengine.Capabilities, string) (wasmengine.RunResult, error) {
 	return wasmengine.RunResult{}, nil
 }
@@ -58,6 +59,7 @@ func (e *ctxRecordingEngine) StopInstance(context.Context) error { return nil }
 func (e *ctxRecordingEngine) CaptureSnapshot(context.Context) (wasmengine.SnapshotCapture, error) {
 	return wasmengine.SnapshotCapture{}, nil
 }
+
 func (e *ctxRecordingEngine) RestoreSnapshot(context.Context, wasmengine.SnapshotRestoreInput, wasmengine.Capabilities) error {
 	return nil
 }

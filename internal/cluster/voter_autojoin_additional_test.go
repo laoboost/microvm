@@ -1,9 +1,10 @@
 package cluster
 
 import (
+	"testing"
+
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/hashicorp/memberlist"
-	"testing"
 )
 
 func TestVoterAutoJoinDelegate(t *testing.T) {

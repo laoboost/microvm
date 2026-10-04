@@ -168,7 +168,8 @@ func TestUtilityHelpers(t *testing.T) {
 
 func TestMainRouteHandlerBranches(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &server{authOptional: true,
+	s := &server{
+		authOptional: true,
 		logger:       logger,
 		sandboxID:    "sb-test",
 		authToken:    "token-123",
@@ -504,7 +505,8 @@ func TestRoutesDispatchCoverage(t *testing.T) {
 	}
 	t.Cleanup(mgr.Close)
 
-	srv := &server{authOptional: true,
+	srv := &server{
+		authOptional: true,
 		logger:       logger,
 		sandboxID:    "sb-test",
 		allowedPorts: map[int]struct{}{},

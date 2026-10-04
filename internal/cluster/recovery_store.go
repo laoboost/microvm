@@ -16,8 +16,10 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-const placementRecoveryRefPrefix = "recovery:v1:"
-const placementRecoverySnapshotRefSets = 3
+const (
+	placementRecoveryRefPrefix       = "recovery:v1:"
+	placementRecoverySnapshotRefSets = 3
+)
 
 type placementRecoveryStore interface {
 	Put(sandboxID string, rec placementRecovery) (string, error)

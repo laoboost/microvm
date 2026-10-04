@@ -3,10 +3,11 @@ package worker
 import (
 	"context"
 	"errors"
-	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"net"
 	"net/http"
 	"testing"
+
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 type mockEngineError struct{}
@@ -14,12 +15,15 @@ type mockEngineError struct{}
 func (m *mockEngineError) LoadModule(ctx context.Context, path string, _ wasmengine.LoadOptions) error {
 	return errors.New("err")
 }
+
 func (m *mockEngineError) Instantiate(ctx context.Context, caps wasmengine.Capabilities) error {
 	return errors.New("err")
 }
+
 func (m *mockEngineError) Exec(ctx context.Context, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error) {
 	return wasmengine.RunResult{}, errors.New("err")
 }
+
 func (m *mockEngineError) Run(ctx context.Context, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error) {
 	return wasmengine.RunResult{}, errors.New("err")
 }
@@ -27,18 +31,23 @@ func (m *mockEngineError) Invoke(ctx context.Context, export string) error { ret
 func (m *mockEngineError) InvokeExport(ctx context.Context, export string) error {
 	return errors.New("err")
 }
+
 func (m *mockEngineError) Checkpoint(ctx context.Context, outDir string, meta wasmengine.SnapshotConfig) error {
 	return errors.New("err")
 }
+
 func (m *mockEngineError) CaptureSnapshot(ctx context.Context) (wasmengine.SnapshotCapture, error) {
 	return wasmengine.SnapshotCapture{}, errors.New("err")
 }
+
 func (m *mockEngineError) RestoreSnapshot(ctx context.Context, input wasmengine.SnapshotRestoreInput, caps wasmengine.Capabilities) error {
 	return errors.New("err")
 }
+
 func (m *mockEngineError) Restore(ctx context.Context, dir string, caps wasmengine.Capabilities) error {
 	return errors.New("err")
 }
+
 func (m *mockEngineError) SetCapability(ctx context.Context, caps wasmengine.Capabilities) error {
 	return errors.New("err")
 }

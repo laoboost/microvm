@@ -17,9 +17,11 @@ type mockEngine struct {
 func (m *mockEngine) LoadModule(ctx context.Context, path string, _ wasmengine.LoadOptions) error {
 	return m.err
 }
+
 func (m *mockEngine) Instantiate(ctx context.Context, caps wasmengine.Capabilities) error {
 	return m.err
 }
+
 func (m *mockEngine) Run(ctx context.Context, caps wasmengine.Capabilities, export string) (wasmengine.RunResult, error) {
 	return wasmengine.RunResult{}, m.err
 }
@@ -27,6 +29,7 @@ func (m *mockEngine) InvokeExport(ctx context.Context, export string) error { re
 func (m *mockEngine) CaptureSnapshot(ctx context.Context) (wasmengine.SnapshotCapture, error) {
 	return wasmengine.SnapshotCapture{}, m.err
 }
+
 func (m *mockEngine) RestoreSnapshot(ctx context.Context, inDir wasmengine.SnapshotRestoreInput, caps wasmengine.Capabilities) error {
 	return m.err
 }

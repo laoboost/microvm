@@ -10,10 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/models"
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
-
-	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // -------------------------------------------------------------------
@@ -323,5 +322,7 @@ func TestEnsureClient_WithWiredClient(t *testing.T) {
 }
 
 // keep imports active
-var _ = errdefs.ErrNotFound
-var _ = cntr.Running
+var (
+	_ = errdefs.ErrNotFound
+	_ = cntr.Running
+)

@@ -3548,7 +3548,8 @@ func (s *Store) loadPorts(ctx context.Context, sandboxID string) ([]models.Expos
 
 func scanSandbox(scanner interface {
 	Scan(dest ...any) error
-}) (*models.Sandbox, error) {
+},
+) (*models.Sandbox, error) {
 	var sandbox models.Sandbox
 	var envJSON string
 	var networkBlocked int
@@ -3692,7 +3693,8 @@ func scanSandbox(scanner interface {
 
 func scanCompatState(scanner interface {
 	Scan(dest ...any) error
-}) (*models.SandboxCompatState, error) {
+},
+) (*models.SandboxCompatState, error) {
 	var state models.SandboxCompatState
 	err := scanner.Scan(
 		&state.SandboxID,
@@ -3711,7 +3713,8 @@ func scanCompatState(scanner interface {
 
 func scanSnapshotAlias(scanner interface {
 	Scan(dest ...any) error
-}) (*models.SnapshotAlias, error) {
+},
+) (*models.SnapshotAlias, error) {
 	var alias models.SnapshotAlias
 	var extraNamesJSON string
 	err := scanner.Scan(
@@ -3740,7 +3743,8 @@ func scanSnapshotAlias(scanner interface {
 
 func scanIdempotentRequestRecord(scanner interface {
 	Scan(dest ...any) error
-}) (*models.IdempotentRequestRecord, error) {
+},
+) (*models.IdempotentRequestRecord, error) {
 	var record models.IdempotentRequestRecord
 	var replayUntil sql.NullTime
 	err := scanner.Scan(
@@ -3767,7 +3771,8 @@ func scanIdempotentRequestRecord(scanner interface {
 
 func scanSnapshot(scanner interface {
 	Scan(dest ...any) error
-}) (*models.SandboxSnapshot, error) {
+},
+) (*models.SandboxSnapshot, error) {
 	var snapshot models.SandboxSnapshot
 	var entrypointJSON string
 	var imageVerifiedAt sql.NullTime
@@ -3807,7 +3812,8 @@ func scanSnapshot(scanner interface {
 
 func scanTemplate(scanner interface {
 	Scan(dest ...any) error
-}) (*models.Template, error) {
+},
+) (*models.Template, error) {
 	var template models.Template
 	var readyAt sql.NullTime
 	var hasSnapshot int
@@ -4834,7 +4840,8 @@ func (s *Store) GetFirecrackerVMMPoolStats(ctx context.Context, templateID strin
 // every caller projects the same columns in the same order.
 func scanFirecrackerVMMSlot(row interface {
 	Scan(...any) error
-}) (*FirecrackerVMMSlot, error) {
+},
+) (*FirecrackerVMMSlot, error) {
 	var (
 		slot                              FirecrackerVMMSlot
 		sandboxID                         sql.NullString
@@ -5329,7 +5336,8 @@ var ErrJSBundleInUse = errors.New("js bundle is referenced by an active sandbox"
 
 func scanWasmModule(row interface {
 	Scan(dest ...any) error
-}) (WasmModuleRecord, error) {
+},
+) (WasmModuleRecord, error) {
 	var rec WasmModuleRecord
 	var hasWarm int
 	var readyAt sql.NullTime

@@ -141,9 +141,11 @@ type configurableCheckpointPusher struct {
 func (p *configurableCheckpointPusher) DestRefFor(id string) string {
 	return p.DestRefTagged(id, "latest")
 }
+
 func (p *configurableCheckpointPusher) DestRefTagged(sandboxID, tag string) string {
 	return "reg/" + sandboxID + ":" + tag
 }
+
 func (p *configurableCheckpointPusher) PushOnceTo(_ context.Context, _, _, destRef string) (WasmCheckpointPushResult, error) {
 	p.n++
 	if p.n > 1 && p.digestErr != nil {

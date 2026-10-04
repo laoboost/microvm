@@ -41,15 +41,19 @@ type volumeErrCluster struct {
 func (c *volumeErrCluster) VolumeByID(context.Context, string, string) (models.Volume, error) {
 	return models.Volume{}, c.byIDErr
 }
+
 func (c *volumeErrCluster) VolumeByName(context.Context, string, string) (models.Volume, error) {
 	return models.Volume{}, c.byNameErr
 }
+
 func (c *volumeErrCluster) VolumesForTenant(context.Context, string) ([]models.Volume, error) {
 	return nil, c.listErr
 }
+
 func (c *volumeErrCluster) VolumeExistsForSource(context.Context, string) (bool, error) {
 	return false, c.sourceErr
 }
+
 func (c *volumeErrCluster) VolumeAttachmentCount(context.Context, string, string) (int, error) {
 	return 0, c.attachErr
 }

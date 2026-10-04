@@ -28,9 +28,11 @@ type failPutRecoveryStore struct{}
 func (failPutRecoveryStore) Put(string, placementRecovery) (string, error) {
 	return "", errors.New("forced put failure")
 }
+
 func (failPutRecoveryStore) Get(string) (placementRecovery, bool, error) {
 	return placementRecovery{}, false, nil
 }
+
 func (failPutRecoveryStore) GetRecord(string) (placementRecoveryStoreRecord, bool, error) {
 	return placementRecoveryStoreRecord{}, false, nil
 }
@@ -663,7 +665,6 @@ func TestVoterAutoJoinAndDeadOwnerUnitBranches(t *testing.T) {
 	if _, ok := c.selectRecreationTargetExcluding(&models.CreateSandboxRequest{ImageDistributionMode: models.ImageDistributionLocalOnly}); ok {
 		t.Fatal("local-only exclude")
 	}
-
 }
 
 func TestAssertOwnershipGuardsAndStalePaths(t *testing.T) {

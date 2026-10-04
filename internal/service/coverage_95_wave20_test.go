@@ -59,30 +59,38 @@ type scriptedVolumeMeta struct {
 func (m *scriptedVolumeMeta) GetOrCreate(context.Context, *models.Volume, int) (*models.Volume, bool, error) {
 	return nil, false, m.getOrCreateErr
 }
+
 func (m *scriptedVolumeMeta) ByID(context.Context, string, string) (*models.Volume, error) {
 	if m.byIDErr != nil {
 		return nil, m.byIDErr
 	}
 	return m.byID, nil
 }
+
 func (m *scriptedVolumeMeta) ByName(context.Context, string, string) (*models.Volume, error) {
 	return nil, m.byNameErr
 }
+
 func (m *scriptedVolumeMeta) List(context.Context, string) ([]models.Volume, error) {
 	return nil, m.listErr
 }
+
 func (m *scriptedVolumeMeta) DeleteRow(context.Context, string, string) error {
 	return m.deleteRowErr
 }
+
 func (m *scriptedVolumeMeta) ExistsForSource(context.Context, string) (bool, error) {
 	return m.exists, m.existsErr
 }
+
 func (m *scriptedVolumeMeta) AttachmentCount(context.Context, string, string) (int, error) {
 	return m.attachmentCount, m.attachmentCountErr
 }
+
 func (m *scriptedVolumeMeta) PutAttachments(context.Context, []models.VolumeAttachment) error {
 	return m.putAttachmentsErr
 }
+
 func (m *scriptedVolumeMeta) DeleteAttachmentsForSandbox(context.Context, string) error {
 	return m.deleteAttachErr
 }

@@ -15,14 +15,13 @@ import (
 	"strings"
 	"testing"
 
+	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/models"
 	cntr "github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespecs "github.com/opencontainers/runtime-spec/specs-go"
-
-	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
-	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // -------------------------------------------------------------------

@@ -14,13 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/gorilla/websocket"
 )
 
 // fakeToolboxRouteRuntime is the bare-minimum runtime.Runtime needed to seed a
@@ -32,6 +31,7 @@ type fakeToolboxRouteRuntime struct{}
 func (fakeToolboxRouteRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Create")
 }
+
 func (fakeToolboxRouteRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Start")
 }
@@ -39,15 +39,19 @@ func (fakeToolboxRouteRuntime) Stop(context.Context, string) error { panic("unex
 func (fakeToolboxRouteRuntime) Destroy(context.Context, *models.Sandbox) error {
 	panic("unexpected Destroy")
 }
+
 func (fakeToolboxRouteRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	panic("unexpected CreateSnapshot")
 }
+
 func (fakeToolboxRouteRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	panic("unexpected Resize")
 }
+
 func (fakeToolboxRouteRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Inspect")
 }
+
 func (fakeToolboxRouteRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	return map[string]*models.SandboxRuntimeState{}, nil
 }

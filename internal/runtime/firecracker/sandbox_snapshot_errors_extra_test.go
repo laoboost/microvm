@@ -28,10 +28,10 @@ func TestWriteSandboxSnapshot_Errors_Extra(t *testing.T) {
 	// 1. mkdir base fails
 	testErr(func() {
 		// make base a file
-		os.MkdirAll(d.cfg.RunDir, 0755)
+		os.MkdirAll(d.cfg.RunDir, 0o755)
 		base, _ := d.sandboxSnapshotBase()
-		os.MkdirAll(filepath.Dir(base), 0755)
-		os.WriteFile(base, []byte("file"), 0644)
+		os.MkdirAll(filepath.Dir(base), 0o755)
+		os.WriteFile(base, []byte("file"), 0o644)
 	}, "create snapshot base")
 
 	// reset base
@@ -50,13 +50,13 @@ func TestWriteSandboxSnapshot_Errors_Extra(t *testing.T) {
 
 	// Create srcRootfs so we pass rootfs copy
 	srcRootfs := filepath.Join(handle.runDir, rootfsFileName)
-	os.WriteFile(srcRootfs, []byte("rootfs"), 0644)
+	os.WriteFile(srcRootfs, []byte("rootfs"), 0o644)
 
 	// 4. copy overlay fails
 	testErr(func() {
 		srcOverlay := filepath.Join(handle.runDir, overlayFileName)
 		// make srcOverlay a directory so copyFile fails
-		os.Mkdir(srcOverlay, 0755)
+		os.Mkdir(srcOverlay, 0o755)
 	}, "copy overlay")
 	os.RemoveAll(filepath.Join(handle.runDir, overlayFileName))
 
@@ -93,7 +93,6 @@ func TestConfigureSandboxSnapshotRestore_Extra_2(t *testing.T) {
 		t.Errorf("expected PatchDrive overlay or rootfs error, got %v", err)
 	}
 	client.drivePatchErr = nil
-
 }
 
 func TestCopyFile_Errors_Extra(t *testing.T) {
@@ -112,12 +111,12 @@ func TestCopyFile_Errors_Extra(t *testing.T) {
 
 	// Open fails (e.g. permission denied) -> mock it by creating a file with 000 permissions
 	srcFile := filepath.Join(tmpDir, "src")
-	os.WriteFile(srcFile, []byte("data"), 0000)
+	os.WriteFile(srcFile, []byte("data"), 0o000)
 	// Some OS allow opening even 0000 by owner, but this works on macOS/Linux.
 
 	// Create fails (dst is a directory)
 	srcFile2 := filepath.Join(tmpDir, "src2")
-	os.WriteFile(srcFile2, []byte("data"), 0644)
+	os.WriteFile(srcFile2, []byte("data"), 0o644)
 	err = copyFile(srcFile2, tmpDir)
 	if err == nil || !strings.Contains(err.Error(), "create") {
 		t.Errorf("expected create error, got %v", err)

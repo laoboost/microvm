@@ -190,13 +190,17 @@ func TestFSMPlaceCarriesSpec(t *testing.T) {
 // without touching the owner pointer.
 func TestFSMUpsertSpec(t *testing.T) {
 	fsm := newPlacementFSM()
-	c, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
-		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 1}})
+	c, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 1},
+	})
 	fsm.Apply(&raft.Log{Data: c})
 
 	// Resize: bump CPU via opUpsertSpec.
-	u, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "sb1",
-		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 2}})
+	u, _ := encodeCommand(command{
+		Op: opUpsertSpec, SandboxID: "sb1",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 2},
+	})
 	fsm.Apply(&raft.Log{Data: u})
 
 	got, _ := fsm.get("sb1")
@@ -208,8 +212,10 @@ func TestFSMUpsertSpec(t *testing.T) {
 	}
 
 	// Upsert against unknown sandbox: silent no-op.
-	u2, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "ghost",
-		Spec: &models.CreateSandboxRequest{Image: "x"}})
+	u2, _ := encodeCommand(command{
+		Op: opUpsertSpec, SandboxID: "ghost",
+		Spec: &models.CreateSandboxRequest{Image: "x"},
+	})
 	if got := fsm.Apply(&raft.Log{Data: u2}); got != nil {
 		t.Fatalf("upsert against unknown id returned %v, want nil", got)
 	}
@@ -261,16 +267,20 @@ func TestFSMHotPlacementReadsOmitRecoveryPayload(t *testing.T) {
 
 func TestFSMNameLookupTracksPlaceRenameAndDelete(t *testing.T) {
 	fsm := newPlacementFSM()
-	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
-		Spec: &models.CreateSandboxRequest{Image: "alpine", Name: "alpha"}})
+	place, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", Name: "alpha"},
+	})
 	fsm.Apply(&raft.Log{Data: place})
 
 	if got, ok := fsm.sandboxIDByName(" alpha "); !ok || got != "sb1" {
 		t.Fatalf("lookup alpha = (%q, %v), want (sb1, true)", got, ok)
 	}
 
-	rename, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: "sb1",
-		Spec: &models.CreateSandboxRequest{Image: "alpine", Name: "beta"}})
+	rename, _ := encodeCommand(command{
+		Op: opUpsertSpec, SandboxID: "sb1",
+		Spec: &models.CreateSandboxRequest{Image: "alpine", Name: "beta"},
+	})
 	fsm.Apply(&raft.Log{Data: rename})
 
 	if got, ok := fsm.sandboxIDByName("alpha"); ok {
@@ -382,8 +392,10 @@ func TestFSMPlaceCarriesPortsThroughRetry(t *testing.T) {
 // exposures during recreate.
 func TestFSMReassignPreservesPorts(t *testing.T) {
 	fsm := newPlacementFSM()
-	p, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
-		Spec: &models.CreateSandboxRequest{Image: "alpine"}})
+	p, _ := encodeCommand(command{
+		Op: opPlace, SandboxID: "sb1", OwnerNodeID: "A",
+		Spec: &models.CreateSandboxRequest{Image: "alpine"},
+	})
 	fsm.Apply(&raft.Log{Data: p})
 	add, _ := encodeCommand(command{Op: opAddExposedPort, SandboxID: "sb1", Port: 5432, Protocol: "tcp"})
 	fsm.Apply(&raft.Log{Data: add})

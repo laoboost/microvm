@@ -144,7 +144,7 @@ func TestCurrentOnNilRingIsSafe(t *testing.T) {
 func TestLoadUpstreamWrapKeyRing_ReadFileError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "isdir")
-	os.Mkdir(path, 0400)
+	os.Mkdir(path, 0o400)
 	if _, err := LoadUpstreamWrapKeyRing(path); err == nil {
 		t.Fatal("expected error reading directory as key file")
 	}

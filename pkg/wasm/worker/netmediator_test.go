@@ -3,7 +3,6 @@ package worker
 import (
 	"bytes"
 	"context"
-
 	"io"
 	"net"
 	"testing"

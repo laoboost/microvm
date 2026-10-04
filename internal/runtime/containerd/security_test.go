@@ -5,10 +5,9 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/containerd/containerd/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-
-	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // applyOpts runs each SpecOpt against a base spec with no client/container,

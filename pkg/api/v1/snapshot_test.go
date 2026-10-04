@@ -431,9 +431,11 @@ type noopRuntime struct{}
 func (noopRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Create")
 }
+
 func (noopRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	panic("unexpected CreateSnapshot")
 }
+
 func (noopRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Start")
 }
@@ -442,9 +444,11 @@ func (noopRuntime) Destroy(context.Context, *models.Sandbox) error { panic("unex
 func (noopRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	panic("unexpected Resize")
 }
+
 func (noopRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Inspect")
 }
+
 func (noopRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	panic("unexpected ListManaged")
 }

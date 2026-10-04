@@ -239,6 +239,7 @@ func (s *statusRecorder) statusCode() int {
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	apihttp.WriteJSON(w, status, value)
 }
+
 func writeError(w http.ResponseWriter, status int, message string) {
 	apihttp.WriteError(w, status, message)
 }

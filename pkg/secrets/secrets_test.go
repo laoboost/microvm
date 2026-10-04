@@ -144,12 +144,12 @@ func TestLoadOrGenerateKeyEdgeCases(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "key")
-	os.WriteFile(path, []byte("invalid-base64-xyz!"), 0600)
+	os.WriteFile(path, []byte("invalid-base64-xyz!"), 0o600)
 	if _, err := loadOrGenerateKey("", path); err == nil {
 		t.Fatal("expected error for invalid base64 in fallback file")
 	}
 
-	os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString([]byte("short-key"))), 0600)
+	os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString([]byte("short-key"))), 0o600)
 	if _, err := loadOrGenerateKey("", path); err == nil {
 		t.Fatal("expected error for short key in fallback file")
 	}
@@ -157,14 +157,14 @@ func TestLoadOrGenerateKeyEdgeCases(t *testing.T) {
 	// Using a directory as a file path is rejected (insecure mode for a
 	// typical 0700 dir, or a read error otherwise).
 	isdir := filepath.Join(dir, "isdir")
-	os.Mkdir(isdir, 0700)
+	os.Mkdir(isdir, 0o700)
 	if _, err := loadOrGenerateKey("", isdir); err == nil {
 		t.Fatal("expected error when fallback path is a directory")
 	}
 
 	// Directory creation failure: parent directory is not writable.
 	nonWritable := filepath.Join(dir, "nowrite")
-	if err := os.Mkdir(nonWritable, 0500); err != nil {
+	if err := os.Mkdir(nonWritable, 0o500); err != nil {
 		t.Fatalf("mkdir failed: %v", err)
 	}
 	path = filepath.Join(nonWritable, "key")

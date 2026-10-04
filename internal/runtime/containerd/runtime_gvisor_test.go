@@ -8,6 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
+	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/models"
 	cntr "github.com/containerd/containerd"
 	apievents "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/events"
@@ -15,11 +19,6 @@ import (
 	runtimeoptions "github.com/containerd/containerd/pkg/runtimeoptions/v1"
 	"github.com/containerd/containerd/runtime"
 	"github.com/containerd/typeurl/v2"
-
-	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
-	"github.com/aerol-ai/microvm/pkg/docker"
-	"github.com/aerol-ai/microvm/pkg/docker/netrules"
-	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // Phase 4 matrix (offline): cold create / park / adopt / netrules / readiness

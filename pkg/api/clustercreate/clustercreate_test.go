@@ -246,6 +246,7 @@ func (f *fakeRuntime) Ping(context.Context) error { return nil }
 func (f *fakeRuntime) RemoveImage(context.Context, string) error {
 	return nil
 }
+
 func (f *fakeRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	return nil
 }

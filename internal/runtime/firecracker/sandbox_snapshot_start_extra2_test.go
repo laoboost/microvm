@@ -16,12 +16,15 @@ type fakePoolGetErr struct {
 func (p *fakePoolGetErr) Allocate(ctx context.Context, sandboxID string, now time.Time) (*TapSlot, error) {
 	return nil, p.err
 }
+
 func (p *fakePoolGetErr) Transfer(ctx context.Context, fromID, toID string, now time.Time) (*TapSlot, error) {
 	return nil, p.err
 }
+
 func (p *fakePoolGetErr) Release(ctx context.Context, sandboxID string) error {
 	return p.err
 }
+
 func (p *fakePoolGetErr) Get(ctx context.Context, sandboxID string) (*TapSlot, error) {
 	return nil, p.err
 }
@@ -33,7 +36,7 @@ func TestStartFromSandboxSnapshot_ExtraErrors(t *testing.T) {
 
 	sbID := "sb-errs"
 	manifestDir, memPath, statePath, rootfsPath, overlayPath, manifestPath := d.sandboxSnapshotPaths(sbID)
-	os.MkdirAll(manifestDir, 0755)
+	os.MkdirAll(manifestDir, 0o755)
 
 	// validateSandboxID fails
 	if _, err := d.startFromSandboxSnapshot(context.Background(), "bad/id"); err == nil || !strings.Contains(err.Error(), "invalid character") {
@@ -80,20 +83,20 @@ func TestStartFromSandboxSnapshot_ExtraErrors(t *testing.T) {
 	}
 
 	// Write valid manifest
-	os.WriteFile(manifestPath, []byte(`{"version":1,"sandbox_id":"sb-errs","has_overlay":true,"vsock_cid":3}`), 0644)
+	os.WriteFile(manifestPath, []byte(`{"version":1,"sandbox_id":"sb-errs","has_overlay":true,"vsock_cid":3}`), 0o644)
 
 	// rootfs missing
 	raw, _ := os.ReadFile(manifestPath)
 	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "snapshot rootfs missing") {
 		t.Errorf("raw manifest: %q\nexpected rootfs missing error, got %v", string(raw), err)
 	}
-	os.WriteFile(rootfsPath, []byte("rootfs"), 0644)
+	os.WriteFile(rootfsPath, []byte("rootfs"), 0o644)
 
 	// overlay missing
 	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "snapshot overlay missing") {
 		t.Errorf("expected overlay missing error, got %v", err)
 	}
-	os.WriteFile(overlayPath, []byte("overlay"), 0644)
+	os.WriteFile(overlayPath, []byte("overlay"), 0o644)
 
 	// tap lookup fails
 	d.pool = &fakePoolGetErr{err: os.ErrPermission}
@@ -120,20 +123,20 @@ func TestStartFromSandboxSnapshot_ExtraErrors(t *testing.T) {
 
 	// Handle setup for copy errors
 	runDir := filepath.Join(t.TempDir(), "run")
-	os.MkdirAll(runDir, 0755)
+	os.MkdirAll(runDir, 0o755)
 	d.SetSpawner(func(cfg Config, id string) (VMMHandle, error) {
 		return &fakeVMM{runDir: runDir}, nil
 	})
 
 	// copy rootfs fails -> we can't easily mock copyFile directly, but we can make the destination unwriteable
-	os.MkdirAll(filepath.Join(runDir, rootfsFileName), 0755) // make dst a directory
+	os.MkdirAll(filepath.Join(runDir, rootfsFileName), 0o755) // make dst a directory
 	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "stage rootfs") {
 		t.Errorf("expected stage rootfs error, got %v", err)
 	}
 	os.RemoveAll(filepath.Join(runDir, rootfsFileName))
 
 	// copy overlay fails
-	os.MkdirAll(filepath.Join(runDir, overlayFileName), 0755)
+	os.MkdirAll(filepath.Join(runDir, overlayFileName), 0o755)
 	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "stage overlay") {
 		t.Errorf("expected stage overlay error, got %v", err)
 	}

@@ -10,9 +10,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/gorilla/websocket"
 )
 
 func TestSessionsClientCases(t *testing.T) {

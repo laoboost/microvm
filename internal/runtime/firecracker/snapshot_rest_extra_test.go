@@ -47,7 +47,7 @@ func TestSnapshotTemplate_RESTErrors_Extra(t *testing.T) {
 				GuestCID:      3,
 			}
 			// Write dummy rootfs
-			os.WriteFile(req.RootfsPath, []byte("data"), 0644)
+			os.WriteFile(req.RootfsPath, []byte("data"), 0o644)
 
 			_, err := d.SnapshotTemplate(context.Background(), req)
 			if err == nil || !strings.Contains(err.Error(), tc.errStr) {
@@ -76,7 +76,7 @@ func TestSnapshotTemplate_HashErrors_Extra(t *testing.T) {
 		OutStatePath:  "/tmp/state-hash",
 		GuestCID:      3,
 	}
-	os.WriteFile(req.RootfsPath, []byte("data"), 0644)
+	os.WriteFile(req.RootfsPath, []byte("data"), 0o644)
 
 	// Since fakeClient creates the snapshot files, hashFile will succeed.
 	// We can delete them right after SnapshotTemplate? No, it hashes inside SnapshotTemplate.

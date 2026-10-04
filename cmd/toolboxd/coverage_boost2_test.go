@@ -344,7 +344,8 @@ func TestSessionHandlerRecording_WithContent(t *testing.T) {
 	}
 	t.Cleanup(mgr.Close)
 
-	srv := &server{authOptional: true,
+	srv := &server{
+		authOptional: true,
 		sessions:     mgr,
 		daytona:      newDaytonaCompat(),
 		logger:       logger,

@@ -11,15 +11,14 @@ import (
 	"testing"
 	"time"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/events"
-	"github.com/opencontainers/runtime-spec/specs-go"
-
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
+	cntr "github.com/containerd/containerd"
+	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/events"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // coverage_push95_test.go: hit remaining offline-reachable branches to clear 95%.

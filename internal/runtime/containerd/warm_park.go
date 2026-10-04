@@ -9,13 +9,12 @@ import (
 	"strings"
 	"time"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/oci"
-	"github.com/opencontainers/runtime-spec/specs-go"
-
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
+	cntr "github.com/containerd/containerd"
+	"github.com/containerd/containerd/oci"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 const adoptReadyTimeout = 2 * time.Second

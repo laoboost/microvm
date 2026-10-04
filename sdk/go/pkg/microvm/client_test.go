@@ -10,10 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/aerol-ai/microvm/pkg/models"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+	"github.com/gorilla/websocket"
 )
 
 func TestNewClientCases(t *testing.T) {

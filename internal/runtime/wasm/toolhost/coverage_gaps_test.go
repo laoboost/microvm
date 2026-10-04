@@ -711,14 +711,17 @@ func (m *memStateKV) Get(_ context.Context, _, key string) ([]byte, bool, error)
 	v, ok := m.data[key]
 	return v, ok, nil
 }
+
 func (m *memStateKV) Set(_ context.Context, _, key string, value []byte) error {
 	m.data[key] = append([]byte(nil), value...)
 	return nil
 }
+
 func (m *memStateKV) Delete(_ context.Context, _, key string) error {
 	delete(m.data, key)
 	return nil
 }
+
 func (m *memStateKV) ListKeys(_ context.Context, _ string) ([]string, error) {
 	out := make([]string, 0, len(m.data))
 	for k := range m.data {

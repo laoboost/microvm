@@ -210,7 +210,8 @@ func newEnvdTestServer(t *testing.T) *server {
 		t.Fatalf("sessions.New() error = %v", err)
 	}
 	t.Cleanup(sessionsMgr.Close)
-	return &server{authOptional: true,
+	return &server{
+		authOptional: true,
 		logger:       logger,
 		sandboxID:    "sb-test",
 		authToken:    "toolbox-token",

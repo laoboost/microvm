@@ -419,7 +419,7 @@ func TestSessionsEdgeCases(t *testing.T) {
 	// Block the recording path by replacing the sandbox ID directory with a regular file
 	sandboxDir := filepath.Join(recDir, "sb-no-rec")
 	_ = os.RemoveAll(sandboxDir)
-	if err := os.WriteFile(sandboxDir, []byte("blocker"), 0644); err != nil {
+	if err := os.WriteFile(sandboxDir, []byte("blocker"), 0o644); err != nil {
 		t.Fatalf("write blocker file: %v", err)
 	}
 

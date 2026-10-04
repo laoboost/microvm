@@ -59,9 +59,11 @@ func (f *fakeCapacityRuntime) Inspect(_ context.Context, ref string) (*models.Sa
 func (f *fakeCapacityRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	return nil, nil
 }
+
 func (f *fakeCapacityRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	return "", nil
 }
+
 func (f *fakeCapacityRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	f.startCount++
 	if f.startErr != nil {
@@ -79,6 +81,7 @@ func (f *fakeCapacityRuntime) Destroy(_ context.Context, sb *models.Sandbox) err
 	}
 	return nil
 }
+
 func (f *fakeCapacityRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	return nil
 }

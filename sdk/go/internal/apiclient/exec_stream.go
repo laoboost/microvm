@@ -11,9 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/gorilla/websocket"
-
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -21,8 +20,10 @@ const (
 	streamPrefixStderr = 0x02
 )
 
-type ExecStreamOptions = sdktypes.ExecStreamOptions
-type ExecExitInfo = sdktypes.ExecExitInfo
+type (
+	ExecStreamOptions = sdktypes.ExecStreamOptions
+	ExecExitInfo      = sdktypes.ExecExitInfo
+)
 
 type ExecStreamHandle struct {
 	conn       *websocket.Conn

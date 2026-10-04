@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/models"
 	cntr "github.com/containerd/containerd"
 	apievents "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
@@ -28,10 +31,6 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runtime-spec/specs-go"
-
-	"github.com/aerol-ai/microvm/pkg/docker"
-	"github.com/aerol-ai/microvm/pkg/docker/netrules"
-	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 type fakeTransport struct {
@@ -230,12 +229,14 @@ func (c *fakeContainer) NewTask(context.Context, cio.Creator, ...cntr.NewTaskOpt
 	}
 	return c.task, nil
 }
+
 func (c *fakeContainer) Spec(context.Context) (*oci.Spec, error) {
 	if c.specOverride != nil {
 		return c.specOverride, nil
 	}
 	return &oci.Spec{}, nil
 }
+
 func (c *fakeContainer) Task(context.Context, cio.Attach) (cntr.Task, error) {
 	if c.taskErr != nil {
 		return nil, c.taskErr
@@ -245,9 +246,11 @@ func (c *fakeContainer) Task(context.Context, cio.Attach) (cntr.Task, error) {
 	}
 	return c.task, nil
 }
+
 func (c *fakeContainer) Image(context.Context) (cntr.Image, error) {
 	return &fakeImage{name: "alpine:3.20"}, nil
 }
+
 func (c *fakeContainer) Labels(context.Context) (map[string]string, error) {
 	if c.labelsErr != nil {
 		return nil, c.labelsErr
@@ -258,6 +261,7 @@ func (c *fakeContainer) Labels(context.Context) (map[string]string, error) {
 	}
 	return out, nil
 }
+
 func (c *fakeContainer) SetLabels(_ context.Context, labels map[string]string) (map[string]string, error) {
 	if c.setLabelsErr != nil {
 		return nil, c.setLabelsErr
@@ -268,6 +272,7 @@ func (c *fakeContainer) SetLabels(_ context.Context, labels map[string]string) (
 	}
 	return c.labels, nil
 }
+
 func (c *fakeContainer) Extensions(context.Context) (map[string]typeurl.Any, error) {
 	return nil, nil
 }
@@ -293,6 +298,7 @@ func (t *fakeTask) Start(context.Context) error {
 	t.status = cntr.Running
 	return nil
 }
+
 func (t *fakeTask) Delete(context.Context, ...cntr.ProcessDeleteOpts) (*cntr.ExitStatus, error) {
 	t.status = cntr.Stopped
 	return &cntr.ExitStatus{}, nil
@@ -311,6 +317,7 @@ func (t *fakeTask) Status(context.Context) (cntr.Status, error) {
 	}
 	return cntr.Status{Status: t.status}, nil
 }
+
 func (t *fakeTask) Wait(context.Context) (<-chan cntr.ExitStatus, error) {
 	ch := make(chan cntr.ExitStatus, 1)
 	ch <- cntr.ExitStatus{}
@@ -330,6 +337,7 @@ func (t *fakeTask) Update(context.Context, ...cntr.UpdateTaskOpts) error { retur
 func (t *fakeTask) Exec(context.Context, string, *specs.Process, cio.Creator) (cntr.Process, error) {
 	return nil, errors.New("not implemented")
 }
+
 func (t *fakeTask) LoadProcess(context.Context, string, cio.Attach) (cntr.Process, error) {
 	return nil, errors.New("not implemented")
 }
@@ -351,6 +359,7 @@ func (h *harnessNetns) Provision(context.Context, string) (string, string, error
 	}
 	return h.path, h.ip, nil
 }
+
 func (h *harnessNetns) Release(context.Context, string) error {
 	h.released = true
 	return nil

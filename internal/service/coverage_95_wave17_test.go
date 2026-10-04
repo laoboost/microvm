@@ -129,6 +129,7 @@ type failingSpecCluster struct {
 func (c *failingSpecCluster) UpsertSpec(context.Context, string, *models.CreateSandboxRequest, cluster.PlacementSecrets) error {
 	return c.err
 }
+
 func (c *failingSpecCluster) SpecOf(string) *models.CreateSandboxRequest {
 	return &models.CreateSandboxRequest{Image: "a"}
 }

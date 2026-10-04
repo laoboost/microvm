@@ -28,6 +28,7 @@ type fakeSnapshotRuntime struct {
 func (f *fakeSnapshotRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Create")
 }
+
 func (f *fakeSnapshotRuntime) CreateSnapshot(_ context.Context, containerRef, imageRef string) (string, error) {
 	f.hits++
 	f.lastRef = containerRef
@@ -37,6 +38,7 @@ func (f *fakeSnapshotRuntime) CreateSnapshot(_ context.Context, containerRef, im
 	}
 	return f.imageID, nil
 }
+
 func (f *fakeSnapshotRuntime) Start(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Start")
 }
@@ -44,12 +46,15 @@ func (f *fakeSnapshotRuntime) Stop(context.Context, string) error { panic("unexp
 func (f *fakeSnapshotRuntime) Destroy(context.Context, *models.Sandbox) error {
 	panic("unexpected Destroy")
 }
+
 func (f *fakeSnapshotRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	panic("unexpected Resize")
 }
+
 func (f *fakeSnapshotRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
 	panic("unexpected Inspect")
 }
+
 func (f *fakeSnapshotRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	panic("unexpected ListManaged")
 }
@@ -62,6 +67,7 @@ func (f *fakeSnapshotRuntime) RemoveImage(_ context.Context, imageRef string) er
 	}
 	return nil
 }
+
 func (f *fakeSnapshotRuntime) PushAllowedPorts(context.Context, string, string, []int) error {
 	panic("unexpected PushAllowedPorts")
 }

@@ -3,9 +3,10 @@ package store
 import (
 	"context"
 	"fmt"
-	"github.com/aerol-ai/microvm/pkg/models"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 func TestCheckCreateErrorsAll(t *testing.T) {

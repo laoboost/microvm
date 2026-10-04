@@ -7,12 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/docker"
 	apievents "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/runtime"
 	"github.com/containerd/typeurl/v2"
-
-	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
 func TestNormalizeContainerdEvent(t *testing.T) {

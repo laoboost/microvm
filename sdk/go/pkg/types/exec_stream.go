@@ -1,7 +1,9 @@
 package types
 
-type StreamCallback func([]byte)
-type StreamErrorCallback func(string)
+type (
+	StreamCallback      func([]byte)
+	StreamErrorCallback func(string)
+)
 
 type ExecStreamOptions struct {
 	Command  string              `json:"command"`

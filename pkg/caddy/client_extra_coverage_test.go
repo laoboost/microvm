@@ -183,7 +183,6 @@ func TestUpsertHelpers_AgainstFakeCaddy(t *testing.T) {
 }
 
 func TestUpsertHelpers_ErrorPaths(t *testing.T) {
-
 	ctx := context.Background()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

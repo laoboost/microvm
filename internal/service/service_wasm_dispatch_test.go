@@ -67,15 +67,19 @@ func (r *wasmRecordingRuntime) Destroy(context.Context, *models.Sandbox) error {
 	r.destroyCalls++
 	return nil
 }
+
 func (r *wasmRecordingRuntime) CreateSnapshot(context.Context, string, string) (string, error) {
 	return "", nil
 }
+
 func (r *wasmRecordingRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	return nil
 }
+
 func (r *wasmRecordingRuntime) Inspect(context.Context, string) (*models.SandboxRuntimeState, error) {
 	return nil, nil
 }
+
 func (r *wasmRecordingRuntime) ListManaged(context.Context) (map[string]*models.SandboxRuntimeState, error) {
 	out := make(map[string]*models.SandboxRuntimeState, len(r.managed))
 	for id, state := range r.managed {

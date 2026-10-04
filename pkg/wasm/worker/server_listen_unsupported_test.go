@@ -29,6 +29,7 @@ func (noListenEngine) StopInstance(context.Context) error { return nil }
 func (noListenEngine) CaptureSnapshot(context.Context) (wasmengine.SnapshotCapture, error) {
 	return wasmengine.SnapshotCapture{}, nil
 }
+
 func (noListenEngine) RestoreSnapshot(context.Context, wasmengine.SnapshotRestoreInput, wasmengine.Capabilities) error {
 	return nil
 }

@@ -112,5 +112,7 @@ func (r *recorder) Write(p []byte) (int, error) {
 func (r *recorder) WriteHeader(code int) { r.code = code }
 
 // Compile-time guard so signature drift surfaces here.
-var _ http.ResponseWriter = (*recorder)(nil)
-var _ = errors.New
+var (
+	_ http.ResponseWriter = (*recorder)(nil)
+	_                     = errors.New
+)

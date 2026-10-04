@@ -63,9 +63,11 @@ func (n *Noop) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
 func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	return nil
 }
+
 func (n *Noop) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	return nil
 }
+
 func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
 	return nil
 }
@@ -79,6 +81,7 @@ func (n *Noop) ExposedPortsOf(sandboxID string) map[int]ExposedPortRoute        
 func (n *Noop) AddCustomDomain(ctx context.Context, sandboxID, hostname string) error {
 	return nil
 }
+
 func (n *Noop) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
 	return nil
 }
@@ -92,6 +95,7 @@ func (n *Noop) CancelReservation(ctx context.Context, sandboxID string) error { 
 func (n *Noop) SetNodeDrainState(ctx context.Context, nodeID string, drained bool) error {
 	return nil
 }
+
 func (n *Noop) ReassignPlacement(ctx context.Context, sandboxID string, target PlacementTarget) error {
 	return nil
 }
@@ -294,6 +298,7 @@ func (n *Noop) releaseVolumeAttachmentsForSandboxLocked(sandboxID string) {
 		}
 	}
 }
+
 func (n *Noop) RemoveMember(ctx context.Context, nodeID string, force bool) error {
 	return ErrUnknownMember
 }
