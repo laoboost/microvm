@@ -536,7 +536,8 @@ func (d *Driver) Resize(ctx context.Context, containerRef string, req models.Res
 func resizeLinuxResources(req models.ResizeSandboxRequest, pidsLimit int) *specs.LinuxResources {
 	res := &specs.LinuxResources{}
 	if pidsLimit > 0 {
-		res.Pids = &specs.LinuxPids{Limit: int64(pidsLimit)}
+		limit := int64(pidsLimit)
+		res.Pids = &specs.LinuxPids{Limit: &limit}
 	}
 	if req.MemoryMB > 0 {
 		limit := int64(req.MemoryMB) * 1024 * 1024
