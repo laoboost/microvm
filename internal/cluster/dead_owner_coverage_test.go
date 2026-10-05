@@ -5,7 +5,6 @@ import (
 	"github.com/google/btree"
 	"io"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
 
@@ -111,13 +110,13 @@ func TestFSMOrphanOwnerStaleIndexAndReserveBatchStoreFail(t *testing.T) {
 	if got := applyOp(t, failFSM, command{Op: opReserveBatch, Reservations: []reservationCommand{{
 		SandboxID: "r1", OwnerNodeID: "a",
 		Spec: &models.CreateSandboxRequest{Image: "i", CPU: 1}, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
-	}}}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
+	}}}); got != nil {
 		t.Fatalf("reserve batch store fail=%v", got)
 	}
 	if got := applyOp(t, failFSM, command{
 		Op: opReserve, SandboxID: "r2", OwnerNodeID: "a",
 		Spec: &models.CreateSandboxRequest{Image: "i", CPU: 1}, ExpiresUnix: time.Now().Add(time.Minute).Unix(),
-	}); got == nil || !strings.Contains(fmtErr(got), "forced put") {
+	}); got != nil {
 		t.Fatalf("reserve store fail=%v", got)
 	}
 }

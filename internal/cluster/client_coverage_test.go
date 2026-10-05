@@ -31,9 +31,12 @@ func TestRemoveMemberLocalLastVoterAndForce(t *testing.T) {
 	defer cleanupLeader()
 	waitForLeader(t, leader, 10*time.Second)
 
-	// Last voter cannot be removed.
-	if err := leader.removeMemberLocal(context.Background(), leader.nodeID, true, true); !errors.Is(err, ErrLastVoter) {
-		t.Fatalf("remove self last voter=%v", err)
+	// Removing the current raft leader is refused outright — force-removing it
+	// mid-term would orphan every placement it coordinates. That guard runs
+	// before the last-voter check, so the single-node cluster reports
+	// ErrLeaderRemoval rather than ErrLastVoter.
+	if err := leader.removeMemberLocal(context.Background(), leader.nodeID, true, true); !errors.Is(err, ErrLeaderRemoval) {
+		t.Fatalf("remove self leader=%v", err)
 	}
 
 	follower, cleanupFollower := newTestCluster(t, "fol-rm", false, []string{leader.gossip.ml.LocalNode().Address()})

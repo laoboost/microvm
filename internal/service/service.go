@@ -1083,7 +1083,7 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 	// host paths (mounts rootfs dirs, runtime state dirs). Reject traversal /
 	// separators here at the service boundary — every runtime path below
 	// trusts this value.
-	if err := mounts.ValidateSandboxID(id); err != nil {
+	if err := models.ValidateSandboxID(id); err != nil {
 		return nil, err
 	}
 	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {

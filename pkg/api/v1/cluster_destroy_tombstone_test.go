@@ -31,17 +31,23 @@ func seedDestroySandbox(t *testing.T, st *storepkg.Store, id string) {
 		ID: id, Image: "alpine:3.20", Status: models.SandboxStatusStarted,
 		ContainerID: "ctr-" + id, ContainerIP: "10.0.0.9",
 		CPU: 1, MemoryMB: 256, DiskGB: 1, OSUser: "root", ToolboxEnabled: true,
-		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		// Destroy retains the sandbox audit ACL against the local durable
+		// incarnation; the service now refuses to do that without one.
+		AuditIncarnationID: "inc-" + id,
+		CreatedAt:          now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 }
 
-// When the local destroy succeeds but DeletePlacement fails, the FSM can keep
-// a Placed row that would let the owner watcher resurrect the sandbox. The
-// handler must tombstone the id (MarkDeliberatelyDeleted) so the watcher
-// leaves it dead — reconcile does NOT catch these ghost rows.
-func TestClusterDestroyWrap_TombstonesOnDeletePlacementFailure(t *testing.T) {
+// Destroy in cluster mode no longer reports success on a placement-failure
+// fallback. DestroySandbox fences the placement authoritatively first and
+// fails closed with ErrClusterFinalizationUnavailable (503) when it cannot
+// confirm the authoritative delete, so the handler never reaches its
+// best-effort DeletePlacement/MarkDeliberatelyDeleted fallback. Reporting 204
+// here would tell the caller the sandbox is gone while the FSM may still hold
+// a Placed row the owner watcher can resurrect from.
+func TestClusterDestroyWrap_FailsClosedWhenPlacementFinalizationFails(t *testing.T) {
 	rt := &apiRecordingRuntime{}
 	stub := &tombstoneStubCluster{promoteStubCluster: &promoteStubCluster{
 		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
@@ -55,17 +61,14 @@ func TestClusterDestroyWrap_TombstonesOnDeletePlacementFailure(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.clusterDestroyWrap(rr, req)
 
-	if rr.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204; body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
 	if len(rt.destroyIDs) != 1 || rt.destroyIDs[0] != "sb-destroy" {
 		t.Fatalf("destroy ids = %+v, want [sb-destroy]", rt.destroyIDs)
 	}
-	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-destroy" {
-		t.Fatalf("DeletePlacement calls = %+v, want [sb-destroy]", stub.deleteCalls)
-	}
-	if len(stub.marked) != 1 || stub.marked[0] != "sb-destroy" {
-		t.Fatalf("MarkDeliberatelyDeleted calls = %+v, want [sb-destroy]", stub.marked)
+	if len(stub.marked) != 0 {
+		t.Fatalf("MarkDeliberatelyDeleted calls = %+v, want none (fail-closed, no fallback)", stub.marked)
 	}
 }
 

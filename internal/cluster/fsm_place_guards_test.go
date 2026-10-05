@@ -63,7 +63,8 @@ func TestFSMOpPlaceWithFailingRecoveryStoreFallsBackToInlineAndAppliesAllOrNothi
 
 	if got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-atomic", OwnerNodeID: "node-a", OwnerAPIURL: "http://a",
-		Spec: &models.CreateSandboxRequest{Name: "old-name", Image: "alpine:1"},
+		IncarnationID: "inc-atomic",
+		Spec:          &models.CreateSandboxRequest{Name: "old-name", Image: "alpine:1"},
 	}); got != nil {
 		t.Fatalf("initial place: %v", got)
 	}
@@ -73,7 +74,8 @@ func TestFSMOpPlaceWithFailingRecoveryStoreFallsBackToInlineAndAppliesAllOrNothi
 
 	if got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-atomic", OwnerNodeID: "node-a", OwnerAPIURL: "http://a",
-		Spec: &models.CreateSandboxRequest{Name: "new-name", Image: "alpine:2"},
+		ExpectedIncarnationID: "inc-atomic",
+		Spec:                  &models.CreateSandboxRequest{Name: "new-name", Image: "alpine:2"},
 	}); got != nil {
 		t.Fatalf("re-place with failing recovery store = %v, want nil (in-memory fallback must keep apply deterministic)", got)
 	}
@@ -107,7 +109,8 @@ func TestFSMOpPlaceRunsRecoveryPutBeforeIndexMutations(t *testing.T) {
 
 	if got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-order", OwnerNodeID: "node-a",
-		Spec: &models.CreateSandboxRequest{Name: "old-name", Image: "alpine:1"},
+		IncarnationID: "inc-order",
+		Spec:          &models.CreateSandboxRequest{Name: "old-name", Image: "alpine:1"},
 	}); got != nil {
 		t.Fatalf("initial place: %v", got)
 	}
@@ -115,7 +118,8 @@ func TestFSMOpPlaceRunsRecoveryPutBeforeIndexMutations(t *testing.T) {
 	spy.nameAtPut = nil
 	if got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-order", OwnerNodeID: "node-a",
-		Spec: &models.CreateSandboxRequest{Name: "new-name", Image: "alpine:2"},
+		ExpectedIncarnationID: "inc-order",
+		Spec:                  &models.CreateSandboxRequest{Name: "new-name", Image: "alpine:2"},
 	}); got != nil {
 		t.Fatalf("re-place: %v", got)
 	}

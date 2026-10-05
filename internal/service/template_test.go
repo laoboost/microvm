@@ -242,7 +242,7 @@ func TestCreateTemplateValidationAndIdentifierErrors(t *testing.T) {
 		svc, _, _ := newTemplateHarness(t)
 		svc.SetTemplateBuilder(&fakeTemplateBuilder{})
 		_, err := svc.CreateTemplate(ctx, models.CreateTemplateRequest{ID: "../outside", Image: "docker://alpine"})
-		if err == nil || !contains(err.Error(), "template id must") {
+		if err == nil || !contains(err.Error(), "invalid template id") {
 			t.Fatalf("CreateTemplate() error = %v, want unsafe id rejection", err)
 		}
 	})
