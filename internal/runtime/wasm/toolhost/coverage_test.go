@@ -432,6 +432,9 @@ func TestHostSessionsWithoutManager(t *testing.T) {
 }
 
 func TestHostSessionsCreateNilManager(t *testing.T) {
+	// The nil-manager branch of POST /sessions sits behind the host-exec gate,
+	// which fails closed first; enable it so the 503 branch stays covered.
+	requireHostExec(t)
 	h := toolhost.New(toolhost.Config{
 		SandboxID: "sb",
 		WorkDir:   t.TempDir(),

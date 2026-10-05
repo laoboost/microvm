@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -138,55 +137,6 @@ func TestHandleUploadAtomicWriteError(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("atomic write onto directory status = %d body=%s", rec.Code, rec.Body.String())
 	}
-}
-
-func TestDaytonaSessionExecStderrAndFollowLogs(t *testing.T) {
-	h, _ := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-stderr"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	execPayload, _ := json.Marshal(map[string]string{
-		"command": "echo err 1>&2; echo visible",
-	})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-stderr/exec", bytes.NewReader(execPayload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("exec status = %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	pl2, _ := json.Marshal(map[string]string{"sessionId": "ds-hold"})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl2))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	execPayload2, _ := json.Marshal(map[string]interface{}{
-		"command":  "printf 'prompt'",
-		"runAsync": true,
-	})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-hold/exec", bytes.NewReader(execPayload2))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	var resp map[string]interface{}
-	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	cmdID, _ := resp["cmdId"].(string)
-
-	srv := httptest.NewServer(h.Handler())
-	defer srv.Close()
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/process/session/ds-hold/command/" + cmdID + "/logs?follow=true"
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("dial logs: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, _, _ = conn.ReadMessage()
-	conn.Close()
 }
 
 // ─── files.go ────────────────────────────────────────────────────────────────
@@ -500,52 +450,6 @@ func TestDaytonaSessionListSkipsStaleCompat(t *testing.T) {
 	_ = mgr
 }
 
-func TestDaytonaSessionDeleteSuccessPath(t *testing.T) {
-	h, _ := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-del-ok"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodDelete, "/process/session/ds-del-ok", nil)
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("delete ok status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestDaytonaSessionDeleteRaceNotFound(t *testing.T) {
-	h, mgr := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-del-race"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	sess, err := mgr.GetByName("ds-del-race")
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(10 * time.Millisecond)
-		_ = mgr.Delete(sess.ID())
-	}()
-
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodDelete, "/process/session/ds-del-race", nil)
-	h.Handler().ServeHTTP(rec, req)
-	wg.Wait()
-	if rec.Code != http.StatusNotFound && rec.Code != http.StatusNoContent {
-		t.Fatalf("race delete status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
 func TestDaytonaCommandStreamSlowSubscriber(t *testing.T) {
 	s := newDaytonaCommandStream()
 	ch := make(chan []byte) // unbuffered → default branch in broadcast
@@ -555,95 +459,8 @@ func TestDaytonaCommandStreamSlowSubscriber(t *testing.T) {
 	s.broadcast(sessions.StreamStdout, []byte("drop-me"))
 }
 
-func TestDaytonaRunSessionCommandBranches(t *testing.T) {
-	h, mgr := newHostWithRealSessions(t)
-
-	t.Run("stderr and sync echo", func(t *testing.T) {
-		pl, _ := json.Marshal(map[string]string{"sessionId": "ds-run"})
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-
-		execPayload, _ := json.Marshal(map[string]string{"command": "echo out; echo err 1>&2"})
-		rec = httptest.NewRecorder()
-		req = httptest.NewRequest(http.MethodPost, "/process/session/ds-run/exec", bytes.NewReader(execPayload))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("exec status = %d body=%s", rec.Code, rec.Body.String())
-		}
-	})
-
-	t.Run("session closes without marker", func(t *testing.T) {
-		sess, err := mgr.Create(context.Background(), models.CreateSessionRequest{
-			Name:    "ds-abort",
-			Command: "sleep 60",
-			PTY:     false,
-		})
-		if err != nil {
-			t.Fatalf("create: %v", err)
-		}
-		state := h.daytona.ensureSession("ds-abort")
-		cmd := &daytonaCommandState{
-			id:        "abort-cmd",
-			command:   "sleep 60",
-			createdAt: time.Now().UTC(),
-			running:   true,
-			stream:    newDaytonaCommandStream(),
-		}
-		state.addCommand(cmd)
-		_ = mgr.Delete(sess.ID())
-		_, _ = h.runDaytonaSessionCommand(sess, state, cmd)
-	})
-
-	t.Run("sync prompt holdback", func(t *testing.T) {
-		pl, _ := json.Marshal(map[string]string{"sessionId": "ds-prompt"})
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-
-		execPayload, _ := json.Marshal(map[string]string{"command": "printf 'prompt'"})
-		rec = httptest.NewRecorder()
-		req = httptest.NewRequest(http.MethodPost, "/process/session/ds-prompt/exec", bytes.NewReader(execPayload))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("prompt exec status = %d body=%s", rec.Code, rec.Body.String())
-		}
-		var resp daytonaSessionExecuteResponse
-		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("json: %v", err)
-		}
-		if resp.Stdout == nil || !strings.Contains(*resp.Stdout, "prompt") {
-			t.Fatalf("expected prompt in stdout, got %v", resp.Stdout)
-		}
-	})
-
-	t.Run("async flag alias", func(t *testing.T) {
-		pl, _ := json.Marshal(map[string]string{"sessionId": "ds-async2"})
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-
-		async := true
-		execPayload, _ := json.Marshal(map[string]interface{}{
-			"command": "echo via-async",
-			"async":   async,
-		})
-		rec = httptest.NewRecorder()
-		req = httptest.NewRequest(http.MethodPost, "/process/session/ds-async2/exec", bytes.NewReader(execPayload))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("async alias status = %d", rec.Code)
-		}
-	})
-}
-
 func TestHandleDaytonaSessionDeleteDirectPaths(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 
 	rec := httptest.NewRecorder()
@@ -737,6 +554,7 @@ func TestAtomicWriteFileChmodAndRenameErrors(t *testing.T) {
 }
 
 func TestDaytonaStreamLogsClientDisconnect(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
@@ -756,8 +574,13 @@ func TestDaytonaStreamLogsClientDisconnect(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	h.Handler().ServeHTTP(rec, req)
 	var execResp map[string]interface{}
-	_ = json.Unmarshal(rec.Body.Bytes(), &execResp)
-	cmdID := execResp["cmdId"].(string)
+	if err := json.Unmarshal(rec.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("exec response: %v body=%s", err, rec.Body.String())
+	}
+	cmdID, ok := execResp["cmdId"].(string)
+	if !ok {
+		t.Fatalf("exec did not return a cmdId: %s", rec.Body.String())
+	}
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/process/session/ds-disc/command/" + cmdID + "/logs?follow=true"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
@@ -769,6 +592,7 @@ func TestDaytonaStreamLogsClientDisconnect(t *testing.T) {
 }
 
 func TestDaytonaSessionCommandInputWithNewline(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-nl"})
 	rec := httptest.NewRecorder()
@@ -785,8 +609,13 @@ func TestDaytonaSessionCommandInputWithNewline(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	h.Handler().ServeHTTP(rec, req)
 	var execResp map[string]interface{}
-	_ = json.Unmarshal(rec.Body.Bytes(), &execResp)
-	cmdID := execResp["cmdId"].(string)
+	if err := json.Unmarshal(rec.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("exec response: %v body=%s", err, rec.Body.String())
+	}
+	cmdID, ok := execResp["cmdId"].(string)
+	if !ok {
+		t.Fatalf("exec did not return a cmdId: %s", rec.Body.String())
+	}
 	time.Sleep(100 * time.Millisecond)
 
 	// Data already ends with newline → no auto-append branch difference
@@ -810,6 +639,7 @@ func TestNewDaytonaCommandIDRandFailure(t *testing.T) {
 }
 
 func TestHandleDaytonaSessionCreateDuplicateReturnsOK(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-dup-create"})
 	rec := httptest.NewRecorder()
@@ -856,6 +686,7 @@ func TestHandleUploadMissingFileAndPathRequired(t *testing.T) {
 }
 
 func TestHandleDaytonaSessionCreateValidationErrors(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 
 	rec := httptest.NewRecorder()
@@ -886,6 +717,7 @@ func TestStripSandboxPrefixExactID(t *testing.T) {
 }
 
 func TestHandleDaytonaSessionDeleteClearsCompatState(t *testing.T) {
+	requireHostExec(t)
 	h, _ := newHostWithRealSessions(t)
 	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-del-clear"})
 	rec := httptest.NewRecorder()

@@ -141,8 +141,6 @@ func (s *Session) ExitInfo() (int, string) {
 	if !s.exited.Load() {
 		return -1, ""
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.exitCode, s.exitSignal
 }
 
@@ -318,7 +316,6 @@ func (s *Session) finish(code int, signal string, failed bool) {
 		s.mu.Unlock()
 		return
 	}
-	s.mu.Lock()
 	s.exitCode = code
 	s.exitSignal = signal
 	s.failed = failed

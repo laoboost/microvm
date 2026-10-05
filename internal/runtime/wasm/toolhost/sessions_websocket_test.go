@@ -218,6 +218,9 @@ func TestSessionsRecordingOpenError(t *testing.T) {
 }
 
 func TestSessionsDisabled(t *testing.T) {
+	// The nil-manager branch of POST /sessions sits behind the host-exec gate,
+	// which fails closed first; enable it so the 503 branch stays covered.
+	requireHostExec(t)
 	h := New(Config{
 		SandboxID: "sb",
 		WorkDir:   t.TempDir(),
@@ -334,6 +337,7 @@ func TestDrainSessionFrames(t *testing.T) {
 }
 
 func TestSessionsEdgeCases(t *testing.T) {
+	requireHostExec(t)
 	h, mgr := newHostWithRealSessions(t)
 
 	// 1. Session ID empty -> 400
