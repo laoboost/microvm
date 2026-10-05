@@ -81,6 +81,17 @@ public class MicroVMClient {
     private final WebSocketConnector webSocketConnector;
     private final ai.aerol.microvm.model.RetryConfig retryConfig;
 
+    /** One bounded fleet-list page plus the opaque token for the next page. */
+    public static final class SandboxPage {
+        public final List<Sandbox> sandboxes;
+        public final String nextPageToken;
+
+        private SandboxPage(List<Sandbox> sandboxes, String nextPageToken) {
+            this.sandboxes = List.copyOf(sandboxes);
+            this.nextPageToken = nextPageToken;
+        }
+    }
+
     public MicroVMClient() {
         this(new MicroVMConfig());
     }
@@ -218,7 +229,7 @@ public class MicroVMClient {
     }
 
     public List<Sandbox> list() {
-        return list(Collections.emptyMap());
+        return list(Collections.emptyMap(), false);
     }
 
     /**
@@ -229,40 +240,132 @@ public class MicroVMClient {
      * keeping fixtures and request matchers stable.
      */
     public List<Sandbox> list(java.util.Map<String, String> tags) {
-        String path = versioned("/sandboxes") + buildTagQuery(tags);
-        SandboxData[] response = doJson("GET", path, null, SandboxData[].class);
-        if (response == null) {
-            return Collections.emptyList();
-        }
-        return java.util.Arrays.stream(response).map(this::wrap).collect(Collectors.toList());
+        return list(tags, false);
     }
 
-    // Renders the tag filter as the server's ?tag.<key>=<value> wire format.
-    // The "tag." prefix is literal — parseTagFilter on the server checks the
-    // *decoded* query key — so only the user-supplied key and value get
-    // percent-encoded. Returns "" for null/empty so the URL stays
+    /**
+     * Lists sandboxes with optional {@code include_env=true}. Env is omitted
+     * from get/list by default; opt-in reads are audited server-side.
+     */
+    public List<Sandbox> list(java.util.Map<String, String> tags, boolean includeEnv) {
+        java.util.ArrayList<Sandbox> items = new java.util.ArrayList<>();
+        String pageToken = "";
+        // Safety cap for cluster page drain (enough for 100k @ page size 1).
+        for (int page = 0; page < 100_000; page++) {
+            SandboxPage result = listPage(tags, includeEnv, pageToken);
+            items.addAll(result.sandboxes);
+            pageToken = result.nextPageToken;
+            if (pageToken.isEmpty()) {
+                return items;
+            }
+        }
+        throw new MicroVMException("incomplete cluster list: exceeded max pages");
+    }
+
+    /**
+     * Fetches exactly one server page. Fleet inventory callers should loop on
+     * {@link SandboxPage#nextPageToken} to keep memory bounded.
+     */
+    public SandboxPage listPage(java.util.Map<String, String> tags, boolean includeEnv, String pageToken) {
+        String basePath = versioned("/sandboxes") + buildSandboxQuery(tags, includeEnv);
+        String path = appendQueryParam(basePath, "page_token", pageToken);
+        HttpResponse<byte[]> httpResponse = sendJsonRequest("GET", path, null);
+        ensureSuccess(httpResponse);
+        String partial = headerValue(httpResponse, "X-Cluster-List-Partial");
+        String ready = headerValue(httpResponse, "X-Cluster-List-Placement-Ready");
+        if ("true".equals(partial) || "false".equals(ready)) {
+            throw new MicroVMException("incomplete cluster list");
+        }
+        SandboxData[] response = JsonSupport.read(httpResponse.body(), SandboxData[].class);
+        java.util.ArrayList<Sandbox> items = new java.util.ArrayList<>();
+        if (response != null) {
+            for (SandboxData item : response) {
+                items.add(wrap(item));
+            }
+        }
+        return new SandboxPage(items, headerValue(httpResponse, "X-Cluster-List-Next-Page-Token").trim());
+    }
+
+    private static String headerValue(HttpResponse<byte[]> response, String name) {
+        return response.headers().firstValue(name).orElse("");
+    }
+
+    private static String appendQueryParam(String path, String key, String value) {
+        if (value == null || value.isBlank()) {
+            return path;
+        }
+        String sep = path.contains("?") ? "&" : "?";
+        return path + sep + encodeQueryValue(key) + "=" + encodeQueryValue(value);
+    }
+
+    // Renders tag filters and optional include_env as the server's wire
+    // format. The "tag." prefix is literal — parseTagFilter on the server
+    // checks the *decoded* query key — so only the user-supplied key and
+    // value get percent-encoded. Returns "" for null/empty so the URL stays
     // byte-identical to the pre-filter call (no stray trailing "?").
-    private static String buildTagQuery(java.util.Map<String, String> tags) {
-        if (tags == null || tags.isEmpty()) {
+    private static String buildSandboxQuery(java.util.Map<String, String> tags, boolean includeEnv) {
+        boolean hasTags = tags != null && !tags.isEmpty();
+        if (!hasTags && !includeEnv) {
             return "";
         }
         StringBuilder out = new StringBuilder("?");
         boolean first = true;
-        for (java.util.Map.Entry<String, String> entry : tags.entrySet()) {
+        if (hasTags) {
+            for (java.util.Map.Entry<String, String> entry : tags.entrySet()) {
+                if (!first) {
+                    out.append('&');
+                }
+                first = false;
+                out.append("tag.");
+                out.append(URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8));
+                out.append('=');
+                out.append(URLEncoder.encode(entry.getValue(), StandardCharsets.UTF_8));
+            }
+        }
+        if (includeEnv) {
             if (!first) {
                 out.append('&');
             }
-            first = false;
-            out.append("tag.");
-            out.append(URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8));
-            out.append('=');
-            out.append(URLEncoder.encode(entry.getValue(), StandardCharsets.UTF_8));
+            out.append("include_env=true");
         }
         return out.toString();
     }
 
+    /**
+     * Returns the caller's sandbox with this name, or empty if there is none.
+     * Names are unique per owner. The reply is only trusted when it holds at
+     * most one sandbox carrying the requested name: a server that predates
+     * {@code ?name=} ignores the filter and returns an ordinary list page, and
+     * acting on its first row would target the wrong sandbox.
+     */
+    public java.util.Optional<Sandbox> getByName(String name) {
+        return getByName(name, false);
+    }
+
+    /** {@link #getByName(String)} with optional {@code include_env=true}. */
+    public java.util.Optional<Sandbox> getByName(String name, boolean includeEnv) {
+        String wanted = name == null ? "" : name.trim();
+        if (wanted.isEmpty()) {
+            throw new IllegalArgumentException("sandbox name is required");
+        }
+        String path = appendQueryParam(versioned("/sandboxes") + buildSandboxQuery(null, includeEnv), "name", wanted);
+        SandboxData[] response = doJson("GET", path, null, SandboxData[].class);
+        if (response == null || response.length == 0) {
+            return java.util.Optional.empty();
+        }
+        if (response.length > 1 || !wanted.equals(response[0].name)) {
+            throw new MicroVMException(apiUrl + " does not support sandbox name lookup; use the sandbox ID or upgrade the server");
+        }
+        return java.util.Optional.of(wrap(response[0]));
+    }
+
     public Sandbox get(String sandboxId) {
-        return wrap(doJson("GET", sandboxPath(sandboxId), null, SandboxData.class));
+        return get(sandboxId, false);
+    }
+
+    /** Fetches a sandbox; when {@code includeEnv} is true, appends {@code ?include_env=true}. */
+    public Sandbox get(String sandboxId, boolean includeEnv) {
+        return wrap(doJson("GET", sandboxPath(sandboxId) + buildSandboxQuery(null, includeEnv), null, SandboxData.class));
     }
 
     public Sandbox start(String sandboxId) {
@@ -956,7 +1059,9 @@ public class MicroVMClient {
             try {
                 HttpResponse<byte[]> response = sendFollowingRedirects(method, resolve(path), bodyPublisher, contentType, extraHeaders);
                 int status = response.statusCode();
-                if ((status == 429 || status == 502 || status == 503 || status == 504) && attempt < maxRetries) {
+                // 421: misdirected (connection coalescing or a stale route); the
+                // server closed the connection, so the retry reconnects.
+                if ((status == 421 || status == 429 || status == 502 || status == 503 || status == 504) && attempt < maxRetries) {
                     // Fall through to retry logic
                 } else {
                     return response;

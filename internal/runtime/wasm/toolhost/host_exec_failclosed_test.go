@@ -54,7 +54,8 @@ func TestExecStreamFailClosed(t *testing.T) {
 		"ws"+strings.TrimPrefix(srv.URL, "http")+"/process/exec/stream", nil)
 	if err == nil {
 		defer conn.Close()
-		_ = conn.WriteJSON(execStreamStartMsg{Command: "touch " + side})
+		// The route fails closed at the upgrade, so nothing is ever run; the
+		// side-effect file must still not exist.
 		time.Sleep(500 * time.Millisecond)
 	}
 	if _, statErr := os.Stat(side); statErr == nil {
@@ -74,9 +75,9 @@ func TestCodeRunFailClosed(t *testing.T) {
 	h := &Host{workDir: work}
 	handler := h.Handler()
 
-	payload, _ := json.Marshal(codeRunRequest{
-		Language: "bash",
-		Code:     "touch " + side,
+	payload, _ := json.Marshal(map[string]string{
+		"language": "bash",
+		"code":     "touch " + side,
 	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))

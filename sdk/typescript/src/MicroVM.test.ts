@@ -548,9 +548,33 @@ test("MicroVM.list URL-encodes tag keys and values", async () => {
   assert.equal(url.searchParams.get("tag.needs=encode"), "v&v");
 });
 
-// Backward-compat: list() with no options and list({}) must produce the
-// pre-filter URL byte-for-byte so existing fixtures, request matchers, and
-// proxies don't see a stray "?".
+test("MicroVM.get and list include_env opt-in", async () => {
+  const urls: string[] = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input) => {
+      urls.push(new Request(input).url);
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/sandboxes")) {
+        return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ id: "sb-1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  await sdk.get("sb-1", { includeEnv: true });
+  await sdk.list({ tags: { team: "a" }, includeEnv: true });
+  assert.equal(urls[0], "https://api.example.com/v1/sandboxes/sb-1?include_env=true");
+  const listURL = new URL(urls[1]);
+  assert.equal(listURL.searchParams.get("tag.team"), "a");
+  assert.equal(listURL.searchParams.get("include_env"), "true");
+});
+
+// Empty filters should produce the canonical collection URL without a stray
+// query delimiter.
 test("MicroVM.list omits the query string when no tags are supplied", async () => {
   const urls: string[] = [];
   const sdk = new MicroVM({
@@ -567,6 +591,87 @@ test("MicroVM.list omits the query string when no tags are supplied", async () =
   for (const u of urls) {
     assert.equal(u, "https://api.example.com/v1/sandboxes");
   }
+});
+
+test("MicroVM.list drains cluster page tokens", async () => {
+  const urls: string[] = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input) => {
+      const url = new Request(input).url;
+      urls.push(url);
+      const token = new URL(url).searchParams.get("page_token");
+      if (!token) {
+        return new Response(JSON.stringify([{ id: "sb-1", image: "alpine", status: "started" }]), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "X-Cluster-List-Partial": "false",
+            "X-Cluster-List-Placement-Ready": "true",
+            "X-Cluster-List-Next-Page-Token": "tok-1",
+          },
+        });
+      }
+      return new Response(JSON.stringify([{ id: "sb-2", image: "alpine", status: "started" }]), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "X-Cluster-List-Partial": "false",
+          "X-Cluster-List-Placement-Ready": "true",
+        },
+      });
+    },
+  });
+  const items = await sdk.list();
+  assert.deepEqual(items.map((s) => s.id), ["sb-1", "sb-2"]);
+  assert.equal(urls[1], "https://api.example.com/v1/sandboxes?page_token=tok-1");
+});
+
+test("MicroVM.listPages yields without accumulating later pages", async () => {
+  let calls = 0;
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async () => {
+      calls++;
+      return new Response(JSON.stringify([{ id: `sb-${calls}`, image: "alpine", status: "started" }]), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "X-Cluster-List-Placement-Ready": "true",
+          ...(calls === 1 ? { "X-Cluster-List-Next-Page-Token": "tok-1" } : {}),
+        },
+      });
+    },
+  });
+  const pages = sdk.listPages();
+  const first = await pages.next();
+  if (first.done) throw new Error("first page missing");
+  assert.equal(calls, 1);
+  assert.deepEqual(first.value.map((s) => s.id), ["sb-1"]);
+  const second = await pages.next();
+  if (second.done) throw new Error("second page missing");
+  assert.equal(calls, 2);
+  assert.deepEqual(second.value.map((s) => s.id), ["sb-2"]);
+  assert.equal((await pages.next()).done, true);
+});
+
+test("MicroVM.list errors on partial cluster coverage", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async () =>
+      new Response("[]", {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "X-Cluster-List-Partial": "true",
+          "X-Cluster-List-Placement-Ready": "true",
+        },
+      }),
+  });
+  await assert.rejects(() => sdk.list(), /incomplete cluster list/);
 });
 
 test("MicroVM health maps ssh gateway state", async () => {
@@ -1140,4 +1245,73 @@ test("MicroVM.deleteTemplate sends DELETE on the per-id path", async () => {
   assert.ok(seenRequest);
   assert.equal(seenRequest.method, "DELETE");
   assert.ok(seenRequest.url.endsWith("/v1/templates/tpl-x"));
+});
+
+// Names are unique per owner and looked up with ?name=. getByName must trust
+// the reply only when it holds at most one sandbox carrying that name: an old
+// server ignores the filter and returns a normal list page.
+test("MicroVM.getByName sends ?name= and verifies the reply", async () => {
+  const replies: Record<string, string> = {
+    agent: JSON.stringify([{ id: "sb-1", name: "agent", tags: { team: "x" } }]),
+    missing: "[]",
+    old: JSON.stringify([{ id: "sb-1", name: "a" }, { id: "sb-2", name: "b" }]),
+    mismatch: JSON.stringify([{ id: "sb-3", name: "someone-else" }]),
+  };
+  const urls: string[] = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input) => {
+      const url = new URL(new Request(input).url);
+      urls.push(url.toString());
+      return new Response(replies[url.searchParams.get("name") ?? ""] ?? "[]", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const found = await sdk.getByName(" agent ");
+  assert.equal(found?.id, "sb-1");
+  assert.equal(found?.name, "agent");
+  assert.deepEqual(found?.tags, { team: "x" });
+  const first = new URL(urls[0]);
+  assert.equal(first.pathname, "/v1/sandboxes");
+  assert.equal(first.searchParams.get("name"), "agent");
+
+  assert.equal(await sdk.getByName("missing"), null);
+  await assert.rejects(sdk.getByName("old"), /does not support sandbox name lookup/);
+  await assert.rejects(sdk.getByName("mismatch"), /does not support sandbox name lookup/);
+  await assert.rejects(sdk.getByName("  "), /name is required/);
+});
+
+test("MicroVM.list forwards a name filter and create sends name and tags", async () => {
+  const seen: { url: string; body?: string }[] = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ url: req.url, body: req.method === "POST" ? await req.text() : undefined });
+      if (req.method === "POST") {
+        return new Response(JSON.stringify({ id: "sb-new", name: "agent", tags: { a: "b" } }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  await sdk.list({ name: "agent", tags: { team: "x" }, includeEnv: true });
+  const listURL = new URL(seen[0].url);
+  assert.equal(listURL.searchParams.get("name"), "agent");
+  assert.equal(listURL.searchParams.get("tag.team"), "x");
+  assert.equal(listURL.searchParams.get("include_env"), "true");
+
+  const created = await sdk.create({ image: "alpine:3.20", name: "agent", tags: { a: "b" } });
+  const body = JSON.parse(seen[1].body ?? "{}");
+  assert.equal(body.name, "agent");
+  assert.deepEqual(body.tags, { a: "b" });
+  assert.equal(created.name, "agent");
+  assert.deepEqual(created.tags, { a: "b" });
 });

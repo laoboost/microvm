@@ -2,24 +2,20 @@ package types
 
 import "github.com/aerol-ai/microvm/pkg/models"
 
-type (
-	CreateSandboxOptions   = models.CreateSandboxRequest
-	ResizeSandboxOptions   = models.ResizeSandboxRequest
-	Lifecycle              = models.Lifecycle
-	Failover               = models.Failover
-	UpdateLifecycleOptions = models.UpdateLifecycleRequest
-	ExecRequest            = models.ExecRequest
-	ExecResult             = models.ExecResult
-	ExposedPort            = models.ExposedPort
-)
+type CreateSandboxOptions = models.CreateSandboxRequest
+type ResizeSandboxOptions = models.ResizeSandboxRequest
+type Lifecycle = models.Lifecycle
+type Failover = models.Failover
+type UpdateLifecycleOptions = models.UpdateLifecycleRequest
+type ExecRequest = models.ExecRequest
+type ExecResult = models.ExecResult
+type ExposedPort = models.ExposedPort
 
 // ExposeResult is the structured outcome of a successful expose call. Host
 // and HostPort are populated only when Protocol == ExposeProtocolTCP — for
 // HTTP and TLS exposures the dialable URL is in URL alone.
-type (
-	ExposeResult    = models.ExposePortResponse
-	SandboxSnapshot = models.SandboxSnapshot
-)
+type ExposeResult = models.ExposePortResponse
+type SandboxSnapshot = models.SandboxSnapshot
 
 // Template is the server's Firecracker rootfs template row. Re-exported
 // verbatim from pkg/models so the SDK stays aligned with the wire format.
@@ -87,17 +83,16 @@ const (
 	ExposeProtocolTLS ExposeProtocol = "tls"
 )
 
-type (
-	HealthStatus         = models.HealthStatus
-	Sandbox              = models.Sandbox
-	MountSpec            = models.MountSpec
-	MountSpecRedacted    = models.MountSpecRedacted
-	PlatformVolumeMount  = models.PlatformVolumeMount
-	MountType            = models.MountType
-	CreateSessionOptions = models.CreateSessionRequest
-	Session              = models.Session
-	SessionStatus        = models.SessionStatus
-)
+type HealthStatus = models.HealthStatus
+type Sandbox = models.Sandbox
+type RegistryAuth = models.RegistryAuth
+type MountSpec = models.MountSpec
+type MountSpecRedacted = models.MountSpecRedacted
+type PlatformVolumeMount = models.PlatformVolumeMount
+type MountType = models.MountType
+type CreateSessionOptions = models.CreateSessionRequest
+type Session = models.Session
+type SessionStatus = models.SessionStatus
 
 const (
 	SessionStatusRunning = models.SessionStatusRunning
@@ -128,10 +123,8 @@ const (
 	DurabilityDurable      = models.DurabilityDurable
 )
 
-type (
-	NetworkUsage            = models.NetworkUsage
-	SetNetworkLimitsOptions = models.UpdateNetworkLimitsRequest
-)
+type NetworkUsage = models.NetworkUsage
+type SetNetworkLimitsOptions = models.UpdateNetworkLimitsRequest
 
 // CustomDomain is the per-hostname row attached to a sandbox. Status moves
 // pending_dns → issuing → ready (or failed), driven server-side by Caddy's
@@ -266,10 +259,8 @@ type RegisterSnapshotOptions struct {
 	DiskGB   int
 }
 
-type (
-	GPURequest = models.GPURequest
-	GPUVendor  = models.GPUVendor
-)
+type GPURequest = models.GPURequest
+type GPUVendor = models.GPUVendor
 
 const (
 	GPUVendorNVIDIA = models.GPUVendorNVIDIA

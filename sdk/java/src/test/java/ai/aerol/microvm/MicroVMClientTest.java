@@ -59,6 +59,39 @@ import ai.aerol.microvm.model.WasmModule;
 import ai.aerol.microvm.model.WasmModuleStatus;
 
 class MicroVMClientTest {
+    // 421: an owner answered for a sandbox it doesn't hold (connection
+    // coalescing or a stale route). The server closes the connection, so the
+    // retry reconnects and the ingress re-routes it.
+    @Test
+    void getRetries421MisdirectedRequest() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger hits = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            if (hits.incrementAndGet() == 1) {
+                writeJson(exchange, 421, mapOf("error", "misdirected request; reconnect"));
+                return;
+            }
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-421",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "public_url", "https://sb-421.example.com",
+                "cpu", 1,
+                "memory_mb", 512,
+                "disk_gb", 10,
+                "created_at", "2026-05-07T10:00:00Z",
+                "updated_at", "2026-05-07T10:00:00Z"
+            ));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = client.get("sb-421");
+            assertEquals("sb-421", sandbox.id);
+            assertEquals(2, hits.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
     @Test
     void createWithImageBuildsThenCreatesSandbox() throws Exception {
         AtomicReference<Map<String, Object>> buildPayload = new AtomicReference<>();
@@ -264,6 +297,36 @@ class MicroVMClientTest {
             assertEquals(apiUrl, client.getApiUrl());
             client.list();
             assertEquals("Bearer env-pat", authorization.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void getAndListIncludeEnvQuery() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenQuery = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            seenPath.set(exchange.getRequestURI().getPath());
+            seenQuery.set(exchange.getRequestURI().getRawQuery());
+            if (exchange.getRequestURI().getPath().endsWith("/sandboxes")) {
+                writeResponse(exchange, 200, "application/json", "[]".getBytes(StandardCharsets.UTF_8));
+                return;
+            }
+            writeJson(exchange, 200, mapOf("id", "sb-1"));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            client.get("sb-1", true);
+            assertEquals("/v1/sandboxes/sb-1", seenPath.get());
+            assertEquals("include_env=true", seenQuery.get());
+
+            Map<String, String> tags = new HashMap<>();
+            tags.put("team", "a");
+            client.list(tags, true);
+            assertEquals("/v1/sandboxes", seenPath.get());
+            assertTrue(seenQuery.get().contains("include_env=true"));
+            assertTrue(seenQuery.get().contains("tag.team=a"));
         } finally {
             server.stop(0);
         }
@@ -981,9 +1044,60 @@ class MicroVMClientTest {
         }
     }
 
-    // Backward-compat: list() and list(emptyMap) must produce the pre-filter
-    // URL byte-for-byte. A stray trailing "?" would break HTTP fixtures and
-    // request matchers in downstream code.
+    // Names are unique per owner and looked up with ?name=. getByName must
+    // trust the reply only when it holds at most one sandbox carrying that
+    // name: an old server ignores the filter and returns a normal list page.
+    @Test
+    void getByNameSendsNameQueryAndVerifiesReply() throws Exception {
+        Map<String, Object> agent = new java.util.LinkedHashMap<>();
+        agent.put("id", "sb-1");
+        agent.put("name", "agent");
+        agent.put("tags", mapOf("team", "x"));
+        Map<String, List<Object>> replies = new HashMap<>();
+        replies.put("agent", List.of(agent));
+        replies.put("missing", List.of());
+        replies.put("old", List.of(mapOf("id", "sb-1", "name", "a"), mapOf("id", "sb-2", "name", "b")));
+        replies.put("mismatch", List.of(mapOf("id", "sb-3", "name", "someone-else")));
+        List<String> queries = new ArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            String q = exchange.getRequestURI().getQuery();
+            queries.add(q);
+            writeJson(exchange, 200, replies.get(q.substring("name=".length())));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox found = client.getByName(" agent ").orElseThrow();
+            assertEquals("sb-1", found.toData().id);
+            assertEquals("agent", found.toData().name);
+            assertEquals("x", found.toData().tags.get("team"));
+            assertEquals("name=agent", queries.get(0));
+            assertTrue(client.getByName("missing").isEmpty());
+            for (String name : List.of("old", "mismatch")) {
+                MicroVMException err = assertThrows(MicroVMException.class, () -> client.getByName(name));
+                assertTrue(err.getMessage().contains("does not support sandbox name lookup"), err.getMessage());
+            }
+            assertThrows(IllegalArgumentException.class, () -> client.getByName("  "));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createOptionsSerializeNameAndTags() throws Exception {
+        CreateOptions options = new CreateOptions();
+        options.image = "alpine";
+        String plain = JsonSupport.write(options);
+        assertTrue(!plain.contains("\"name\""), plain);
+        options.name = "agent";
+        options.tags = Map.of("a", "b");
+        String json = JsonSupport.write(options);
+        assertTrue(json.contains("\"name\":\"agent\""), json);
+        assertTrue(json.contains("\"tags\":{\"a\":\"b\"}"), json);
+    }
+
+    // Empty filters should use the canonical collection URL without a stray
+    // query delimiter.
     @Test
     void listWithoutTagsOmitsQueryString() throws Exception {
         AtomicReference<String> seenQuery = new AtomicReference<>();
@@ -1003,6 +1117,90 @@ class MicroVMClientTest {
             client.list(null);
             assertEquals(null, seenQuery.get());
             assertEquals(3, calls.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listErrorsOnPartialClusterCoverage() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            exchange.getResponseHeaders().set("X-Cluster-List-Partial", "true");
+            exchange.getResponseHeaders().set("X-Cluster-List-Placement-Ready", "true");
+            writeJson(exchange, 200, List.of());
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException err = assertThrows(MicroVMException.class, client::list);
+            assertTrue(err.getMessage().contains("incomplete cluster list"), err.getMessage());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listDrainsClusterPageTokens() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            int n = calls.incrementAndGet();
+            exchange.getResponseHeaders().set("X-Cluster-List-Partial", "false");
+            exchange.getResponseHeaders().set("X-Cluster-List-Placement-Ready", "true");
+            if (n == 1) {
+                exchange.getResponseHeaders().set("X-Cluster-List-Next-Page-Token", "tok-1");
+                writeJson(exchange, 200, List.of(mapOf(
+                    "id", "sb-1",
+                    "image", "alpine",
+                    "status", "started",
+                    "cpu", 1,
+                    "memory_mb", 256,
+                    "disk_gb", 1,
+                    "created_at", "2024-01-01T00:00:00Z",
+                    "updated_at", "2024-01-01T00:00:00Z"
+                )));
+                return;
+            }
+            assertEquals("page_token=tok-1", exchange.getRequestURI().getRawQuery());
+            writeJson(exchange, 200, List.of(mapOf(
+                "id", "sb-2",
+                "image", "alpine",
+                "status", "started",
+                "cpu", 1,
+                "memory_mb", 256,
+                "disk_gb", 1,
+                "created_at", "2024-01-01T00:00:00Z",
+                "updated_at", "2024-01-01T00:00:00Z"
+            )));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            List<Sandbox> items = client.list();
+            assertEquals(2, items.size());
+            assertEquals("sb-1", items.get(0).id);
+            assertEquals("sb-2", items.get(1).id);
+            assertEquals(2, calls.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listPageFetchesOnlyOnePage() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            calls.incrementAndGet();
+            exchange.getResponseHeaders().set("X-Cluster-List-Placement-Ready", "true");
+            exchange.getResponseHeaders().set("X-Cluster-List-Next-Page-Token", "tok-next");
+            writeJson(exchange, 200, List.of(Map.of("id", "sb-page", "image", "alpine", "status", "started")));
+        });
+
+        try {
+            MicroVMClient.SandboxPage page = clientFor(server).listPage(java.util.Collections.emptyMap(), false, "tok-current");
+            assertEquals(1, calls.get());
+            assertEquals(1, page.sandboxes.size());
+            assertEquals("sb-page", page.sandboxes.get(0).id);
+            assertEquals("tok-next", page.nextPageToken);
         } finally {
             server.stop(0);
         }
@@ -1492,8 +1690,11 @@ class MicroVMClientTest {
     }
 
     private static Map<String, Object> mapOf(Object... entries) {
+        if ((entries.length & 1) != 0) {
+            throw new IllegalArgumentException("mapOf requires key/value pairs");
+        }
         Map<String, Object> map = new HashMap<>();
-        for (int i = 0; i < entries.length; i += 2) {
+        for (int i = 0; i + 1 < entries.length; i += 2) {
             map.put((String) entries[i], entries[i + 1]);
         }
         return map;

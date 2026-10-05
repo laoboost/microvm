@@ -11,17 +11,18 @@ import (
 	"syscall"
 	"time"
 
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
+	refdocker "github.com/distribution/reference"
+	"github.com/opencontainers/runtime-spec/specs-go"
+
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/remotes/docker"
-	refdocker "github.com/distribution/reference"
-	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // Create provisions and starts a managed task in the aerolvm namespace.
@@ -535,7 +536,8 @@ func (d *Driver) Resize(ctx context.Context, containerRef string, req models.Res
 func resizeLinuxResources(req models.ResizeSandboxRequest, pidsLimit int) *specs.LinuxResources {
 	res := &specs.LinuxResources{}
 	if pidsLimit > 0 {
-		res.Pids = &specs.LinuxPids{Limit: int64(pidsLimit)}
+		limit := int64(pidsLimit)
+		res.Pids = &specs.LinuxPids{Limit: &limit}
 	}
 	if req.MemoryMB > 0 {
 		limit := int64(req.MemoryMB) * 1024 * 1024
@@ -704,7 +706,11 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 		// WithPullUnpack is mandatory: cntr.WithNewSnapshot expects the image
 		// layers unpacked into the snapshotter, and a bare Pull does not unpack.
 		opts := []cntr.RemoteOpt{cntr.WithPullUnpack}
-		if a := auth; a != nil && a.Username != "" {
+		// Resolved inside the flight, after the local re-check, so a warm
+		// image never reads the PAT file and N concurrent cold creates of
+		// one cross-node snapshot read it once.
+		pullAuth, patErr := d.pullAuthFor(ref, auth)
+		if a := pullAuth; a != nil && a.Username != "" {
 			refHost := registryHost(ref)
 			opts = append(opts, cntr.WithResolver(docker.NewResolver(docker.ResolverOptions{
 				// Scope creds to the ref's own registry host. Returning creds
@@ -718,7 +724,14 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 				})),
 			})))
 		}
-		return client.PullImage(ctx, ref, opts...)
+		image, pullErr := client.PullImage(ctx, ref, opts...)
+		if pullErr != nil && patErr != nil {
+			// The anonymous fallback against a `cluster/` ref fails with an
+			// opaque "failed to fetch anonymous token: 401"; name the real
+			// cause (the unreadable PAT file) in the error the create returns.
+			return nil, fmt.Errorf("%w (AOCR cluster pull auth unavailable, pulled anonymously: %w)", pullErr, patErr)
+		}
+		return image, pullErr
 	})
 	if err != nil {
 		if backoff := d.cfg.PullFailureBackoff; backoff > 0 {

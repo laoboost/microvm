@@ -72,7 +72,10 @@ func TestMountAllRejectsPathTraversalSandboxID(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for path-traversal sandbox id")
 	}
-	if !strings.Contains(err.Error(), "sandbox id") {
+	// Case-insensitive: the two sandbox-ID validators word it differently
+	// ("invalid sandbox id" vs "invalid sandbox ID"); what matters is that
+	// the id was rejected.
+	if !strings.Contains(strings.ToLower(err.Error()), "sandbox id") {
 		t.Fatalf("error = %v, want sandbox-id validation error", err)
 	}
 	outside := filepath.Join(td, "evil")

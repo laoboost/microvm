@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .image import Image
@@ -217,6 +217,7 @@ class ExecStreamHandle:
             try:
                 self._ws.close()
             except Exception:
+                # The peer may already have closed the socket.
                 pass
 
     def _handle_text_frame(self, payload: str) -> None:
@@ -316,6 +317,7 @@ class SessionAttachHandle:
             try:
                 self._ws.close()
             except Exception:
+                # The peer may already have closed the socket.
                 pass
 
     def _handle_text_frame(self, payload: str) -> None:
@@ -576,13 +578,67 @@ class MicroVM:
         pushed: Optional[str] = str(pushed_value) if pushed_value else None
         return BuildImageResult(image=image_tag, pushed=pushed)
 
-    def list(self, *, tags: Optional[Dict[str, str]] = None) -> List[Sandbox]:
-        path = self._versioned("/sandboxes") + _build_tag_query(tags)
-        sandboxes = self._do_json("GET", path, None)
-        return [self._wrap_sandbox(item) for item in sandboxes]
+    def list(
+        self,
+        *,
+        tags: Optional[Dict[str, str]] = None,
+        include_env: bool = False,
+        name: Optional[str] = None,
+    ) -> List[Sandbox]:
+        """List sandboxes. ``name`` filters to the caller's sandbox with exactly
+        that name (``?name=``). Servers that predate name lookup ignore the
+        filter and return a normal list; prefer :meth:`get_by_name`, which
+        checks the reply."""
+        items: List[Sandbox] = []
+        for page in self.iter_pages(tags=tags, include_env=include_env, name=name):
+            items.extend(page)
+        return items
 
-    def get(self, sandbox_id: str) -> Sandbox:
-        sandbox = self._do_json("GET", f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}", None)
+    def iter_pages(
+        self,
+        *,
+        tags: Optional[Dict[str, str]] = None,
+        include_env: bool = False,
+        name: Optional[str] = None,
+    ) -> Iterator[List[Sandbox]]:
+        """Yield one server page at a time for bounded-memory fleet scans."""
+        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env, name)
+        page_token = ""
+        for _ in range(100000):
+            path = _append_query_param(base_path, "page_token", page_token)
+            sandboxes, headers = self._do_json_headers("GET", path, None)
+            partial = headers.get("X-Cluster-List-Partial", "")
+            ready = headers.get("X-Cluster-List-Placement-Ready", "")
+            if partial == "true" or ready == "false":
+                raise MicroVMError("incomplete cluster list")
+            yield [self._wrap_sandbox(item) for item in sandboxes or []]
+            page_token = (headers.get("X-Cluster-List-Next-Page-Token") or "").strip()
+            if page_token == "":
+                return
+        raise MicroVMError("incomplete cluster list: exceeded max pages")
+
+    def get_by_name(self, name: str, *, include_env: bool = False) -> Optional[Sandbox]:
+        """Return the caller's sandbox with this name, or ``None`` if there is
+        none. Names are unique per owner. The reply is only trusted when it holds
+        at most one sandbox carrying the requested name: a server that predates
+        ``?name=`` ignores the filter and returns an ordinary list page, and
+        acting on its first row would target the wrong sandbox."""
+        wanted = (name or "").strip()
+        if not wanted:
+            raise ValueError("sandbox name is required")
+        path = self._versioned("/sandboxes") + _build_sandbox_query(None, include_env, wanted)
+        sandboxes = self._do_json("GET", path, None) or []
+        if not sandboxes:
+            return None
+        if len(sandboxes) > 1 or str(_first_of(sandboxes[0], "name") or "") != wanted:
+            raise MicroVMError(
+                f"{self.api_url} does not support sandbox name lookup; use the sandbox ID or upgrade the server"
+            )
+        return self._wrap_sandbox(sandboxes[0])
+
+    def get(self, sandbox_id: str, *, include_env: bool = False) -> Sandbox:
+        path = f"{self._version_prefix}/sandboxes/{_resource_path(sandbox_id)}" + _build_sandbox_query(None, include_env)
+        sandbox = self._do_json("GET", path, None)
         return self._wrap_sandbox(sandbox)
 
     def start(self, sandbox_id: str) -> Sandbox:
@@ -990,6 +1046,17 @@ class MicroVM:
         return f"{self.api_url}{path}"
 
     def _request(self, method: str, url: str, body: Optional[bytes] = None, content_type: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None) -> bytes:
+        raw, _ = self._request_headers(method, url, body, content_type, extra_headers)
+        return raw
+
+    def _request_headers(
+        self,
+        method: str,
+        url: str,
+        body: Optional[bytes] = None,
+        content_type: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> tuple[bytes, Dict[str, str]]:
         max_retries = self._retry_config["maxRetries"]
         base_delay_ms = self._retry_config["baseDelayMs"]
         max_delay_ms = self._retry_config["maxDelayMs"]
@@ -1007,10 +1074,13 @@ class MicroVM:
 
             try:
                 with opener.open(request) as response:
-                    return response.read()
+                    headers = {k: v for k, v in response.headers.items()}
+                    return response.read(), headers
             except urllib.error.HTTPError as exc:
                 last_exc = exc
-                if exc.code in (429, 502, 503, 504) and attempt < max_retries:
+                # 421: misdirected (connection coalescing / stale route);
+                # the server closed the connection, so the retry reconnects.
+                if exc.code in (421, 429, 502, 503, 504) and attempt < max_retries:
                     pass # Handled by the retry logic below
                 else:
                     payload = exc.read()
@@ -1037,15 +1107,19 @@ class MicroVM:
         raise last_exc
 
     def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
+        data, _ = self._do_json_headers(method, path, payload)
+        return data
+
+    def _do_json_headers(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> tuple[Any, Dict[str, str]]:
         body = None
         content_type = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
-        raw = self._request(method, self._url(path), body, content_type)
+        raw, headers = self._request_headers(method, self._url(path), body, content_type)
         if raw == b"":
-            return {}
-        return json.loads(raw.decode("utf-8"))
+            return {}, headers
+        return json.loads(raw.decode("utf-8")), headers
 
     def _do_multipart(
         self,
@@ -1127,6 +1201,10 @@ def _to_websocket_url(base_url: str, path: str) -> str:
 
 def _first_of(mapping: Dict[str, Any], *keys: str) -> Any:
     for key in keys:
+        # Callers pass string field names. Skip anything else so a dict
+        # never reaches the subscript, which would raise TypeError.
+        if not isinstance(key, str):
+            continue
         if key in mapping and mapping[key] is not None:
             return mapping[key]
     return None
@@ -1136,19 +1214,35 @@ def _compact(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
 
-def _build_tag_query(tags: Optional[Dict[str, str]]) -> str:
-    # Renders the tag filter as the server's `?tag.<key>=<value>` wire format.
+def _build_sandbox_query(
+    tags: Optional[Dict[str, str]], include_env: bool = False, name: Optional[str] = None
+) -> str:
+    # Renders tag filters and optional include_env as the server's wire format.
     # The `tag.` prefix is literal — the server's parseTagFilter inspects the
     # decoded query key — so only the user-supplied key and value get
-    # percent-encoded. An empty or missing map returns "" so the request URL is
+    # percent-encoded. An empty query returns "" so the request URL is
     # byte-identical to the pre-filter call (no stray trailing "?").
-    if not tags:
+    parts: List[str] = []
+    if tags:
+        parts.extend(
+            f"tag.{urllib.parse.quote(str(key), safe='')}={urllib.parse.quote(str(value), safe='')}"
+            for key, value in tags.items()
+        )
+    if include_env:
+        parts.append("include_env=true")
+    wanted = (name or "").strip()
+    if wanted:
+        parts.append(f"name={urllib.parse.quote(wanted, safe='')}")
+    if not parts:
         return ""
-    parts = [
-        f"tag.{urllib.parse.quote(str(key), safe='')}={urllib.parse.quote(str(value), safe='')}"
-        for key, value in tags.items()
-    ]
     return "?" + "&".join(parts)
+
+
+def _append_query_param(path: str, key: str, value: str) -> str:
+    if not value:
+        return path
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}{urllib.parse.quote(key, safe='')}={urllib.parse.quote(value, safe='')}"
 
 
 def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
@@ -1156,6 +1250,8 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
     failover = _first_of(options, "failover")
     return _compact(
         {
+            "name": _first_of(options, "name"),
+            "tags": _first_of(options, "tags"),
             "image": _first_of(options, "image"),
             "cpu": _first_of(options, "cpu"),
             "memory_mb": _first_of(options, "memoryMB", "memory_mb"),
@@ -1597,6 +1693,12 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
         if mapped_failover:
             result["failover"] = mapped_failover
 
+    name = _first_of(sandbox, "name")
+    if name not in (None, ""):
+        result["name"] = str(name)
+    tags = _first_of(sandbox, "tags")
+    if isinstance(tags, dict) and len(tags) > 0:
+        result["tags"] = {str(key): str(value) for key, value in tags.items()}
     container_id = _first_of(sandbox, "container_id", "containerID")
     if container_id not in (None, ""):
         result["containerID"] = str(container_id)

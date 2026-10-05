@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"testing"
+
+	"github.com/google/btree"
 )
 
 // TestDeletePlacementPlantsTombstoneWhenApplyFails pins the F2a contract: a call
@@ -31,9 +33,9 @@ func TestDeletePlacementPlantsTombstoneWhenApplyFails(t *testing.T) {
 	}
 	c.fsm.recovery["sb-faildel"] = placementRecovery{Spec: spec}
 	if c.fsm.ownerIndex == nil {
-		c.fsm.ownerIndex = map[string]map[string]struct{}{}
+		c.fsm.ownerIndex = map[string]*btree.BTreeG[string]{}
 	}
-	c.fsm.ownerIndex["follower"] = map[string]struct{}{"sb-faildel": {}}
+	c.fsm.ownerIndex["follower"] = ownerIndexTree("sb-faildel")
 	c.fsm.mu.Unlock()
 
 	rec := newRecordingRecreator()

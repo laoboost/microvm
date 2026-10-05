@@ -18,8 +18,10 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
 	"github.com/aerol-ai/microvm/pkg/api/e2b"
+	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -33,7 +35,11 @@ type Server struct {
 	containerEngine string
 	patToken        string
 	validator       controlplane.Validator
+	auditLimiter    *apiv1.AuditRateLimiter
+	clusterEnabled  bool
 	mux             *http.ServeMux
+	root            http.Handler
+	mcp             *remotemcp.Handler
 }
 
 // NewServer constructs the API server. validator is the second-token (non-PAT)
@@ -64,14 +70,34 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		containerEngine: cfg.ContainerEngine,
 		patToken:        patToken,
 		validator:       validator,
-		mux:             http.NewServeMux(),
+		clusterEnabled:  cfg.EnableCluster,
+		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
+			IdentityRate: cfg.AuditRateLimitIdentity,
+			OperatorRate: cfg.AuditRateLimitOperator,
+			NodeRate:     cfg.AuditRateLimitNode,
+		}),
+		mux: http.NewServeMux(),
+	}
+	if cfg.MCPEnabled {
+		s.mcp = remotemcp.New(remotemcp.Config{
+			AllowedOrigins: cfg.MCPAllowedOrigins,
+			AllowedHosts:   cfg.MCPAllowedHosts,
+			RateLimit:      cfg.MCPRateLimit,
+			Version:        version.Version,
+			Logger:         logger,
+		}, s.Handler)
 	}
 	s.routes()
+	s.root = loggingMiddleware(s.logger, s.clusterControlHeaderGuard(s.mux))
 	return s
 }
 
 func (s *Server) Handler() http.Handler {
-	return loggingMiddleware(s.logger, s.mux)
+	if s.root == nil {
+		// A Server built without NewServer (tests) still serves its mux.
+		return loggingMiddleware(s.logger, s.clusterControlHeaderGuard(s.mux))
+	}
+	return s.root
 }
 
 func (s *Server) routes() {
@@ -100,10 +126,17 @@ func (s *Server) routes() {
 		Service:         s.service,
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
+		AuditLimiter:    s.auditLimiter,
 		Builder:         s.builder,
 		Build:           apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
 		ContainerEngine: s.containerEngine,
 	})
+
+	// Remote MCP (opt-in, SB_MCP_ENABLED). Its tools call back into this
+	// same handler in-process with the caller's token.
+	if s.mcp != nil {
+		s.mux.Handle(remotemcp.Path, s.mcp.Wrap(s.requireAuth))
+	}
 
 	// Operator dashboard + expvar. /ui is unauth (static HTML; PAT prompted
 	// in-page), /debug/vars is PAT-gated. See pkg/api/dashboard.go.

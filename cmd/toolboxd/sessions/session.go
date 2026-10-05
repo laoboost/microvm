@@ -135,11 +135,12 @@ func (s *Session) RecordingPath() string { return s.recorder.Path() }
 // the session is still running, returns -1, "". Exit fields are read under the
 // mutex (see Snapshot).
 func (s *Session) ExitInfo() (int, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if !s.exited.Load() {
 		return -1, ""
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.exitCode, s.exitSignal
 }
 
@@ -201,37 +202,48 @@ func (s *Session) Subscribe() (<-chan Frame, func()) {
 // Write forwards bytes to the session's stdin (PTY in PTY mode, pipe stdin
 // otherwise). Returns an error if the session has exited or stdin is closed.
 func (s *Session) Write(p []byte) (int, error) {
+	s.mu.Lock()
 	if s.exited.Load() {
+		s.mu.Unlock()
 		return 0, errors.New("session has exited")
 	}
-	if s.ptmx != nil {
-		// Optionally record stdin keystrokes for replay accuracy.
-		if s.recorder != nil {
-			s.recorder.WriteInput(p)
+	ptmx := s.ptmx
+	stdin := s.stdin
+	rec := s.recorder
+	s.mu.Unlock()
+	if ptmx != nil {
+		if rec != nil {
+			rec.WriteInput(p)
 		}
-		return s.ptmx.Write(p)
+		return ptmx.Write(p)
 	}
-	if s.stdin != nil {
-		return s.stdin.Write(p)
+	if stdin != nil {
+		return stdin.Write(p)
 	}
 	return 0, errors.New("session has no writable stdin")
 }
 
 // CloseStdin half-closes stdin so the process sees EOF.
 func (s *Session) CloseStdin() error {
-	if s.stdin != nil {
-		return s.stdin.Close()
+	s.mu.Lock()
+	stdin := s.stdin
+	ptmx := s.ptmx
+	s.mu.Unlock()
+	if stdin != nil {
+		return stdin.Close()
 	}
-	if s.ptmx != nil {
+	if ptmx != nil {
 		// PTY half-close isn't well-defined; nothing to do.
 		return nil
 	}
 	return nil
 }
 
-// Resize updates the PTY window size. No-op in pipe mode.
+// Resize updates the PTY window size. No-op in pipe mode or after exit.
 func (s *Session) Resize(cols, rows int) error {
-	if s.ptmx == nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exited.Load() || s.ptmx == nil {
 		return nil
 	}
 	if cols <= 0 || rows <= 0 {
@@ -299,14 +311,19 @@ func (s *Session) runPump(r io.Reader, stream Stream) {
 // the recorder. Exit fields are written under the mutex so concurrent
 // Snapshot/ExitInfo readers can't race on them.
 func (s *Session) finish(code int, signal string, failed bool) {
-	if !s.exited.CompareAndSwap(false, true) {
+	s.mu.Lock()
+	if s.exited.Load() {
+		s.mu.Unlock()
 		return
 	}
-	s.mu.Lock()
 	s.exitCode = code
 	s.exitSignal = signal
 	s.failed = failed
 	s.exitedAt = time.Now().UTC()
+	// Publish the terminal state only after all metadata is initialized. Readers
+	// that need the metadata take mu, while the atomic remains a cheap guard for
+	// write/shutdown paths that only need to know whether the process exited.
+	s.exited.Store(true)
 	for id, ch := range s.subscribers {
 		close(ch)
 		delete(s.subscribers, id)
@@ -316,8 +333,12 @@ func (s *Session) finish(code int, signal string, failed bool) {
 	if s.recorder != nil {
 		_ = s.recorder.Close()
 	}
-	if s.ptmx != nil {
-		_ = s.ptmx.Close()
+	s.mu.Lock()
+	ptmx := s.ptmx
+	s.ptmx = nil
+	s.mu.Unlock()
+	if ptmx != nil {
+		_ = ptmx.Close()
 	}
 	close(s.doneCh)
 }

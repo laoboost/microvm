@@ -238,9 +238,9 @@ func TestClusterOwnershipNeedsReplayVariants(t *testing.T) {
 // --- ingress_delta.go ---
 
 func TestIngressDeltaHelpersAndGC(t *testing.T) {
-	_ = clusterIngressShardFilter(nil, "self")
+	_ = (&Service{}).clusterIngressShardFilter(nil, "self")
 	c := cluster.NewNoop("self", "http://self", "")
-	f := clusterIngressShardFilter(c, "self")
+	f := (&Service{}).clusterIngressShardFilter(c, "self")
 	_ = f
 
 	svc := &Service{
@@ -250,6 +250,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 	peer := cluster.Placement{
 		SandboxID: "sb-peer", OwnerNodeID: "peer-1", OwnerAPIURL: "http://10.0.0.2:8080",
 		Version: 1,
+		Spec:    &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 		ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 			5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 25432},
 			8080: {Protocol: models.ExposedPortProtocolHTTP},
@@ -282,7 +283,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 	}
 
 	svc.ingressRouteCache = map[string]ingressRouteIntent{}
-	ops, commit := svc.planClusterIngressDelta(intents)
+	ops, commit := svc.planClusterIngressDelta(intents, nil)
 	if len(ops) == 0 {
 		t.Fatal("expected delta ops on cold cache")
 	}
@@ -300,6 +301,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 		OwnerNodeID: "peer-2",
 		OwnerAPIURL: "http://10.0.0.3:8080",
 		Version:     2,
+		Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 		ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 			9090: {},
 		},
@@ -313,7 +315,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 		t.Fatalf("default-protocol port intent missing: %s", defaultKey)
 	}
 
-	_ = routeShardFilterLogValue(cluster.IngressShardFilterForNode(nil, "self"))
+	_ = routeShardFilterLogValue(cluster.IngressShardFilterForNode(nil, "self", config.NodeRoleIngress))
 }
 
 func TestGCUnexpectedClusterIngressRoutes(t *testing.T) {
@@ -373,6 +375,7 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 			OwnerAPIURL:        "http://10.0.0.7:21212",
 			OwnerDataPlaneHost: "10.0.0.7",
 			Version:            1,
+			Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			CustomHostnames:    []string{"api.acme.com"},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				8080: {Protocol: models.ExposedPortProtocolHTTP},
@@ -385,6 +388,7 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 			SandboxID:   "sb-flux",
 			OwnerNodeID: "peer-2",
 			Version:     2,
+			Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				9000: {Protocol: models.ExposedPortProtocolHTTP},
 			},
@@ -393,7 +397,7 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 	if !needL4 {
 		t.Fatal("expected L4 to be required for cluster ingress intents")
 	}
-	ops, commit := svc.planClusterIngressDelta(desired)
+	ops, commit := svc.planClusterIngressDelta(desired, nil)
 	if len(ops) == 0 {
 		t.Fatal("expected initial delta ops")
 	}
@@ -404,11 +408,11 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 	}
 	commit()
 
-	if ops, _ = svc.planClusterIngressDelta(desired); len(ops) != 0 {
+	if ops, _ = svc.planClusterIngressDelta(desired, nil); len(ops) != 0 {
 		t.Fatalf("identical desired state produced %d ops, want 0", len(ops))
 	}
 
-	ops, _ = svc.planClusterIngressDelta(map[string]ingressRouteIntent{})
+	ops, _ = svc.planClusterIngressDelta(map[string]ingressRouteIntent{}, nil)
 	if len(ops) == 0 {
 		t.Fatal("expected delete ops when desired state is empty")
 	}
@@ -653,10 +657,10 @@ func TestHandleL4WakeTCPConnBranches(t *testing.T) {
 		svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 		server, client := net.Pipe()
-		go func() {
-			_, _ = client.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
-			_ = client.Close()
-		}()
+		go func(conn net.Conn) {
+			_, _ = conn.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
+			_ = conn.Close()
+		}(client)
 		svc.handleL4WakeTCPConn(server)
 
 		now := time.Now().UTC()
@@ -684,10 +688,10 @@ func TestHandleL4WakeTCPConnBranches(t *testing.T) {
 			t.Fatalf("UpsertPort: %v", err)
 		}
 		server, client = net.Pipe()
-		go func() {
-			_, _ = client.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
-			_ = client.Close()
-		}()
+		go func(conn net.Conn) {
+			_, _ = conn.Write([]byte("PROXY TCP4 1.2.3.4 5 6.7.8.9 40123\r\n"))
+			_ = conn.Close()
+		}(client)
 		svc.handleL4WakeTCPConn(server)
 	})
 }
@@ -722,11 +726,9 @@ func TestProxyL4WakeConnDialError(t *testing.T) {
 		t.Fatalf("UpsertPort: %v", err)
 	}
 
-	oldDial := dialL4Upstream
-	dialL4Upstream = func(context.Context, string, time.Duration) (net.Conn, error) {
+	setDialL4UpstreamForTest(t, func(context.Context, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
-	}
-	defer func() { dialL4Upstream = oldDial }()
+	})
 
 	server, client := net.Pipe()
 	go func() {
@@ -767,11 +769,9 @@ func TestTLSWakeListenerAcceptBranches(t *testing.T) {
 		t.Fatalf("UpsertPort: %v", err)
 	}
 
-	oldDial := dialL4Upstream
-	dialL4Upstream = func(context.Context, string, time.Duration) (net.Conn, error) {
+	setDialL4UpstreamForTest(t, func(context.Context, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
-	}
-	defer func() { dialL4Upstream = oldDial }()
+	})
 
 	socketPath, err := svc.ensureTLSWakeListener("sb-tls-accept", 8443)
 	if err != nil {

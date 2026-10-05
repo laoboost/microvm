@@ -20,23 +20,24 @@ import (
 	"testing"
 	"time"
 
+	apievents "github.com/containerd/containerd/api/events"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
+	"github.com/containerd/typeurl/v2"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
-	cntr "github.com/containerd/containerd"
-	apievents "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/runtime"
-	"github.com/containerd/typeurl/v2"
-	"github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespecs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -260,7 +261,6 @@ type memContentStore struct {
 func (m *memContentStore) Info(context.Context, digest.Digest) (content.Info, error) {
 	return content.Info{}, errdefs.ErrNotFound
 }
-
 func (m *memContentStore) Update(context.Context, content.Info, ...string) (content.Info, error) {
 	return content.Info{}, nil
 }
@@ -294,7 +294,6 @@ func (w *memContentWriter) Truncate(int64) error            { return nil }
 func (m *memContentStore) Writer(_ context.Context, _ ...content.WriterOpt) (content.Writer, error) {
 	return &memContentWriter{store: m, desc: ocispec.Descriptor{MediaType: "application/octet-stream"}}, nil
 }
-
 func (m *memContentStore) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
 	b, ok := m.blobs[desc.Digest]
 	if !ok {
@@ -302,11 +301,9 @@ func (m *memContentStore) ReaderAt(ctx context.Context, desc ocispec.Descriptor)
 	}
 	return &memReaderAt{data: b}, nil
 }
-
 func (m *memContentStore) Status(context.Context, string) (content.Status, error) {
 	return content.Status{}, errdefs.ErrNotFound
 }
-
 func (m *memContentStore) Exists(_ context.Context, dgst digest.Digest) (bool, error) {
 	_, ok := m.blobs[dgst]
 	return ok, nil
@@ -440,7 +437,6 @@ type listFailTransport struct{ fakeTransport }
 func (*listFailTransport) loadContainer(context.Context, string) (cntr.Container, error) {
 	return nil, errdefs.ErrNotFound
 }
-
 func (*listFailTransport) listContainers(context.Context, ...string) ([]cntr.Container, error) {
 	return nil, errors.New("list failed")
 }

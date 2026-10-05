@@ -27,8 +27,8 @@ func TestCreateSandboxWithID_RejectsPathTraversalID(t *testing.T) {
 	if err == nil {
 		t.Fatalf("CreateSandboxWithID(%q) = %+v, want validation error", "../../etc", resp)
 	}
-	if !strings.Contains(err.Error(), "invalid sandbox id") {
-		t.Fatalf("err = %q, want message containing %q", err.Error(), "invalid sandbox id")
+	if !strings.Contains(err.Error(), "invalid sandbox ID") {
+		t.Fatalf("err = %q, want message containing %q", err.Error(), "invalid sandbox ID")
 	}
 	if rt.createCalls != 0 {
 		t.Fatalf("runtime Create calls = %d, want 0 (id must be rejected before the runtime)", rt.createCalls)
@@ -56,8 +56,8 @@ func TestCreateSandbox_RejectsPathTraversalIDOverride(t *testing.T) {
 	if err == nil {
 		t.Fatalf("createSandbox(idOverride=%q) = %+v, want validation error", "../../../../etc/passwd", resp)
 	}
-	if !strings.Contains(err.Error(), "invalid sandbox id") {
-		t.Fatalf("err = %q, want message containing %q", err.Error(), "invalid sandbox id")
+	if !strings.Contains(err.Error(), "invalid sandbox ID") {
+		t.Fatalf("err = %q, want message containing %q", err.Error(), "invalid sandbox ID")
 	}
 	if rt.createCalls != 0 {
 		t.Fatalf("runtime Create calls = %d, want 0", rt.createCalls)

@@ -30,7 +30,9 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 	// profile at all and let mount-s3 resolve credentials from the environment.
 	useStaticCreds := hasS3Credentials(spec.Credentials)
 
-	argv := []string{"mount-s3", bucket, hostTarget, "--foreground"}
+	// Flags first; the bucket and target are appended after "--" at the end
+	// so neither can be parsed as a mount-s3 option.
+	argv := []string{"mount-s3", "--foreground"}
 	if useStaticCreds {
 		argv = append(argv, "--profile", "sandbox")
 	}
@@ -91,9 +93,14 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 	// AWS_IO_DNS_INVALID_NAME, so the failure looked like a DNS problem.
 	// An operator who explicitly passes an addressing style via extra_args
 	// (--force-path-style / --virtual-hosted-style) keeps their choice.
+	//
+	// This must be appended before the "--" terminator below: anything after
+	// it is positional, and the tool would read the flag as the bucket name.
 	if !slices.Contains(argv, "--force-path-style") && !slices.Contains(argv, "--virtual-hosted-style") {
 		argv = append(argv, "--force-path-style")
 	}
+
+	argv = append(argv, "--", bucket, hostTarget)
 
 	if !useStaticCreds {
 		// No profile file; ambient instance-role credentials are used.

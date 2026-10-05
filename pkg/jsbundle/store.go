@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -171,6 +172,12 @@ func (s *Store) Put(tenant, name string, b *Bundle) (string, error) {
 
 // GetByDigest loads a bundle by its content digest.
 func (s *Store) GetByDigest(digest string) (*Bundle, error) {
+	// A digest is the content-address key and becomes a path component in
+	// blobPath, so reject anything that is not a 64-char hex sha256 before it
+	// can reach the filesystem (a non-hex value like "../x" would traverse).
+	if !isHex64(digest) {
+		return nil, fmt.Errorf("%w: digest %q", ErrBundleNotFound, digest)
+	}
 	raw, err := os.ReadFile(s.blobPath(digest))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -250,6 +257,9 @@ func (s *Store) GCUnreferenced(pinned map[string]struct{}) ([]string, error) {
 // DELETE /v1/js-bundles/{digest} 404s (matching /v1/wasm-modules) instead of
 // silently succeeding on an unknown or unowned id.
 func (s *Store) Delete(tenant, digest string) error {
+	if !isHex64(digest) {
+		return ErrBundleNotFound
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !slices.Contains(s.byTenant[tenant], digest) {
@@ -290,6 +300,25 @@ func (s *Store) ListDigests(tenant string) []string {
 	defer s.mu.Unlock()
 	out := make([]string, len(s.byTenant[tenant]))
 	copy(out, s.byTenant[tenant])
+	return out
+}
+
+// Tenants returns every tenant with at least one bundle on this node, sorted.
+// The replicated artifact catalogue publishes one node's WHOLE inventory of a
+// kind, so it has to enumerate the tenants rather than be asked per tenant —
+// a tenant this node holds nothing for is an answer the catalogue must be
+// able to give.
+func (s *Store) Tenants() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.byTenant))
+	for tenant, digests := range s.byTenant {
+		if len(digests) == 0 {
+			continue
+		}
+		out = append(out, tenant)
+	}
+	sort.Strings(out)
 	return out
 }
 

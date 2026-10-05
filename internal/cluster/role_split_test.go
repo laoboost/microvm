@@ -17,8 +17,7 @@ import (
 // after New wouldn't change what peers see.
 func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, gossipPeers []string) (*Cluster, func()) {
 	t.Helper()
-	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
+	testClusterMu.Lock()
 	dir := t.TempDir()
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 
@@ -26,16 +25,18 @@ func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, g
 		EnableCluster:                 true,
 		NodeID:                        nodeID,
 		NodeRole:                      role,
-		RaftBindAddr:                  fmt.Sprintf("127.0.0.1:%d", raftPort),
-		RaftAdvertiseAddr:             fmt.Sprintf("127.0.0.1:%d", raftPort),
+		RaftBindAddr:                  "127.0.0.1:0",
+		RaftAdvertiseAddr:             "127.0.0.1:0",
 		RaftDataDir:                   filepath.Join(dir, "raft"),
-		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
 		BootstrapPeers:                gossipPeers,
 		ClusterBootstrap:              bootstrap,
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     "127.0.0.1:0",
 		// Test clusters run plaintext gossip (no fleet key). Production only
 		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
 		// opt-in here so voter-promotion subjects stay exercisable.
@@ -44,30 +45,36 @@ func newTestClusterWithRole(t *testing.T, nodeID, role string, bootstrap bool, g
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c, err := New(cfg, logger, nil)
+	testClusterMu.Unlock()
 	if err != nil {
 		t.Fatalf("cluster.New(%s, role=%s): %v", nodeID, role, err)
 	}
 	return c, func() {
+		testClusterMu.Lock()
+		defer testClusterMu.Unlock()
 		if err := c.Close(); err != nil {
 			t.Logf("cluster.Close(%s): %v", nodeID, err)
 		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
 func newTestAgentWithRole(t *testing.T, nodeID, role string, gossipPeers []string) (*Agent, func()) {
 	t.Helper()
-	gossipPort := pickFreeTCPPort(t)
+	testClusterMu.Lock()
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
 	cfg := config.Config{
 		EnableCluster:                 true,
 		NodeID:                        nodeID,
 		NodeRole:                      role,
-		GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-		GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
 		BootstrapPeers:                gossipPeers,
 		SelfAPIAdvertiseURL:           apiURL,
 		ClusterRaftCommitTimeout:      2 * time.Second,
 		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     "127.0.0.1:0",
 		// Test clusters run plaintext gossip (no fleet key). Production only
 		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
 		// opt-in here so voter-promotion subjects stay exercisable.
@@ -75,13 +82,17 @@ func newTestAgentWithRole(t *testing.T, nodeID, role string, gossipPeers []strin
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a, err := NewAgent(cfg, logger, nil)
+	testClusterMu.Unlock()
 	if err != nil {
 		t.Fatalf("cluster.NewAgent(%s, role=%s): %v", nodeID, role, err)
 	}
 	return a, func() {
+		testClusterMu.Lock()
+		defer testClusterMu.Unlock()
 		if err := a.Close(); err != nil {
 			t.Logf("agent.Close(%s): %v", nodeID, err)
 		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

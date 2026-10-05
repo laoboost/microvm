@@ -14,12 +14,13 @@ import (
 )
 
 // (b) The jail is honesty-bound: JailCoverage must name exactly what applyJail
-// realizes. The seccomp allowlist (internal/runtime/isolate/jail.go) is still
-// dead config — it needs a pre-exec BPF install that Go's os/exec cannot
-// express — so the report must never claim seccomp.
+// realizes. applyJail now installs the seccomp allowlist through the re-exec
+// jail shim (alongside chroot, cgroup v2, uid/gid drop and NO_NEW_PRIVS), so
+// the report must claim seccomp — and must not still claim it is missing.
 func TestJailCoverageNamesWhatIsActuallyApplied(t *testing.T) {
-	if got := JailCoverage(); got != "uid-drop only; seccomp NOT applied" {
-		t.Fatalf("JailCoverage() = %q, want %q", got, "uid-drop only; seccomp NOT applied")
+	got := JailCoverage()
+	if !strings.Contains(got, "seccomp") || strings.Contains(got, "NOT applied") {
+		t.Fatalf("JailCoverage() = %q, want a report that seccomp IS applied", got)
 	}
 }
 
@@ -29,12 +30,19 @@ func TestApplyJailSetsNoNewPrivs(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("applyJail prctl is linux-only")
 	}
+	if os.Geteuid() != 0 {
+		t.Skip("applyJail realizes the full jail (chroot, cgroup, setuid); needs root")
+	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	cmd := exec.Command("/bin/true")
-	if err := applyJail(cmd, JailConfig{Require: true, UID: 1000, GID: 1000}); err != nil {
+	realized, err := applyJail(cmd, JailConfig{Require: true, UID: 1000, GID: 1000}, nil)
+	if err != nil {
 		t.Fatalf("applyJail: %v", err)
+	}
+	if realized != nil {
+		t.Cleanup(func() { _ = realized.teardown() })
 	}
 	v, err := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
 	if err != nil {
@@ -80,10 +88,10 @@ func TestHostStartRequireFailsWithoutSeccompUnlessOverridden(t *testing.T) {
 	err := h.Start(context.Background())
 	if err == nil {
 		_ = h.Stop()
-		t.Fatal("Start succeeded with Jail.Require=true while seccomp is NOT applied")
+		t.Fatal("Start succeeded with Jail.Require=true on a host that cannot realize the jail")
 	}
-	if !strings.Contains(err.Error(), "seccomp NOT applied") {
-		t.Fatalf("Start error = %v, want the honest seccomp-not-applied refusal", err)
+	if !strings.Contains(err.Error(), "needs root") && !strings.Contains(err.Error(), "seccomp NOT applied") {
+		t.Fatalf("Start error = %v, want the honest fail-closed jail refusal", err)
 	}
 	if _, statErr := os.Stat(side); statErr == nil {
 		t.Fatal("workerd was spawned despite the Require=true fail-closed gate")
@@ -97,5 +105,9 @@ func TestHostStartRequireFailsWithoutSeccompUnlessOverridden(t *testing.T) {
 	if err2 != nil && strings.Contains(err2.Error(), "seccomp NOT applied") {
 		t.Fatalf("SB_ISOLATE_ALLOW_WEAK_JAIL=true still refused at the jail gate: %v", err2)
 	}
+	// The weak-jail override only waives the seccomp gate; realization still
+	// needs root, so a failure here is expected off-root and must not be the
+	// seccomp refusal itself.
+	_ = err2
 	_ = h2.Stop()
 }

@@ -48,7 +48,7 @@ func TestOwnerWatcherSkipsDeliberatelyDeletedUntilTombstoneExpires(t *testing.T)
 	c.AttachRecreator(rec)
 
 	spec := failoverRecreateSpec()
-	cmd := command{Op: opPlace, SandboxID: "sb-tomb", OwnerNodeID: "leader", Spec: spec}
+	cmd := command{Op: opPlace, SandboxID: "sb-tomb", OwnerNodeID: "leader", IncarnationID: "inc-tomb", Spec: spec}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("raft Apply: %v", err)
@@ -91,7 +91,8 @@ func TestDeletePlacementMarksDeliberatelyDeleted(t *testing.T) {
 
 	cmd := command{
 		Op: opPlace, SandboxID: "sb-del", OwnerNodeID: "leader",
-		Spec: &models.CreateSandboxRequest{Name: "del-me", Image: "alpine"},
+		IncarnationID: "inc-del",
+		Spec:          &models.CreateSandboxRequest{Name: "del-me", Image: "alpine"},
 	}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {

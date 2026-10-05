@@ -43,7 +43,7 @@ func TestPullSnapshotArtifactAcceptsLegacyV1MediaTypes(t *testing.T) {
 	ref := reg.ref("latest")
 	ctx := context.Background()
 
-	if _, err := PushSnapshotArtifact(ctx, pushCfg, writeTestSnapshotDir(t), ref); err != nil {
+	if _, err := PushSnapshotArtifact(ctx, pushCfg, writeTestSnapshotDir(t), ref, "inc-test"); err != nil {
 		t.Fatalf("push: %v", err)
 	}
 
@@ -63,7 +63,7 @@ func TestPullSnapshotArtifactAcceptsLegacyV1MediaTypes(t *testing.T) {
 	reg.setManifest("latest", []byte(legacy))
 
 	dstDir := t.TempDir()
-	if err := PullSnapshotArtifact(ctx, pullCfg, ref, dstDir); err != nil {
+	if err := PullSnapshotArtifact(ctx, pullCfg, ref, "inc-test", dstDir); err != nil {
 		t.Fatalf("legacy v1-media-type artifact failed to pull: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dstDir, "config.json")); err != nil {

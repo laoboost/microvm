@@ -193,7 +193,59 @@ Sandboxes are **private by default**: omitting `allowPublicTraffic` gives no pub
 
 ### Named sandboxes
 
-Pass a `name` field to pin a human-readable identifier to the sandbox. Names must be unique — if you call `create` with a name that belongs to an existing sandbox, the daemon returns **HTTP 409 Conflict** with `"sandbox name already in use"`. Omit the field (or leave it empty) to let the daemon generate a random ID.
+Pass a `name` field to pin a human-readable identifier to the sandbox. Names are unique per owner: two accounts (two tokens with different owners) can each have a sandbox called `build-box`, but one account cannot have two. If you call `create` with a name that one of your sandboxes already has, the daemon returns **HTTP 409 Conflict** with `"sandbox name already in use"`. Omit the field (or leave it empty) to let the daemon generate a random ID.
+
+A name can't start with `owner:`, and it can't look like a generated ID (`sb-` followed by 16 hex digits), so a name and an ID never collide.
+
+### Look up a sandbox by name
+
+`getByName` returns your sandbox with that name in one request, or nothing when you have none. It only sees your own sandboxes, so another account's `build-box` is never returned. Together with the 409 on create, this makes a retry-safe get-or-create: look the name up, create it if it is missing, and on a 409 look it up again.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.getByName('build-box')
+    if (sandbox === null) {
+      console.log('no sandbox called build-box')
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.get_by_name('build-box')
+    if sandbox is None:
+        print('no sandbox called build-box')
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.GetByName(ctx, "build-box")
+    if errors.Is(err, microvm.ErrNotFound) {
+        fmt.Println("no sandbox called build-box")
+    } else if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    match client.get_by_name("build-box")? {
+        Some(sandbox) => println!("{}", sandbox.data.id),
+        None => println!("no sandbox called build-box"),
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    java.util.Optional<Sandbox> sandbox = client.getByName("build-box");
+    if (sandbox.isEmpty()) {
+        System.out.println("no sandbox called build-box");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+An older server that predates name lookup ignores the filter and answers with an ordinary list. Every SDK checks the reply and raises a "does not support sandbox name lookup" error instead of picking a sandbox from that list; use the sandbox ID there, or upgrade the server.
 
 ## Connect to existing sandbox
 
@@ -213,7 +265,7 @@ Retrieve a running sandbox by ID to get a fully usable sandbox object.
     sandbox = client.get('sbx_abc123')
 
     print(sandbox.id)
-    print(sandbox.public_url)
+    print(sandbox.publicURL)
     ```
   </TabItem>
   <TabItem label="Go">
@@ -374,6 +426,61 @@ Change CPU or memory allocation on a running sandbox without restarting it.
     ```java
     var sandboxes = client.list();
     var sandbox   = client.get(id);
+    ```
+  </TabItem>
+</Tabs>
+
+For large fleet inventories, use the page-at-a-time API so the client does not
+retain all 100,000+ sandbox records in memory:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    for await (const page of client.listPages()) {
+      await processPage(page)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    for page in client.iter_pages():
+        process_page(page)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    token := ""
+    for {
+        page, next, err := client.ListPage(ctx, token)
+        if err != nil { return err }
+        processPage(page)
+        if next == "" { break }
+        token = next
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let tags = std::collections::HashMap::new();
+    let mut token = String::new();
+    loop {
+        let page = client.list_page_with_options(&tags, false, &token)?;
+        process_page(&page.sandboxes);
+        match page.next_page_token {
+            Some(next) => token = next,
+            None => break,
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String token = "";
+    do {
+        var page = client.listPage(java.util.Collections.emptyMap(), false, token);
+        processPage(page.sandboxes);
+        token = page.nextPageToken;
+    } while (!token.isEmpty());
     ```
   </TabItem>
 </Tabs>

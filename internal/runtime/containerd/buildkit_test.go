@@ -11,8 +11,9 @@ import (
 	"strings"
 	"testing"
 
+	cntr "github.com/containerd/containerd/v2/client"
+
 	"github.com/aerol-ai/microvm/pkg/docker"
-	cntr "github.com/containerd/containerd"
 )
 
 func TestNewBuildKitBuilderDefaults(t *testing.T) {
@@ -140,6 +141,15 @@ func TestExtractTarRejectsTraversal(t *testing.T) {
 
 	if err := extractTar(buf.Bytes(), t.TempDir()); err == nil {
 		t.Fatal("path traversal entry must be rejected")
+	}
+
+	buf.Reset()
+	tw = tar.NewWriter(&buf)
+	_ = tw.WriteHeader(&tar.Header{Name: "/etc/passwd", Mode: 0o644, Size: 1, Typeflag: tar.TypeReg})
+	_, _ = tw.Write([]byte("x"))
+	_ = tw.Close()
+	if err := extractTar(buf.Bytes(), t.TempDir()); err == nil {
+		t.Fatal("absolute tar entry must be rejected")
 	}
 }
 

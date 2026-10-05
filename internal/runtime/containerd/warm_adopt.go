@@ -8,13 +8,14 @@ import (
 	"syscall"
 	"time"
 
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
+
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
 )
 
 const (

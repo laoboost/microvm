@@ -8,12 +8,17 @@ import (
 )
 
 // applyJail is unavailable off Linux — chroot/setuid/seccomp/cgroup are
-// Linux-only. Returning an error makes Start FAIL CLOSED when a jail is
-// required, so an isolate host is never run unconfined while the operator
-// believes it is jailed.
-func applyJail(_ *exec.Cmd, _ JailConfig) error {
-	return fmt.Errorf("isolate jail: realization requires linux (chroot/setuid/seccomp are Linux-only)")
+// Linux-only. A required jail therefore fails closed here (see Host.Start);
+// this is also why JailRealizable() is false on these platforms.
+func applyJail(*exec.Cmd, JailConfig, []string) (*jailRealized, error) {
+	return nil, fmt.Errorf("isolate jail: realization requires linux (chroot/setuid/seccomp/cgroup are Linux-only)")
 }
 
-// jailRealizable reports that this (non-Linux) platform cannot realize the jail.
 func jailRealizable() bool { return false }
+
+// jailCoverage is the exact profile applyJail realizes off Linux: nothing.
+func jailCoverage() string { return "none — jail realization requires linux" }
+
+// seccompApplied is false off Linux; applyJail errors there anyway, so a
+// required jail fails closed before this is consulted.
+func seccompApplied() bool { return false }

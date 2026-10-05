@@ -6,6 +6,7 @@ DOMAIN=""
 PUBLIC_HOST=""
 PAT_TOKEN=""
 INSTALL_PREFIX="/usr/local/bin"
+INSTALL_PREFIX_EXPLICIT="false"
 BUILD_FROM_SOURCE="auto"
 GITHUB_REPO="aerol-ai/microvm"
 VERSION="latest"
@@ -23,6 +24,11 @@ CADDY_BINARY_URL_EXPLICIT="false"
 WITH_GVISOR="false"
 RUNSC_PATH=""
 WITH_ISOLATE="false"
+# Routing without per-sandbox Caddy writes (plans/ingress-proxy-routing.md).
+# Sets SB_INGRESS_PROXY_ROUTING and routes *.rt.internal to the sandboxd
+# route responder via systemd-resolved.
+INGRESS_PROXY_ROUTING="false"
+ROUTE_DNS_ADDR="127.0.0.1:53053"
 WORKERD_PATH=""
 # Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
 # Phase 1). Upstream ships gzipped standalone binaries with no checksum
@@ -35,7 +41,18 @@ WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
 WITH_CONTAINERD_ENGINE="false"
 LOCAL_MODE="false"
+# --cli-only installs just the aerolvm agent CLI: no daemon, Docker or root.
+CLI_ONLY="false"
+CLI_URL=""
 NODE_NAME=""
+PAT_TOKEN_EXPLICIT="false"
+# macOS --local installs for the current user only — no sudo, nothing outside
+# $HOME. Everything lives under one directory inside /Users, which Docker's
+# Linux VM (OrbStack / Docker Desktop) shares with containers, so the Linux
+# toolboxd bind-mounts into sandboxes from here (a /usr/local/bin path would
+# arrive as an empty directory). sandboxd runs as a LaunchAgent.
+DARWIN_HOME="$HOME/.aerolvm"
+DARWIN_LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.aerol.sandboxd.plist"
 
 # Bound every bootstrap download. Without low-speed and total timeouts, a dead
 # CDN/GitHub connection can sit at 0 bytes forever and leave cloud-init running
@@ -135,6 +152,10 @@ Options:
                                Skips the download step and registers this
                                binary instead. Only consulted with
                                --with-gvisor.
+  --ingress-proxy-routing      Route sandboxes without per-sandbox Caddy
+                               writes (static routes + sandboxd route
+                               responder; configures systemd-resolved for
+                               *.rt.internal). Off by default.
   --with-isolate               Install Cloudflare's workerd (version-pinned,
                                SHA-256 verified against hashes embedded in
                                this script) to /usr/local/bin/workerd and
@@ -219,16 +240,29 @@ Options:
                                file instead of argv (preferred).
   --local                      Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
-                               on both macOS and Linux. Docker Desktop (macOS)
-                               or Docker Engine (Linux) must already be running.
-                               No domain name required. On macOS a launchd
-                               daemon is registered; on Linux a systemd unit
-                               without a Caddy dependency is used.
+                               on both macOS and Linux. No domain name required.
+                               Linux: run with sudo; Docker Engine is installed
+                               if missing and a systemd unit without a Caddy
+                               dependency is used.
+                               macOS: run WITHOUT sudo. Installs for the current
+                               user into ~/.aerolvm and registers a LaunchAgent;
+                               OrbStack or Docker Desktop must be running. Each
+                               sandbox publishes only its toolbox port, on
+                               127.0.0.1; every listener stays on 127.0.0.1.
+  --cli-only                   Install only the aerolvm CLI (also an MCP
+                               server: 'aerolvm mcp') on Linux or macOS. No
+                               daemon, Docker or root needed; without root
+                               it installs to ~/.local/bin unless
+                               --install-prefix says otherwise. Ignores
+                               every server option.
+  --cli-url <url>              Download URL for the aerolvm binary
+                               (--cli-only).
   --help                       Show this help
 
 Examples:
 	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com --pat-token-file /root/pat-token
   ./scripts/install.sh --version v0.1.0 --public-host 203.0.113.42
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | bash -s -- --cli-only
 	./scripts/install.sh --public-host 203.0.113.42 --pat-token-file /root/pat-token --build-from-source
 	./scripts/install.sh --domain sandbox.example.com --pat-token-file /root/pat-token \
 	    --dns-provider cloudflare --dns-api-token-file /root/dns-api-token
@@ -276,19 +310,24 @@ detect_platform() {
 
 resolve_release_urls() {
 	local platform
+	local toolbox_platform
 	local release_base
 
 	platform="$(detect_platform)"
+	# toolboxd is the in-sandbox agent: it always runs inside a Linux
+	# container (on macOS, Docker's Linux VM), so a darwin host still needs
+	# the linux build of the same architecture.
+	toolbox_platform="${platform/#darwin_/linux_}"
 	release_base="https://github.com/${GITHUB_REPO}/releases"
 
 	if [[ "$VERSION" == "latest" ]]; then
 		SANDBOXD_URL="${SANDBOXD_URL:-${release_base}/latest/download/sandboxd_${platform}}"
-		TOOLBOXD_URL="${TOOLBOXD_URL:-${release_base}/latest/download/toolboxd_${platform}}"
+		TOOLBOXD_URL="${TOOLBOXD_URL:-${release_base}/latest/download/toolboxd_${toolbox_platform}}"
 		CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/latest/download/checksums.txt}"
 		CADDY_BINARY_URL="${CADDY_BINARY_URL:-${release_base}/latest/download/caddy_${platform}}"
 	else
 		SANDBOXD_URL="${SANDBOXD_URL:-${release_base}/download/${VERSION}/sandboxd_${platform}}"
-		TOOLBOXD_URL="${TOOLBOXD_URL:-${release_base}/download/${VERSION}/toolboxd_${platform}}"
+		TOOLBOXD_URL="${TOOLBOXD_URL:-${release_base}/download/${VERSION}/toolboxd_${toolbox_platform}}"
 		CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/download/${VERSION}/checksums.txt}"
 		CADDY_BINARY_URL="${CADDY_BINARY_URL:-${release_base}/download/${VERSION}/caddy_${platform}}"
 	fi
@@ -320,66 +359,115 @@ curl_download() {
 
 verify_downloads() {
 	local tmp_dir="$1"
-	local sandboxd_asset="$2"
-	local toolboxd_asset="$3"
-	local sandboxd_url="$4"
-	local toolboxd_url="$5"
+	shift
 
-	if [[ "$SKIP_CHECKSUM_VERIFY" == "true" ]]; then
+if [[ "$SKIP_CHECKSUM_VERIFY" == "true" ]]; then
 		echo "Warning: --skip-checksum-verify given; installing WITHOUT checksum verification" >&2
 		return 0
 	fi
 
-	# Operator-supplied local binaries (file:// URLs) are hashed from the
-	# source path instead of a remote checksums file — there is nothing to
-	# verify them against, and fail-closing on a missing remote checksums
-	# entry would block the standard fork/offline install flow.
-	# Remote (http/https) downloads are always checked against the release
-	# checksums; if ANY asset is remote, the checksums file is mandatory.
+	# Fail closed from here on: a missing/unreachable checksums file or a
+	# missing hash entry must abort the install, not silently skip the
+	# verification (the old behavior — supply-chain hole).
+	if [[ -z "$CHECKSUMS_URL" ]]; then
+		echo "Error: CHECKSUMS_URL is empty; cannot verify downloads. Pass --checksums-url, or --skip-checksum-verify to override." >&2
+		return 1
+	fi
+
+	if ! download_asset "$CHECKSUMS_URL" "$tmp_dir/checksums.txt"; then
+		echo "Error: failed to download checksums from $CHECKSUMS_URL; refusing to install unverified binaries. Pass --skip-checksum-verify to override." >&2
+		return 1
+	fi
+
 	(
 		cd "$tmp_dir"
 		: > selected-checksums.txt
-
-		local need_remote=false
-		local url asset
-		for pair in "${sandboxd_url} ${sandboxd_asset}" "${toolboxd_url} ${toolboxd_asset}"; do
-			url="${pair%% *}"
-			asset="${pair##* }"
-			if [[ "$url" == file://* ]]; then
-				local src="${url#file://}"
-				if [[ ! -f "$src" ]]; then
-					echo "Error: local asset not found: $src" >&2
-					exit 1
-				fi
-				sha256sum "$src" | awk -v name="$asset" '{print $1"  "name}' >> selected-checksums.txt
-			else
-				need_remote=true
+		local asset
+		for asset in "$@"; do
+			if ! awk -v name="$asset" '$2 == name { print }' checksums.txt > "checksum-${asset}.txt" \
+				|| [[ "$(wc -l < "checksum-${asset}.txt")" -ne 1 ]]; then
+				echo "Missing or ambiguous checksum for release asset: $asset" >&2
+				exit 1
 			fi
+			cat "checksum-${asset}.txt" >> selected-checksums.txt
 		done
-
-		if [[ "$need_remote" == "true" ]]; then
-			# Fail closed from here on: a missing/unreachable checksums file or a
-			# missing hash entry must abort the install, not silently skip the
-			# verification (the old behavior — supply-chain hole).
-			if [[ -z "$CHECKSUMS_URL" ]]; then
-				echo "Error: CHECKSUMS_URL is empty; cannot verify downloads. Pass --checksums-url, or --skip-checksum-verify to override." >&2
-				exit 1
-			fi
-
-			if ! download_asset "$CHECKSUMS_URL" "$tmp_dir/checksums.txt"; then
-				echo "Error: failed to download checksums from $CHECKSUMS_URL; refusing to install unverified binaries. Pass --skip-checksum-verify to override." >&2
-				exit 1
-			fi
-
-			grep -E "[[:space:]](${sandboxd_asset}|${toolboxd_asset})$" checksums.txt >> selected-checksums.txt || true
-		fi
-
-		if [[ ! -s selected-checksums.txt ]]; then
-			echo "Error: no checksum entries found for downloaded assets; refusing to install unverified binaries. Pass --skip-checksum-verify to override." >&2
-			exit 1
-		fi
-		sha256sum -c selected-checksums.txt
+		sha256_check selected-checksums.txt
 	)
+}
+
+# sha256_check verifies a checksum file. macOS before 14 has no sha256sum,
+# only shasum, and the --cli-only path runs there.
+sha256_check() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum -c "$1"
+	else
+		shasum -a 256 -c "$1"
+	fi
+}
+
+# install_cli installs the aerolvm agent CLI alone
+# (plans/mcp-server-and-agent-cli.md §5.8): the path for laptops and CI
+# runners that drive a sandboxd running somewhere else.
+install_cli() {
+	local os
+	local arch
+	local dest
+	os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	case "$os" in
+		linux|darwin) ;;
+		*)
+			echo "--cli-only supports Linux and macOS; on Windows download aerolvm_windows_<arch>.exe from the release page" >&2
+			exit 1
+			;;
+	esac
+	case "$(uname -m)" in
+		x86_64|amd64) arch="amd64" ;;
+		aarch64|arm64) arch="arm64" ;;
+		*)
+			echo "aerolvm is released for amd64 and arm64, not $(uname -m)" >&2
+			exit 1
+			;;
+	esac
+
+	dest="$INSTALL_PREFIX"
+	if [[ "$INSTALL_PREFIX_EXPLICIT" != "true" && $EUID -ne 0 && ! -w "$dest" ]]; then
+		# One user-level binary is not worth a sudo prompt.
+		dest="$HOME/.local/bin"
+	fi
+	mkdir -p "$dest"
+
+	# Unlike the server path, "auto" builds from source only inside this
+	# repo: piping the installer into bash from some other Go project must
+	# not try to build ./cmd/aerolvm there.
+	if [[ "$BUILD_FROM_SOURCE" == "true" || ( "$BUILD_FROM_SOURCE" == "auto" && -z "$CLI_URL" && -f ./go.mod && -d ./cmd/aerolvm ) ]]; then
+		CGO_ENABLED=0 go build -trimpath -o "$dest/aerolvm" ./cmd/aerolvm
+	else
+		local release_base
+		local asset
+		local tmp_dir
+		release_base="https://github.com/${GITHUB_REPO}/releases"
+		if [[ "$VERSION" == "latest" ]]; then
+			CLI_URL="${CLI_URL:-${release_base}/latest/download/aerolvm_${os}_${arch}}"
+			CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/latest/download/checksums.txt}"
+		else
+			CLI_URL="${CLI_URL:-${release_base}/download/${VERSION}/aerolvm_${os}_${arch}}"
+			CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/download/${VERSION}/checksums.txt}"
+		fi
+		asset="$(basename "${CLI_URL%%\?*}")"
+		tmp_dir="$(mktemp -d)"
+		download_asset "$CLI_URL" "$tmp_dir/$asset"
+		verify_downloads "$tmp_dir" "$asset"
+		install -m 0755 "$tmp_dir/$asset" "$dest/aerolvm"
+		rm -rf "$tmp_dir"
+	fi
+
+	echo "aerolvm installed: $dest/aerolvm"
+	case ":$PATH:" in
+		*":$dest:"*) ;;
+		*) echo "Add $dest to your PATH to run it as aerolvm." ;;
+	esac
+	echo "Point it at a sandboxd: export SB_API_URL=<api url> SB_PAT_TOKEN=<token>"
+	echo "Add it to an MCP client: aerolvm mcp config claude-code"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -395,6 +483,7 @@ while [[ $# -gt 0 ]]; do
 		--pat-token)
 			echo "Warning: --pat-token on argv is visible in process listings and shell history; prefer --pat-token-file or the environment variable documented in --help" >&2
 			PAT_TOKEN="$2"
+			PAT_TOKEN_EXPLICIT="true"
 			shift 2
 			;;
 		--pat-token-file)
@@ -435,6 +524,7 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--install-prefix)
 			INSTALL_PREFIX="$2"
+			INSTALL_PREFIX_EXPLICIT="true"
 			shift 2
 			;;
 		--idle-timeout-min)
@@ -478,6 +568,10 @@ while [[ $# -gt 0 ]]; do
 			WITH_ISOLATE="true"
 			shift
 			;;
+		--ingress-proxy-routing)
+			INGRESS_PROXY_ROUTING="true"
+			shift
+			;;
 		--workerd-path)
 			WORKERD_PATH="$2"
 			shift 2
@@ -493,6 +587,14 @@ while [[ $# -gt 0 ]]; do
 		--local)
 			LOCAL_MODE="true"
 			shift
+			;;
+		--cli-only)
+			CLI_ONLY="true"
+			shift
+			;;
+		--cli-url)
+			CLI_URL="$2"
+			shift 2
 			;;
 		--node-name)
 			NODE_NAME="$2"
@@ -566,6 +668,11 @@ if [[ -z "$DNS_API_TOKEN" && -n "${SB_DNS_API_TOKEN:-}" ]]; then
 	DNS_API_TOKEN="$SB_DNS_API_TOKEN"
 fi
 
+if [[ "$CLI_ONLY" == "true" ]]; then
+	install_cli
+	exit 0
+fi
+
 if [[ -z "$PAT_TOKEN" ]]; then
 	if command -v openssl >/dev/null 2>&1; then
 		PAT_TOKEN="$(openssl rand -hex 24)"
@@ -576,8 +683,19 @@ if [[ -z "$PAT_TOKEN" ]]; then
 fi
 
 if [[ -z "$PUBLIC_HOST" ]]; then
-	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
+	# macOS hostname has no -I; under pipefail the failed pipeline would
+	# exit the script silently, so fall through to the default instead.
+	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 	PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
+fi
+
+# Host path of the toolboxd binary bind-mounted into every sandbox.
+TOOLBOX_BINARY_PATH="$INSTALL_PREFIX/toolboxd"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+	if [[ "$INSTALL_PREFIX" == "/usr/local/bin" ]]; then
+		INSTALL_PREFIX="$DARWIN_HOME/bin"
+	fi
+	TOOLBOX_BINARY_PATH="$DARWIN_HOME/toolbox/toolboxd"
 fi
 
 if [[ -n "$DNS_PROVIDER" ]]; then
@@ -816,16 +934,29 @@ install_custom_caddy() {
 
 	local tmp_binary
 	if [[ -n "$CADDY_BINARY_URL" ]]; then
-		tmp_binary="$(mktemp)"
+		local prebuilt_dir
+		local prebuilt_asset
+		prebuilt_dir="$(mktemp -d)"
+		prebuilt_asset="$(basename "${CADDY_BINARY_URL%%\?*}")"
+		tmp_binary="$prebuilt_dir/$prebuilt_asset"
 		echo "Downloading prebuilt custom Caddy from ${CADDY_BINARY_URL}"
-		if curl_download "$CADDY_BINARY_URL" -o "$tmp_binary" \
-			&& verify_custom_caddy_binary "$tmp_binary" "Prebuilt custom Caddy binary" "${required_modules[@]}"; then
+		if curl_download "$CADDY_BINARY_URL" -o "$tmp_binary"; then
+			if [[ "$CADDY_BINARY_URL_EXPLICIT" != "true" ]] \
+				&& ! verify_downloads "$prebuilt_dir" "$prebuilt_asset"; then
+				rm -rf "$prebuilt_dir"
+				echo "Prebuilt custom Caddy checksum verification failed" >&2
+				exit 1
+			fi
+			if ! verify_custom_caddy_binary "$tmp_binary" "Prebuilt custom Caddy binary" "${required_modules[@]}"; then
+				rm -rf "$prebuilt_dir"
+				exit 1
+			fi
 			systemctl stop caddy >/dev/null 2>&1 || true
 			install -m 0755 "$tmp_binary" "$caddy_path"
-			rm -f "$tmp_binary"
+			rm -rf "$prebuilt_dir"
 			return
 		fi
-		rm -f "$tmp_binary"
+		rm -rf "$prebuilt_dir"
 		if [[ "$CADDY_BINARY_URL_EXPLICIT" == "true" ]]; then
 			echo "Failed to install custom Caddy from explicit --caddy-binary-url: ${CADDY_BINARY_URL}" >&2
 			exit 1
@@ -865,11 +996,20 @@ install_custom_caddy() {
 }
 
 install_binaries() {
-	mkdir -p "$INSTALL_PREFIX"
+	mkdir -p "$INSTALL_PREFIX" "$(dirname "$TOOLBOX_BINARY_PATH")"
 	if [[ "$BUILD_FROM_SOURCE" == "true" ]]; then
-		make build
+		if [[ "$(uname -s)" == "Darwin" ]]; then
+			# sandboxd runs on the Mac; toolboxd runs in Linux containers.
+			local goarch
+			goarch="$(detect_platform)"
+			goarch="${goarch#*_}"
+			make build-sandboxd
+			GOOS=linux GOARCH="$goarch" make build-toolboxd
+		else
+			make build
+		fi
 		install -m 0755 ./bin/sandboxd "$INSTALL_PREFIX/sandboxd"
-		install -m 0755 ./bin/toolboxd "$INSTALL_PREFIX/toolboxd"
+		install -m 0755 ./bin/toolboxd "$TOOLBOX_BINARY_PATH"
 	else
 		local tmp_dir
 		local sandboxd_asset
@@ -881,10 +1021,10 @@ install_binaries() {
 
 		download_asset "$SANDBOXD_URL" "$tmp_dir/$sandboxd_asset"
 		download_asset "$TOOLBOXD_URL" "$tmp_dir/$toolboxd_asset"
-		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset" "$SANDBOXD_URL" "$TOOLBOXD_URL"
+		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset"
 
 		install -m 0755 "$tmp_dir/$sandboxd_asset" "$INSTALL_PREFIX/sandboxd"
-		install -m 0755 "$tmp_dir/$toolboxd_asset" "$INSTALL_PREFIX/toolboxd"
+		install -m 0755 "$tmp_dir/$toolboxd_asset" "$TOOLBOX_BINARY_PATH"
 		rm -rf "$tmp_dir"
 	fi
 }
@@ -931,6 +1071,8 @@ SB_L4_PORT_RANGE_END=23000
 # isn't needed for issuance. In IP/path mode (no --domain) this stays
 # empty and the layer4 multiplexer is never started.
 SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
+SB_INGRESS_PROXY_ROUTING=$INGRESS_PROXY_ROUTING
+SB_ROUTE_DNS_ADDR=$ROUTE_DNS_ADDR
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	# gVisor has no SB_ENABLE_* flag of its own: registering runsc in
@@ -953,6 +1095,22 @@ EOF
 		if [[ -n "${WORKERD_BIN_RESOLVED:-}" && "$WORKERD_BIN_RESOLVED" != "/usr/local/bin/workerd" ]]; then
 			echo "SB_ISOLATE_WORKERD_PATH=$WORKERD_BIN_RESOLVED" >> /etc/sandboxd/sandboxd.env
 		fi
+		# The jail drops each workerd group process to a dedicated system
+		# user. The daemon's default (uid/gid 1000) is the first login user on
+		# most images — on AWS Ubuntu that is `ubuntu`, with sudo — so give the
+		# jail an identity that owns nothing and can log in nowhere.
+		if ! getent passwd sandboxd-isolate >/dev/null 2>&1; then
+			useradd --system --no-create-home --shell /usr/sbin/nologin --user-group sandboxd-isolate
+		fi
+		ISOLATE_JAIL_UID="$(id -u sandboxd-isolate)"
+		ISOLATE_JAIL_GID="$(id -g sandboxd-isolate)"
+		{
+			echo "SB_ISOLATE_JAIL_UID=${ISOLATE_JAIL_UID}"
+			echo "SB_ISOLATE_JAIL_GID=${ISOLATE_JAIL_GID}"
+			echo "SB_ISOLATE_JAIL_CHROOT_BASE=/srv/isolate-jail"
+			echo "SB_ISOLATE_JAIL_CGROUP_ROOT=/sys/fs/cgroup/aerolvm-isolate"
+		} >> /etc/sandboxd/sandboxd.env
+		install -d -m 0755 /srv/isolate-jail
 	fi
 	# Containerd engine is opt-in and dark by default (plans/containerd-engine.md).
 	# Flipping SB_CONTAINER_ENGINE here does not remove dockerd; coexistence is
@@ -1061,7 +1219,7 @@ https://$DOMAIN:8443 {
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
 	}
-	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/*
+	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /mcp
 	handle @api {
 		reverse_proxy 127.0.0.1:21212
 	}
@@ -1075,7 +1233,13 @@ https://*.$DOMAIN:8443 {
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
 	}
-	respond "Sandbox not found" 404
+	# close: caddy-l4 picks a backend once per TCP connection, so a client
+	# that connected before its sandbox's route existed would otherwise keep
+	# reusing a connection pinned to this 404. Closing makes its next attempt
+	# dial again and be routed afresh.
+	respond "Sandbox not found" 404 {
+		close
+	}
 }
 EOF
 	# The caddy user must be able to read its own config; the bootstrap umask
@@ -1131,6 +1295,70 @@ write_caddy_env() (
 	chmod 0600 /etc/default/caddy
 	chown root:root /etc/default/caddy
 )
+
+# write_route_dns_resolver routes the ingress zone (and ONLY that zone) to the
+# sandboxd route responder. caddy-l4 dials "{sni}.rt.internal" through the
+# system resolver; sandboxd refuses SB_INGRESS_PROXY_ROUTING at boot if this
+# routing is missing (routedns.ProbeName), so a half-configured node stays on
+# the per-sandbox route path.
+#
+# WHY a dedicated dummy link, not a resolved.conf.d drop-in: DNS servers in
+# resolved's GLOBAL section serve every name, and Domains=~rt.internal there
+# does not restrict them. The responder then answered general lookups, and
+# Caddy's ACME zone detection broke ("expected 1 zone, got 0"), so no cert
+# issued (found live on cluster-3-mixed-routing). Per-link DNS with
+# DNSDefaultRoute=false is used ONLY for the link's routing domains.
+#
+# The link needs an address and no IPv6 autoconf, or networkd leaves it in
+# "configuring" and resolved ignores its DNS settings. Requires
+# systemd-networkd and systemd >= 249 (ActivationPolicy, DNS=ip:port).
+write_route_dns_resolver() {
+	if [[ "$INGRESS_PROXY_ROUTING" != "true" ]]; then
+		return
+	fi
+	# An earlier build wrote a global drop-in; it must go (see above).
+	if [[ -f /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf ]]; then
+		rm -f /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf
+	fi
+	if ! systemctl is-active --quiet systemd-networkd || ! systemctl is-active --quiet systemd-resolved; then
+		echo "WARNING: --ingress-proxy-routing needs systemd-networkd + systemd-resolved to scope *.rt.internal;" >&2
+		echo "         not configuring it. sandboxd will refuse the flag at boot and keep per-sandbox Caddy routes." >&2
+		return
+	fi
+	mkdir -p /etc/systemd/network
+	cat > /etc/systemd/network/10-aerolvm-rt.netdev <<'EOF'
+[NetDev]
+Name=aerolvm-rt
+Kind=dummy
+EOF
+	cat > /etc/systemd/network/10-aerolvm-rt.network <<EOF
+[Match]
+Name=aerolvm-rt
+
+[Link]
+RequiredForOnline=no
+ActivationPolicy=always-up
+
+[Network]
+ConfigureWithoutCarrier=yes
+DNS=$ROUTE_DNS_ADDR
+Domains=~rt.internal
+DNSDefaultRoute=false
+Address=169.254.53.53/32
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+EOF
+	systemctl restart systemd-networkd
+	systemctl restart systemd-resolved
+	local i
+	for i in $(seq 1 30); do
+		if resolvectl status aerolvm-rt 2>/dev/null | grep -q "Current Scopes: DNS"; then
+			return
+		fi
+		sleep 1
+	done
+	echo "WARNING: aerolvm-rt never got a DNS scope; sandboxd will refuse --ingress-proxy-routing at boot." >&2
+}
 
 write_caddy_systemd_dropin() {
 	# Always ensure /run/caddy exists for the admin unix socket (the dir mode
@@ -1405,99 +1633,123 @@ install_amd_gpu() {
 	echo "Verify with: rocm-smi"
 }
 
-gvisor_arch() {
+# gvisor_fetch_release downloads and verifies the gVisor release tarball ONCE
+# per install, extracting it into a shared directory both installers read.
+#
+# Upstream changed its release layout: the bucket no longer publishes bare
+# runsc / containerd-shim-runsc-v1 objects, only
+#   releases/release/latest/<arch>/gvisor.tar.{bz2,zstd}(.sha512)
+# so every `--with-gvisor` install failed at download with a plain 404:
+#
+#   curl: (22) The requested URL returned error: 404
+#   --with-gvisor: failed to download runsc from .../latest/x86_64/runsc
+#
+# install.sh exits on that, so sandboxd was never installed at all on a
+# gvisor node. It took out all four workers of an 8-node scenario while the
+# servers — which do not set with_gvisor — came up fine, so the cluster
+# reported "expected 8 members, never reached (last 4)" and looked like a
+# membership bug.
+GVISOR_RELEASE_DIR=""
+GVISOR_TMP_DIRS=()
+gvisor_cleanup_tmp() {
+	local d
+	for d in ${GVISOR_TMP_DIRS+"${GVISOR_TMP_DIRS[@]}"}; do
+		[[ -n "$d" ]] && rm -rf "$d"
+	done
+	GVISOR_TMP_DIRS=()
+}
+trap gvisor_cleanup_tmp EXIT
+
+gvisor_fetch_release() {
+	if [[ -n "$GVISOR_RELEASE_DIR" && -x "${GVISOR_RELEASE_DIR}/runsc" ]]; then
+		return 0
+	fi
+	local arch
 	case "$(uname -m)" in
-		x86_64|amd64)   echo "x86_64" ;;
-		aarch64|arm64)  echo "aarch64" ;;
+		x86_64|amd64)   arch="x86_64" ;;
+		aarch64|arm64)  arch="aarch64" ;;
 		*)
 			echo "--with-gvisor: unsupported architecture $(uname -m) for gVisor" >&2
 			exit 1
 			;;
 	esac
-}
 
-install_gvisor_release() {
-	# Download the latest gVisor release tarball from the official storage
-	# bucket and install runsc + the containerd shim + the gvisor-bin/ sidecar
-	# directory to /usr/local/bin. Upstream bucket layout (since
-	# release-20260921.0 — the old per-binary runsc / containerd-shim-runsc-v1
-	# URLs were removed and now 404):
-	#   storage.googleapis.com/gvisor/releases/release/latest/<arch>/gvisor.tar.zstd
-	# The tarball contains runsc, containerd-shim-runsc-v1 and gvisor-bin/;
-	# runsc re-execs its helpers from gvisor-bin/ NEXT TO ITS OWN BINARY, so
-	# all three must land in the same directory. We verify the SHA-512
-	# published next to the tarball before installing — the
-	# upstream-recommended pattern from https://gvisor.dev/docs/user_guide/install/.
-	# Hosts without zstd fall back to the .tar.bz2 variant (tar needs bzip2).
-	local arch tarball extract_dir
-	arch="$(gvisor_arch)"
 	local base="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}"
-
-	if command -v zstd >/dev/null 2>&1; then
-		tarball="gvisor.tar.zstd"
-	else
-		tarball="gvisor.tar.bz2"
-	fi
-
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
-	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
-	trap "rm -rf '$tmp_dir'" RETURN
+	# Cleaned on exit rather than on RETURN: the extracted tree is shared by
+	# install_runsc_binary and install_runsc_shim, so a RETURN trap would
+	# delete it out from under the second caller. It is ~500MB extracted, on
+	# a 20GB root volume, so leaving it behind is not an option either.
+	GVISOR_TMP_DIRS+=("$tmp_dir")
 
-	echo "Downloading gVisor ${tarball} for ${arch} from ${base}"
-	if ! curl_download "${base}/${tarball}" -o "${tmp_dir}/${tarball}"; then
-		echo "--with-gvisor: failed to download ${base}/${tarball}" >&2
+	echo "Downloading gVisor release for ${arch} from ${base}"
+	if ! curl_download "${base}/gvisor.tar.bz2" -o "${tmp_dir}/gvisor.tar.bz2"; then
+		echo "--with-gvisor: failed to download gvisor.tar.bz2 from ${base}/gvisor.tar.bz2" >&2
 		exit 1
 	fi
-	if ! curl_download "${base}/${tarball}.sha512" -o "${tmp_dir}/${tarball}.sha512"; then
-		echo "--with-gvisor: failed to download ${base}/${tarball}.sha512" >&2
+	if ! curl_download "${base}/gvisor.tar.bz2.sha512" -o "${tmp_dir}/gvisor.tar.bz2.sha512"; then
+		echo "--with-gvisor: failed to download gvisor.tar.bz2.sha512" >&2
 		exit 1
 	fi
 
-	# gVisor's published checksum file uses the artifact path under the bucket,
-	# not just the basename. Rewrite it to match what we have on disk so
-	# sha512sum -c finds the file. Format is "<hash>  <path>".
+	# The published checksum names the file as "gvisor.tar.bz2", which is what
+	# we wrote, but rewrite it anyway so a future rename upstream cannot turn
+	# verification into a silent no-op.
 	(
 		cd "$tmp_dir"
-		awk -v name="${tarball}" '{print $1"  "name}' "${tarball}.sha512" > gvisor.sha512.local
+		awk '{print $1"  gvisor.tar.bz2"}' gvisor.tar.bz2.sha512 > gvisor.sha512.local
 		if ! sha512sum -c gvisor.sha512.local; then
-			echo "--with-gvisor: gVisor ${tarball} checksum verification failed" >&2
+			echo "--with-gvisor: gvisor.tar.bz2 checksum verification failed" >&2
 			exit 1
 		fi
 	)
 
-	extract_dir="${tmp_dir}/extract"
-	mkdir -p "$extract_dir"
-	if [[ "$tarball" == *.zstd ]]; then
-		tar --zstd -xf "${tmp_dir}/${tarball}" -C "$extract_dir"
-	else
-		tar -xjf "${tmp_dir}/${tarball}" -C "$extract_dir"
+	if ! tar xjf "${tmp_dir}/gvisor.tar.bz2" -C "$tmp_dir"; then
+		echo "--with-gvisor: failed to extract gvisor.tar.bz2" >&2
+		exit 1
 	fi
+	# runsc now ships with a gvisor-bin/ payload beside it (gvisor_sentry,
+	# checkpointgofer, the metric server…). Installing the single binary and
+	# dropping the rest would produce a runsc that fails at first container
+	# start rather than at install time.
+	if [[ ! -x "${tmp_dir}/runsc" ]]; then
+		echo "--with-gvisor: gvisor.tar.bz2 did not contain runsc (upstream layout changed again?)" >&2
+		exit 1
+	fi
+	GVISOR_RELEASE_DIR="$tmp_dir"
+}
 
-	local component
-	for component in runsc containerd-shim-runsc-v1 gvisor-bin; do
-		if [[ ! -e "${extract_dir}/${component}" ]]; then
-			echo "--with-gvisor: ${tarball} is missing ${component}" >&2
-			exit 1
-		fi
-		install -m 0755 "${extract_dir}/${component}" /usr/local/bin/"${component}"
-	done
-	echo "Installed runsc, containerd-shim-runsc-v1 and gvisor-bin/ to /usr/local/bin"
+install_runsc_binary() {
+	gvisor_fetch_release
+	install -m 0755 "${GVISOR_RELEASE_DIR}/runsc" /usr/local/bin/runsc
+	if [[ -d "${GVISOR_RELEASE_DIR}/gvisor-bin" ]]; then
+		install -d -m 0755 /usr/local/bin/gvisor-bin
+		find "${GVISOR_RELEASE_DIR}/gvisor-bin" -maxdepth 1 -type f -exec \
+			install -m 0755 {} /usr/local/bin/gvisor-bin/ \;
+		echo "Installed gVisor support binaries to /usr/local/bin/gvisor-bin"
+	fi
+	echo "Installed runsc to /usr/local/bin/runsc"
 }
 
 install_runsc_shim() {
 	# The containerd engine reaches gVisor through the io.containerd.runsc.v1
 	# shim (internal/runtime/containerd/runtime_gvisor.go): containerd resolves
 	# that runtime name by exec'ing containerd-shim-runsc-v1 from its PATH, so
-	# the daemon.json registration covers dockerd only. Ensure the shim (and
-	# the gvisor-bin/ sidecars runsc re-execs) are installed next to runsc so
-	# --with-gvisor works under both engines — without it a runtime:"gvisor"
-	# create on a containerd node fails at shim launch.
-	if command -v containerd-shim-runsc-v1 >/dev/null 2>&1 && [[ -d /usr/local/bin/gvisor-bin ]]; then
-		echo "containerd-shim-runsc-v1 and gvisor-bin/ already installed"
+	# the daemon.json registration below covers dockerd only. Install the shim
+	# next to runsc so --with-gvisor works under both engines — without it a
+	# runtime:"gvisor" create on a containerd node fails at shim launch.
+	if command -v containerd-shim-runsc-v1 >/dev/null 2>&1; then
+		echo "containerd-shim-runsc-v1 already installed"
 		return 0
 	fi
-	install_gvisor_release
+	gvisor_fetch_release
+	if [[ ! -x "${GVISOR_RELEASE_DIR}/containerd-shim-runsc-v1" ]]; then
+		echo "--with-gvisor: gvisor.tar.bz2 did not contain containerd-shim-runsc-v1" >&2
+		exit 1
+	fi
+	install -m 0755 "${GVISOR_RELEASE_DIR}/containerd-shim-runsc-v1" /usr/local/bin/containerd-shim-runsc-v1
+	echo "Installed containerd-shim-runsc-v1 to /usr/local/bin/containerd-shim-runsc-v1"
 }
 
 install_workerd_binary() {
@@ -1602,7 +1854,7 @@ register_gvisor_runtime() {
 	elif command -v runsc >/dev/null 2>&1; then
 		runsc_bin="$(command -v runsc)"
 	else
-		install_gvisor_release
+		install_runsc_binary
 		runsc_bin="/usr/local/bin/runsc"
 	fi
 	if [[ ! -x "$runsc_bin" ]]; then
@@ -1674,7 +1926,7 @@ SB_API_PORT=21212
 SB_PUBLIC_HOST=127.0.0.1
 SB_DB_PATH=/var/lib/sandboxd/state.db
 SB_DOCKER_NETWORK=bridge
-SB_TOOLBOX_BINARY_PATH=$INSTALL_PREFIX/toolboxd
+SB_TOOLBOX_BINARY_PATH=$TOOLBOX_BINARY_PATH
 SB_TOOLBOX_MOUNT_PATH=/usr/local/bin/toolboxd
 SB_TOOLBOX_PORT=2280
 SB_IDLE_TIMEOUT_MIN=$IDLE_TIMEOUT_MIN
@@ -1724,11 +1976,64 @@ WantedBy=multi-user.target
 EOF
 }
 
-write_launchd_plist() {
-	mkdir -p /var/lib/sandboxd /var/lib/sandboxd/mounts /var/log/sandboxd
-	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts
-	local plist_path="/Library/LaunchDaemons/com.aerol.sandboxd.plist"
-	cat > "$plist_path" <<EOF
+# detect_darwin_docker_host prints the unix:// endpoint of the current user's
+# Docker engine. launchd starts the agent with an empty environment, and
+# OrbStack / Docker Desktop serve the engine from a socket under $HOME
+# (~/.orbstack/run/docker.sock, ~/.docker/run/docker.sock);
+# /var/run/docker.sock exists only when Docker Desktop's default-socket option
+# is on. Order: DOCKER_HOST, the active docker context, /var/run/docker.sock.
+detect_darwin_docker_host() {
+	local host=""
+	if [[ "${DOCKER_HOST:-}" == unix://* ]]; then
+		host="$DOCKER_HOST"
+	elif command -v docker >/dev/null 2>&1; then
+		host="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
+	fi
+	if [[ "$host" != unix://* || ! -S "${host#unix://}" ]]; then
+		host=""
+		if [[ -S /var/run/docker.sock ]]; then
+			host="unix:///var/run/docker.sock"
+		fi
+	fi
+	[[ -n "$host" ]] || return 1
+	echo "$host"
+}
+
+# reuse_darwin_pat_token keeps an existing install's token so re-running the
+# installer (the upgrade path) does not lock out clients already holding it.
+reuse_darwin_pat_token() {
+	if [[ "$PAT_TOKEN_EXPLICIT" == "true" || ! -f "$DARWIN_LAUNCH_AGENT" ]]; then
+		return
+	fi
+	local existing
+	existing="$(plutil -extract EnvironmentVariables.SB_PAT_TOKEN raw -o - "$DARWIN_LAUNCH_AGENT" 2>/dev/null || true)"
+	if [[ -n "$existing" ]]; then
+		PAT_TOKEN="$existing"
+	fi
+}
+
+# write_launch_agent_plist registers sandboxd as a per-user LaunchAgent: every
+# path is under $DARWIN_HOME and every listener is bound to 127.0.0.1.
+#   SB_DOCKER_TOOLBOX_LOOPBACK  each sandbox publishes only its toolbox port,
+#                               on 127.0.0.1; macOS Local Network privacy
+#                               blocks a user process from dialing the Docker
+#                               VM's container IPs, but not loopback.
+#   SB_SSH_LISTEN_ADDR          the SSH gateway otherwise binds 0.0.0.0:2220.
+#   SB_RESOURCE_LIMITS_DISABLED every create carries a disk quota (StorageOpt
+#                               size), which dockerd only honours on overlay
+#                               over xfs+pquota; the OrbStack / Docker Desktop
+#                               VMs reject it with a 500.
+# The plist carries the PAT token, so it is created under umask 077.
+write_launch_agent_plist() {
+	local docker_host="$1"
+	local state="$DARWIN_HOME/state"
+	local run="$DARWIN_HOME/run"
+	mkdir -p "$state" "$DARWIN_HOME/mounts" "$run" "$DARWIN_HOME/logs" "$(dirname "$DARWIN_LAUNCH_AGENT")"
+	chmod 0700 "$state" "$DARWIN_HOME/mounts" "$run"
+	local old_umask
+	old_umask="$(umask)"
+	umask 077
+	cat > "$DARWIN_LAUNCH_AGENT" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1741,20 +2046,38 @@ write_launchd_plist() {
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
+		<key>DOCKER_HOST</key>
+		<string>$docker_host</string>
 		<key>SB_PAT_TOKEN</key>
 		<string>$PAT_TOKEN</string>
+		<key>SB_NODE_NAME</key>
+		<string>$NODE_NAME</string>
 		<key>SB_API_HOST</key>
 		<string>127.0.0.1</string>
 		<key>SB_API_PORT</key>
 		<string>21212</string>
 		<key>SB_PUBLIC_HOST</key>
 		<string>127.0.0.1</string>
+		<key>SB_SSH_LISTEN_ADDR</key>
+		<string>127.0.0.1:2220</string>
 		<key>SB_DB_PATH</key>
-		<string>/var/lib/sandboxd/state.db</string>
+		<string>$state/state.db</string>
+		<key>SB_CREDENTIAL_ENCRYPTION_KEY_PATH</key>
+		<string>$state/credential_encryption.key</string>
+		<key>SB_SSH_HOST_KEY_PATH</key>
+		<string>$state/ssh_host_ed25519_key</string>
+		<key>SB_WASM_MODULES_DIR</key>
+		<string>$state/wasm/modules</string>
+		<key>SB_FIRECRACKER_TEMPLATES_DIR</key>
+		<string>$state/firecracker/templates</string>
+		<key>SB_PLATFORM_VOLUMES_RECLAIM_MOUNT_ROOT</key>
+		<string>$state/volume-reclaim</string>
 		<key>SB_DOCKER_NETWORK</key>
 		<string>bridge</string>
+		<key>SB_DOCKER_TOOLBOX_LOOPBACK</key>
+		<string>true</string>
 		<key>SB_TOOLBOX_BINARY_PATH</key>
-		<string>$INSTALL_PREFIX/toolboxd</string>
+		<string>$TOOLBOX_BINARY_PATH</string>
 		<key>SB_TOOLBOX_MOUNT_PATH</key>
 		<string>/usr/local/bin/toolboxd</string>
 		<key>SB_TOOLBOX_PORT</key>
@@ -1765,8 +2088,14 @@ write_launchd_plist() {
 		<string>false</string>
 		<key>SB_ENABLE_NETWORK_RULES</key>
 		<string>false</string>
+		<key>SB_RESOURCE_LIMITS_DISABLED</key>
+		<string>true</string>
 		<key>SB_MOUNTS_ROOT</key>
-		<string>/var/lib/sandboxd/mounts</string>
+		<string>$DARWIN_HOME/mounts</string>
+		<key>SB_MOUNTS_CRED_DIR</key>
+		<string>$run</string>
+		<key>SB_INTERNAL_L4_WAKE_DIR</key>
+		<string>$run/l4wake</string>
 		<key>SB_RECORDING_DIR</key>
 		<string>/var/lib/toolboxd/recordings</string>
 		<key>SB_RECORDING_RETENTION</key>
@@ -1779,16 +2108,58 @@ write_launchd_plist() {
 	<key>KeepAlive</key>
 	<true/>
 	<key>StandardOutPath</key>
-	<string>/var/log/sandboxd/sandboxd.log</string>
+	<string>$DARWIN_HOME/logs/sandboxd.log</string>
 	<key>StandardErrorPath</key>
-	<string>/var/log/sandboxd/sandboxd.err</string>
+	<string>$DARWIN_HOME/logs/sandboxd.err</string>
 </dict>
 </plist>
 EOF
-	# The plist embeds SB_PAT_TOKEN in EnvironmentVariables: 0600, not the
-	# default, so it is not world-readable. launchd only requires it be
-	# root-owned and not group/other-writable.
-	chmod 0600 "$plist_path"
+umask "$old_umask"
+}
+
+# install_darwin_local is --local on macOS: a per-user install, no root.
+install_darwin_local() {
+	if [[ $EUID -eq 0 ]]; then
+		echo "On macOS, run install.sh --local without sudo: it installs into ~/.aerolvm for the current user." >&2
+		exit 1
+	fi
+	local docker_host
+	if ! docker_host="$(detect_darwin_docker_host)"; then
+		echo "No running Docker engine socket found. Start OrbStack or Docker Desktop and re-run," >&2
+		echo "or name it: DOCKER_HOST=unix:///path/to/docker.sock ./install.sh --local" >&2
+		exit 1
+	fi
+	reuse_darwin_pat_token
+	install_binaries
+	write_launch_agent_plist "$docker_host"
+	local domain
+	domain="gui/$(id -u)"
+	launchctl bootout "$domain/com.aerol.sandboxd" >/dev/null 2>&1 || true
+	launchctl bootstrap "$domain" "$DARWIN_LAUNCH_AGENT"
+
+	local healthy="false"
+	local _
+	for _ in $(seq 1 30); do
+		if curl -fsS -o /dev/null http://127.0.0.1:21212/health 2>/dev/null; then
+			healthy="true"
+			break
+		fi
+		sleep 1
+	done
+	if [[ "$healthy" != "true" ]]; then
+		echo "sandboxd did not become healthy within 30s; see $DARWIN_HOME/logs/sandboxd.err" >&2
+		exit 1
+	fi
+
+	echo "AerolVM installed (local mode, current user)"
+	echo "PAT token: $PAT_TOKEN"
+	echo "Use header: Authorization: Bearer <PAT token>"
+	echo "API URL: http://127.0.0.1:21212"
+	echo "Health URL: http://127.0.0.1:21212/health"
+	echo "Docker engine: $docker_host"
+	echo "Service: LaunchAgent com.aerol.sandboxd (starts at login)"
+	echo "Files: $DARWIN_HOME (logs in $DARWIN_HOME/logs)"
+	echo "Stop: launchctl bootout $domain/com.aerol.sandboxd"
 }
 
 if [[ "$LOCAL_MODE" == "true" ]]; then
@@ -1796,39 +2167,31 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		echo "--local is incompatible with --domain and --dns-provider" >&2
 		exit 1
 	fi
+	if [[ "$(uname -s)" == "Darwin" ]]; then
+		install_darwin_local
+		exit 0
+	fi
 	if [[ $EUID -ne 0 ]]; then
 		echo "install.sh must run as root (use sudo)" >&2
 		exit 1
 	fi
 	install_binaries
 	write_local_environment
-	if [[ "$(uname -s)" == "Darwin" ]]; then
-		write_launchd_plist
-		launchctl load /Library/LaunchDaemons/com.aerol.sandboxd.plist
-	else
-		# The local unit hard-Requires docker.service; on Linux we must install
-		# the engine here since this branch skips install_packages. (macOS local
-		# mode assumes Docker Desktop is already running.)
-		ensure_docker
-		write_local_systemd_unit
-		write_healthcheck_script
-		write_healthcheck_units
-		systemctl daemon-reload
-		systemctl enable --now sandboxd sandboxd-healthcheck.timer
-	fi
+	# The local unit hard-Requires docker.service; on Linux we must install
+	# the engine here since this branch skips install_packages.
+	ensure_docker
+	write_local_systemd_unit
+	write_healthcheck_script
+	write_healthcheck_units
+	systemctl daemon-reload
+	systemctl enable --now sandboxd sandboxd-healthcheck.timer
 	echo "AerolVM installed (local mode)"
 	echo "PAT token: stored in /etc/sandboxd/sandboxd.env — view with: sudo cat /etc/sandboxd/sandboxd.env"
 	echo "Use header: Authorization: Bearer <value of the token in sandboxd.env>"
 	echo "API URL: http://127.0.0.1:21212"
 	echo "Health URL: http://127.0.0.1:21212/health"
-	if [[ "$(uname -s)" == "Darwin" ]]; then
-		echo "Service: launchd daemon com.aerol.sandboxd (auto-starts on boot)"
-		echo "Logs: /var/log/sandboxd/sandboxd.log"
-		echo "Stop: sudo launchctl unload /Library/LaunchDaemons/com.aerol.sandboxd.plist"
-	else
-		echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
-		echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
-	fi
+	echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
+	echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
 	exit 0
 fi
 
@@ -1862,6 +2225,7 @@ install_binaries
 write_environment
 write_caddy_env
 write_caddy_systemd_dropin
+write_route_dns_resolver
 write_caddyfile
 write_systemd_unit
 write_healthcheck_script

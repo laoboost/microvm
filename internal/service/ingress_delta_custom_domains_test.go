@@ -29,6 +29,7 @@ func TestBuildClusterIngressIntents_DomainModeAddsPerCustomHostnameSNI(t *testin
 		OwnerNodeID:     "peer-1",
 		OwnerAPIURL:     "http://10.0.0.7:21212",
 		Version:         1,
+		Spec:            &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 		CustomHostnames: []string{"api.acme.com", "shop.beta.io"},
 	}
 
@@ -100,10 +101,11 @@ func TestBuildClusterIngressIntents_CustomHostnameDeltaFiresApply(t *testing.T) 
 		OwnerNodeID:     "peer-1",
 		OwnerAPIURL:     "http://10.0.0.7:21212",
 		Version:         1,
+		Spec:            &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 		CustomHostnames: []string{"api.acme.com"},
 	}
 	initial, _ := svc.buildClusterIngressIntents([]cluster.Placement{base}, "self")
-	ops, commit := svc.planClusterIngressDelta(initial)
+	ops, commit := svc.planClusterIngressDelta(initial, nil)
 	if len(ops) != len(initial) {
 		t.Fatalf("initial delta ops=%d, want %d", len(ops), len(initial))
 	}
@@ -115,7 +117,7 @@ func TestBuildClusterIngressIntents_CustomHostnameDeltaFiresApply(t *testing.T) 
 	next.Version = 2
 	next.CustomHostnames = []string{"api.acme.com", "shop.beta.io"}
 	updated, _ := svc.buildClusterIngressIntents([]cluster.Placement{next}, "self")
-	ops, _ = svc.planClusterIngressDelta(updated)
+	ops, _ = svc.planClusterIngressDelta(updated, nil)
 
 	// Two ops expected: default SNI route's fingerprint changed (version
 	// bump), and one new custom-hostname SNI route appears. The first
@@ -146,6 +148,7 @@ func TestBuildClusterIngressIntents_IPModePropagatesHostnamesInFingerprint(t *te
 		OwnerNodeID:     "peer-1",
 		OwnerAPIURL:     "http://10.0.0.7:21212",
 		Version:         1,
+		Spec:            &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 		CustomHostnames: nil,
 	}
 	without, _ := svc.buildClusterIngressIntents([]cluster.Placement{base}, "self")
@@ -171,6 +174,7 @@ func TestBuildClusterIngressIntentsSkipAndInfluxBranches(t *testing.T) {
 			SandboxID:   "sb-influx",
 			OwnerNodeID: "",
 			Version:     7,
+			Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				8080: {Protocol: models.ExposedPortProtocolHTTP},
 			},
@@ -199,6 +203,7 @@ func TestBuildClusterIngressIntentsDomainWithoutTLSPortSkipsRoutes(t *testing.T)
 			OwnerNodeID:     "peer-1",
 			OwnerAPIURL:     "http://10.0.0.2:21212",
 			Version:         3,
+			Spec:            &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 			CustomHostnames: []string{"api.acme.com"},
 			ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 				8080: {Protocol: models.ExposedPortProtocolHTTP},

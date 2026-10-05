@@ -86,7 +86,8 @@ func (NFS) Build(sandboxID string, index int, spec models.MountSpec, hostTarget,
 		return Plan{}, err
 	}
 
-	argv := []string{"mount", "-t", "nfs", "-o", opts, spec.Source, hostTarget}
+	// "--" keeps source positional even if it ever starts with '-'.
+	argv := []string{"mount", "-t", "nfs", "-o", opts, "--", spec.Source, hostTarget}
 
 	return Plan{
 		Argv:          argv,

@@ -73,8 +73,10 @@ func (r *Resolver) resolvePath(ref string) (string, error) {
 		return "", fmt.Errorf("relative module ref %q requires modules dir", ref)
 	}
 	joined := filepath.Join(r.ModulesDir, ref)
-	// filepath.Join cleans ".." segments; a cleaned result outside
-	// ModulesDir is a traversal attempt (e.g. "../../../etc/passwd").
+	// A relative ref must stay under ModulesDir: a module lives there, so "../"
+	// traversal is never legitimate. (Absolute paths remain the explicit
+	// operator escape hatch handled above.) filepath.Join cleans the result,
+	// so a traversing ref resolves above ModulesDir and fails the check below.
 	rel, err := filepath.Rel(r.ModulesDir, joined)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("%w: %q escapes the modules directory", ErrUnsafeModuleRef, ref)

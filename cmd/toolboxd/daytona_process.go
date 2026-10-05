@@ -99,16 +99,15 @@ func (c *daytonaCommandStream) broadcast(stream sessions.Stream, chunk []byte) {
 	frame = append(frame, chunk...)
 
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if stream == sessions.StreamStderr {
 		c.stderr = append(c.stderr, chunk...)
 	} else {
 		c.stdout = append(c.stdout, chunk...)
 	}
-	subs := make([]chan []byte, len(c.subs))
-	copy(subs, c.subs)
-	c.mu.Unlock()
-
-	for _, sub := range subs {
+	// Keep the lock through these non-blocking sends so finish cannot close a
+	// subscriber after it has been selected here but before the send occurs.
+	for _, sub := range c.subs {
 		select {
 		case sub <- frame:
 		default:
@@ -761,9 +760,9 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 			if lineEnd < 0 {
 				continue
 			}
-			exitCode, err := strconv.Atoi(strings.TrimSpace(rest[:lineEnd]))
-			if err != nil {
-				exitCode = 1
+			var exitCode int32 = 1
+			if parsed, perr := strconv.ParseInt(strings.TrimSpace(rest[:lineEnd]), 10, 32); perr == nil {
+				exitCode = int32(parsed)
 			}
 			stdoutText := captured[:index]
 			stderrText := stderr.String()

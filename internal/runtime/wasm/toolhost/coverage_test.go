@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/toolhost"
@@ -209,71 +210,6 @@ func TestHostExecError(t *testing.T) {
 }
 
 // ─── Code-run interpreter routes ─────────────────────────────────────────────
-
-func TestHostCodeRunBadJSON(t *testing.T) {
-	requireHostExec(t)
-	h := newHost(t)
-	rec := serve(h, http.MethodPost, "/process/code-run", []byte("notjson"), map[string]string{
-		"Content-Type": "application/json",
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("bad json status = %d", rec.Code)
-	}
-}
-
-func TestHostCodeRunMissingCode(t *testing.T) {
-	requireHostExec(t)
-	h := newHost(t)
-	payload, _ := json.Marshal(map[string]string{"language": "python"})
-	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
-		"Content-Type": "application/json",
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("missing code status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHostCodeRunUnsupportedLanguage(t *testing.T) {
-	requireHostExec(t)
-	h := newHost(t)
-	payload, _ := json.Marshal(map[string]string{"code": "x", "language": "cobol"})
-	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
-		"Content-Type": "application/json",
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("unsupported language status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHostCodeRunInterpreterNotInstalled(t *testing.T) {
-	requireHostExec(t)
-	h := newHost(t)
-	// ts-node is unlikely to be installed in test environment
-	payload, _ := json.Marshal(map[string]string{"code": "console.log(1)", "language": "typescript"})
-	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
-		"Content-Type": "application/json",
-	})
-	// 400 if ts-node not found, 200 if it is — either is valid
-	if rec.Code != http.StatusBadRequest && rec.Code != http.StatusOK {
-		t.Fatalf("ts-node status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHostCodeRunBash(t *testing.T) {
-	requireHostExec(t)
-	h := newHost(t)
-	payload, _ := json.Marshal(map[string]string{"code": "echo hello", "language": "bash"})
-	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
-		"Content-Type": "application/json",
-	})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("bash status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("bash json: %v", err)
-	}
-}
 
 func TestHostCodeInterpreterNotImplemented(t *testing.T) {
 	h := newHost(t)
@@ -499,6 +435,8 @@ func TestHostSessionsWithoutManager(t *testing.T) {
 }
 
 func TestHostSessionsCreateNilManager(t *testing.T) {
+	// The nil-manager branch of POST /sessions sits behind the host-exec gate,
+	// which fails closed first; enable it so the 503 branch stays covered.
 	requireHostExec(t)
 	h := toolhost.New(toolhost.Config{
 		SandboxID: "sb",
@@ -717,5 +655,30 @@ func TestHostDaytonaProcessNotFound(t *testing.T) {
 	rec := serve(h, http.MethodGet, "/process/session/unknown/bogus", nil, nil)
 	if rec.Code == http.StatusOK {
 		t.Fatalf("bogus daytona route status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHostDownloadStreamsWithLength pins the streaming download (it runs in
+// sandboxd, so a whole-file read would cost daemon memory): the body is the
+// file with Content-Length set, and a directory keeps the old 500.
+func TestHostDownloadStreamsWithLength(t *testing.T) {
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte("wasm-file "), 4096)
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := newHost(t, func(c *toolhost.Config) { c.WorkDir = dir })
+	rec := serve(h, http.MethodGet, "/files/download?path=/big.txt", nil, nil)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), data) {
+		t.Fatalf("status %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	if got := rec.Header().Get("Content-Length"); got != strconv.Itoa(len(data)) {
+		t.Fatalf("Content-Length = %q, want %d", got, len(data))
+	}
+	if rec := serve(h, http.MethodGet, "/files/download?path=/sub", nil, nil); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("directory status = %d, want 500", rec.Code)
 	}
 }

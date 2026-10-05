@@ -218,6 +218,8 @@ func TestSessionsRecordingOpenError(t *testing.T) {
 }
 
 func TestSessionsDisabled(t *testing.T) {
+	// The nil-manager branch of POST /sessions sits behind the host-exec gate,
+	// which fails closed first; enable it so the 503 branch stays covered.
 	requireHostExec(t)
 	h := New(Config{
 		SandboxID: "sb",
@@ -365,10 +367,7 @@ func TestSessionsEdgeCases(t *testing.T) {
 	}
 	defer func() { _ = mgr.Delete(sess.ID()) }()
 
-	// 3. Resize REST API success. Do this BEFORE any signal: SIGINT below kills
-	// the `sleep 10`, and resize needs a live session — asserting resize after
-	// the signal raced the process exit (exposed once this test stopped being
-	// skipped by the host-exec gate).
+	// Resize before signal so finish cannot race Setsize under -race.
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/resize", strings.NewReader(`{"cols":120,"rows":40}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -386,7 +385,7 @@ func TestSessionsEdgeCases(t *testing.T) {
 		t.Fatalf("resize error got %d", rec.Code)
 	}
 
-	// 4. Signal REST API success
+	// Signal REST API success
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/signal", strings.NewReader(`{"signal":"INT"}`))
 	req.Header.Set("Content-Type", "application/json")

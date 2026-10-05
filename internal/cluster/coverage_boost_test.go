@@ -2,18 +2,24 @@ package cluster
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,17 +34,11 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
-	// Both nodes are TLS-equipped and share one cert dir: internalClient must be
-	// installed by New (before the capacity-lease loop starts reading it), which
-	// is what the TLS path does — assigning follower.internalClient after New
-	// would race that loop. A mixed pair (TLS follower, plaintext leader) cannot
-	// complete a raft handshake, so the leader is TLS too.
-	tlsDir := writeTestClusterTLSDir(t)
-	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-int-fwd", true, nil, tlsDir)
+	leader, cleanupLeader := newTestCluster(t, "ldr-int-fwd", true, nil)
 	defer cleanupLeader()
 	waitForLeader(t, leader, 10*time.Second)
 
-	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-int-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, tlsDir)
+	follower, cleanupFollower := newTestCluster(t, "fol-int-fwd", false, []string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 
@@ -72,9 +72,10 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	})
 
 	payload, err := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   "sb-int-fwd",
-		OwnerNodeID: follower.nodeID,
+		Op:            opPlace,
+		SandboxID:     "sb-int-fwd",
+		OwnerNodeID:   follower.nodeID,
+		IncarnationID: "inc-int-fwd",
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -96,8 +97,9 @@ func TestForwardApplyLeaderAPIURLMissing(t *testing.T) {
 	follower, cleanupFollower := newTestCluster(t, "fol-missing-url", false, []string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+	waitForLeader(t, follower, 10*time.Second)
 
-	follower.internalClient = nil
+	follower.setInternalClient(nil)
 	follower.gossip.memberIndex.upsert(Member{
 		NodeID: leader.nodeID,
 		Alive:  true,
@@ -109,8 +111,8 @@ func TestForwardApplyLeaderAPIURLMissing(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	err = follower.forwardApplyToLeader(context.Background(), payload)
-	if !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("forwardApplyToLeader missing API URL = %v, want ErrNotLeader", err)
+	if !errors.Is(err, ErrPeerInternalURLRequired) {
+		t.Fatalf("forwardApplyToLeader missing internal URL = %v, want ErrPeerInternalURLRequired", err)
 	}
 }
 
@@ -123,9 +125,10 @@ func TestLeaderApplyEncodedSuccess(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 
 	payload, err := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   "sb-apply-encoded",
-		OwnerNodeID: c.nodeID,
+		Op:            opPlace,
+		SandboxID:     "sb-apply-encoded",
+		OwnerNodeID:   c.nodeID,
+		IncarnationID: "inc-apply-encoded",
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -146,7 +149,7 @@ func TestApplyCommandReturnsPlacementConflict(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
 
-	seed, err := encodeCommand(command{Op: opPlace, SandboxID: "sb-conflict", OwnerNodeID: "other-node"})
+	seed, err := encodeCommand(command{Op: opPlace, SandboxID: "sb-conflict", OwnerNodeID: "other-node", IncarnationID: "inc-conflict"})
 	if err != nil {
 		t.Fatalf("encode seed placement: %v", err)
 	}
@@ -193,19 +196,18 @@ func TestAgentDoHTTPRequestErrorBranches(t *testing.T) {
 	}
 
 	for i, tc := range cases {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv, internalClient := newNodeBoundForwardServer(t, "worker-self", "server-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, tc.body, tc.status)
 		}))
 		index := newGossipMemberIndex()
-		index.upsert(Member{NodeID: "server-1", APIURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
+		index.upsert(Member{NodeID: "server-1", APIURL: srv.URL, InternalURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
 		agent := &Agent{
-			nodeID:     "worker-self",
-			httpClient: srv.Client(),
-			gossip:     &gossipNode{memberIndex: index},
-			logger:     slog.Default(),
+			nodeID:         "worker-self",
+			internalClient: internalClient,
+			gossip:         &gossipNode{memberIndex: index},
+			logger:         slog.Default(),
 		}
 		err := agent.RemoveMember(context.Background(), "ghost", false)
-		srv.Close()
 		if !tc.check(err) {
 			t.Fatalf("case %d status=%d: err=%v", i, tc.status, err)
 		}
@@ -213,24 +215,23 @@ func TestAgentDoHTTPRequestErrorBranches(t *testing.T) {
 }
 
 func TestAgentControlPlaneFailoverAfterNotLeader(t *testing.T) {
-	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	dirs := writeTestClusterTLSDirs(t, "worker-self", "server-1", "server-2")
+	srv1, internalClient := newNodeBoundForwardServerWithDirs(t, dirs, "worker-self", "server-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, ErrNotLeader.Error(), http.StatusServiceUnavailable)
 	}))
-	defer srv1.Close()
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv2, _ := newNodeBoundForwardServerWithDirs(t, dirs, "worker-self", "server-2", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"leader": "server-2"})
 	}))
-	defer srv2.Close()
 
 	index := newGossipMemberIndex()
-	index.upsert(Member{NodeID: "server-1", APIURL: srv1.URL, Alive: true, Role: config.NodeRoleServer})
-	index.upsert(Member{NodeID: "server-2", APIURL: srv2.URL, Alive: true, Role: config.NodeRoleServer})
+	index.upsert(Member{NodeID: "server-1", APIURL: srv1.URL, InternalURL: srv1.URL, Alive: true, Role: config.NodeRoleServer})
+	index.upsert(Member{NodeID: "server-2", APIURL: srv2.URL, InternalURL: srv2.URL, Alive: true, Role: config.NodeRoleServer})
 	agent := &Agent{
-		nodeID:     "worker-self",
-		httpClient: http.DefaultClient,
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.Default(),
+		nodeID:         "worker-self",
+		internalClient: internalClient,
+		gossip:         &gossipNode{memberIndex: index},
+		logger:         slog.Default(),
 	}
 	for range 8 {
 		if got := agent.Leader(); got == "server-2" {
@@ -264,7 +265,6 @@ func TestAgentTryControlPlaneInternalSuccess(t *testing.T) {
 	})
 	agent := &Agent{
 		nodeID:         "worker-self",
-		httpClient:     public.Client(),
 		internalClient: internal.Client(),
 		gossip:         &gossipNode{memberIndex: index},
 		logger:         slog.Default(),
@@ -321,6 +321,7 @@ func TestAgentAssertOwnershipClaimsOrphanWithPortsAndDomains(t *testing.T) {
 					OwnerNodeID:         "",
 					OwnerState:          PlacementOwnerStateOrphaned,
 					OrphanedOwnerNodeID: "worker-self",
+					IncarnationID:       "inc-orphan",
 				},
 				Orphaned: true,
 			})
@@ -333,6 +334,7 @@ func TestAgentAssertOwnershipClaimsOrphanWithPortsAndDomains(t *testing.T) {
 	if err := agent.AssertOwnership(context.Background(), []LocalSandboxState{{
 		ID:              "sb-orphan",
 		Spec:            spec,
+		Secrets:         PlacementSecrets{IncarnationID: "inc-orphan"},
 		CustomHostnames: []string{"orphan.example.com"},
 		ExposedPorts:    map[int]ExposedPortRoute{8080: {Protocol: "http", PublicURL: "https://orphan"}},
 	}}); err != nil {
@@ -352,10 +354,9 @@ func TestAgentSecretsOfAndExposedPortsLookupFailure(t *testing.T) {
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "server-1", APIURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
 	agent := &Agent{
-		nodeID:     "worker-self",
-		httpClient: srv.Client(),
-		gossip:     &gossipNode{memberIndex: index},
-		logger:     slog.Default(),
+		nodeID: "worker-self",
+		gossip: &gossipNode{memberIndex: index},
+		logger: slog.Default(),
 	}
 	if got := agent.SecretsOf("sb-x"); got.Ref != "" || got.Version != 0 {
 		t.Fatalf("SecretsOf on error = %+v", got)
@@ -370,14 +371,17 @@ func TestAgentPlacementsShardQueryCaches(t *testing.T) {
 	shard := PlacementShardForSandbox("sb-shard-cache", DefaultPlacementShardCount)
 	filter := PlacementShardFilter{ShardCount: DefaultPlacementShardCount, Shards: []int{shard}}
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
-		if r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsQueryPath {
-			var got PlacementShardFilter
-			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-				t.Fatalf("decode shard filter: %v", err)
+		if r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsPagePath {
+			var req PlacementPageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode placement page request: %v", err)
 			}
-			capture.appendShardFilter(got)
+			capture.appendShardFilter(req.ShardFilter)
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]Placement{{SandboxID: "sb-shard-cache", Version: 7}})
+			_ = json.NewEncoder(w).Encode(PlacementPageResponse{
+				Placements:    []Placement{{SandboxID: "sb-shard-cache", Version: 7}},
+				Authoritative: true,
+			})
 			return true
 		}
 		return false
@@ -393,6 +397,9 @@ func TestAgentPlacementsShardQueryCaches(t *testing.T) {
 	cached := agent.PlacementsForShards(filter)
 	if len(cached) != 1 {
 		t.Fatalf("cached shard placements = %+v", cached)
+	}
+	if filters := capture.shardFiltersSnapshot(); len(filters) != 2 {
+		t.Fatalf("shard filters = %+v, want one paged read per call", filters)
 	}
 }
 
@@ -502,7 +509,7 @@ func TestClusterReserveOnTargetApplyReservationPath(t *testing.T) {
 	c.gossip.delegate.admitter = admitter
 	c.gossip.delegate.mu.Unlock()
 	c.gossip.refreshMemberIndex()
-	c.capacityLeases.admitter = admitter
+	c.capacityLeases.setAdmitter(admitter)
 	c.capacityLeases.set(c.nodeID, admitter.Snapshot(), time.Now())
 
 	ctx := context.Background()
@@ -515,23 +522,61 @@ func TestClusterReserveOnTargetApplyReservationPath(t *testing.T) {
 	}
 }
 
-func writeTestClusterTLSDir(t *testing.T) string {
+var (
+	sharedTestCAOnce sync.Once
+	sharedTestCAKey  *rsa.PrivateKey
+	sharedTestCACert *x509.Certificate
+	sharedTestCAPEM  []byte
+	sharedTestCAErr  error
+)
+
+func initSharedTestCA() {
+	sharedTestCAKey, sharedTestCAErr = rsa.GenerateKey(rand.Reader, 2048)
+	if sharedTestCAErr != nil {
+		return
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{Organization: []string{"AerolVM Shared Test CA"}},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &sharedTestCAKey.PublicKey, sharedTestCAKey)
+	if err != nil {
+		sharedTestCAErr = err
+		return
+	}
+	sharedTestCACert, sharedTestCAErr = x509.ParseCertificate(der)
+	sharedTestCAPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func writeTestClusterTLSDir(t *testing.T, nodeID string) string {
 	t.Helper()
+	sharedTestCAOnce.Do(initSharedTestCA)
+	if sharedTestCAErr != nil {
+		t.Fatalf("shared test CA: %v", sharedTestCAErr)
+	}
 	dir := t.TempDir()
-	_, tlsCert, err := generateTestCert()
+	nodeKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		t.Fatalf("generateTestCert: %v", err)
+		t.Fatalf("node key: %v", err)
 	}
-	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsCert.Certificate[0]})
-	keyDER, err := x509.MarshalPKCS8PrivateKey(tlsCert.PrivateKey)
+	leaf := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: nodeID},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:    []string{"aerolvm-cluster-node", "localhost", "node:" + nodeID}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leaf, sharedTestCACert, &nodeKey.PublicKey, sharedTestCAKey)
 	if err != nil {
-		t.Fatalf("marshal key: %v", err)
+		t.Fatalf("node cert: %v", err)
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	if err := os.WriteFile(filepath.Join(dir, tlsCAFile), caPEM, 0o644); err != nil {
+	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(nodeKey)})
+	if err := os.WriteFile(filepath.Join(dir, tlsCAFile), sharedTestCAPEM, 0o644); err != nil {
 		t.Fatalf("write ca: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, tlsNodeCertFile), caPEM, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, tlsNodeCertFile), leafPEM, 0o644); err != nil {
 		t.Fatalf("write cert: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, tlsNodeKeyFile), keyPEM, 0o644); err != nil {
@@ -540,93 +585,145 @@ func writeTestClusterTLSDir(t *testing.T) string {
 	return dir
 }
 
+// writeTestClusterTLSDirs mints one CA and per-node leaves so multi-node mTLS
+// tests satisfy node:<id> peer verification under a shared trust anchor.
+func writeTestClusterTLSDirs(t *testing.T, nodeIDs ...string) map[string]string {
+	t.Helper()
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("ca key: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"AerolVM Test CA"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("ca cert: %v", err)
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("parse ca: %v", err)
+	}
+	out := make(map[string]string, len(nodeIDs))
+	for i, nodeID := range nodeIDs {
+		nodeKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("node key: %v", err)
+		}
+		leaf := &x509.Certificate{
+			SerialNumber: big.NewInt(int64(100 + i)),
+			Subject:      pkix.Name{CommonName: nodeID, Organization: []string{"AerolVM Test Node"}},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(24 * time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+			DNSNames:     []string{"aerolvm-cluster-node", "localhost", "node:" + nodeID},
+			IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		}
+		leafDER, err := x509.CreateCertificate(rand.Reader, leaf, caCert, &nodeKey.PublicKey, caKey)
+		if err != nil {
+			t.Fatalf("leaf cert %s: %v", nodeID, err)
+		}
+		leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(nodeKey)})
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, tlsCAFile), caPEM, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, tlsNodeCertFile), leafPEM, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, tlsNodeKeyFile), keyPEM, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out[nodeID] = dir
+	}
+	return out
+}
+
 func newTestClusterWithTLSDir(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string, tlsDir string) (*Cluster, func()) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	for attempt := 0; attempt < 5; attempt++ {
-		apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
-		raftPort := pickFreeTCPPort(t)
-		gossipPort := pickFreeTCPPort(t)
-		dir := t.TempDir()
-		cfg := config.Config{
-			EnableCluster:                 true,
-			NodeID:                        nodeID,
-			RaftBindAddr:                  fmt.Sprintf("127.0.0.1:%d", raftPort),
-			RaftAdvertiseAddr:             fmt.Sprintf("127.0.0.1:%d", raftPort),
-			RaftDataDir:                   filepath.Join(dir, "raft"),
-			GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-			GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
-			BootstrapPeers:                gossipPeers,
-			ClusterBootstrap:              bootstrap,
-			SelfAPIAdvertiseURL:           apiURL,
-			ClusterRaftCommitTimeout:      2 * time.Second,
-			ClusterCapacityGossipInterval: time.Second,
-			ClusterTLSDir:                 tlsDir,
-			ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
-			// Test clusters run plaintext gossip (no fleet key). Production only
-			// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
-			// opt-in here so voter-promotion subjects stay exercisable.
-			ClusterInsecureGossip: true,
-		}
-		c, err := New(cfg, logger, nil)
-		if err == nil {
-			return c, func() {
-				if err := c.Close(); err != nil {
-					t.Logf("cluster.Close(%s): %v", nodeID, err)
-				}
-			}
-		}
-		if !strings.Contains(err.Error(), "address already in use") {
-			t.Fatalf("cluster.New(%s, tls): %v", nodeID, err)
-		}
+	testClusterMu.Lock()
+	c, err := New(config.Config{
+		EnableCluster:                 true,
+		NodeID:                        nodeID,
+		RaftBindAddr:                  "127.0.0.1:0",
+		RaftAdvertiseAddr:             "127.0.0.1:0",
+		RaftDataDir:                   filepath.Join(t.TempDir(), "raft"),
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
+		BootstrapPeers:                gossipPeers,
+		ClusterBootstrap:              bootstrap,
+		SelfAPIAdvertiseURL:           fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)),
+		ClusterRaftCommitTimeout:      2 * time.Second,
+		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 tlsDir,
+		ClusterInternalListenAddr:     "127.0.0.1:0",
+		// Test clusters run plaintext gossip (no fleet key). Production only
+		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+		// opt-in here so voter-promotion subjects stay exercisable.
+		ClusterInsecureGossip: true,
+	}, logger, nil)
+	testClusterMu.Unlock()
+	if err != nil {
+		t.Fatalf("cluster.New(%s, tls): %v", nodeID, err)
 	}
-	t.Fatalf("cluster.New(%s, tls): failed after retries due to port collisions", nodeID)
-	return nil, nil
+	return c, func() {
+		testClusterMu.Lock()
+		defer testClusterMu.Unlock()
+		if err := c.Close(); err != nil {
+			t.Logf("cluster.Close(%s): %v", nodeID, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func newTestClusterWithTLS(t *testing.T, nodeID string, bootstrap bool, gossipPeers []string) (*Cluster, func()) {
 	t.Helper()
-	return newTestClusterWithTLSDir(t, nodeID, bootstrap, gossipPeers, writeTestClusterTLSDir(t))
+	return newTestClusterWithTLSDir(t, nodeID, bootstrap, gossipPeers, writeTestClusterTLSDir(t, nodeID))
 }
 
 func newTestAgentWithTLS(t *testing.T, nodeID, role string, gossipPeers []string) (*Agent, func()) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tlsDir := writeTestClusterTLSDir(t)
-	for attempt := 0; attempt < 5; attempt++ {
-		gossipPort := pickFreeTCPPort(t)
-		apiURL := fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t))
-		cfg := config.Config{
-			EnableCluster:                 true,
-			NodeID:                        nodeID,
-			NodeRole:                      role,
-			GossipBindAddr:                fmt.Sprintf("127.0.0.1:%d", gossipPort),
-			GossipAdvertiseAddr:           fmt.Sprintf("127.0.0.1:%d", gossipPort),
-			BootstrapPeers:                gossipPeers,
-			SelfAPIAdvertiseURL:           apiURL,
-			ClusterRaftCommitTimeout:      2 * time.Second,
-			ClusterCapacityGossipInterval: time.Second,
-			ClusterTLSDir:                 tlsDir,
-			ClusterInternalListenAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)),
-			// Test clusters run plaintext gossip (no fleet key). Production only
-			// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
-			// opt-in here so voter-promotion subjects stay exercisable.
-			ClusterInsecureGossip: true,
-		}
-		a, err := NewAgent(cfg, logger, nil)
-		if err == nil {
-			return a, func() {
-				if err := a.Close(); err != nil {
-					t.Logf("agent.Close(%s): %v", nodeID, err)
-				}
-			}
-		}
-		if !strings.Contains(err.Error(), "address already in use") {
-			t.Fatalf("cluster.NewAgent(%s, tls): %v", nodeID, err)
-		}
+	testClusterMu.Lock()
+	a, err := NewAgent(config.Config{
+		EnableCluster:                 true,
+		NodeID:                        nodeID,
+		NodeRole:                      role,
+		GossipBindAddr:                "127.0.0.1:0",
+		GossipAdvertiseAddr:           "127.0.0.1:0",
+		BootstrapPeers:                gossipPeers,
+		SelfAPIAdvertiseURL:           fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)),
+		ClusterRaftCommitTimeout:      2 * time.Second,
+		ClusterCapacityGossipInterval: time.Second,
+		ClusterTLSDir:                 writeTestClusterTLSDir(t, nodeID),
+		ClusterInternalListenAddr:     "127.0.0.1:0",
+		// Test clusters run plaintext gossip (no fleet key). Production only
+		// permits that behind SB_CLUSTER_INSECURE_GOSSIP; mirror the explicit
+		// opt-in here so voter-promotion subjects stay exercisable.
+		ClusterInsecureGossip: true,
+	}, logger, nil)
+	testClusterMu.Unlock()
+	if err != nil {
+		t.Fatalf("cluster.NewAgent(%s, tls): %v", nodeID, err)
 	}
-	t.Fatalf("cluster.NewAgent(%s, tls): failed after retries due to port collisions", nodeID)
-	return nil, nil
+	return a, func() {
+		testClusterMu.Lock()
+		defer testClusterMu.Unlock()
+		if err := a.Close(); err != nil {
+			t.Logf("agent.Close(%s): %v", nodeID, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func TestClusterBootstrapWithTLSInternalServer(t *testing.T) {
@@ -689,8 +786,8 @@ func TestClusterReadWrapperPaths(t *testing.T) {
 		SandboxID:     "sb-read",
 		OwnerNodeID:   "node-a",
 		Spec:          &models.CreateSandboxRequest{Image: "alpine"},
-		SecretRef:     "secret-ref",
-		SecretVersion: 2,
+		IncarnationID: "inc-read", SecretRef: testSecretRef("sb-read", "inc-read"),
+		SecretVersion: 1, SecretSealGeneration: 1,
 	})
 	applyOp(t, fsm, command{Op: opAddExposedPort, SandboxID: "sb-read", Port: 80, Protocol: "http"})
 	applyOp(t, fsm, command{Op: opAddCustomDomain, SandboxID: "sb-read", Hostname: "read.example.com"})
@@ -699,7 +796,7 @@ func TestClusterReadWrapperPaths(t *testing.T) {
 	if spec := c.SpecOf("sb-read"); spec == nil || spec.Image != "alpine" {
 		t.Fatalf("SpecOf = %+v", spec)
 	}
-	if got := c.SecretsOf("sb-read"); got.Ref != "secret-ref" {
+	if got := c.SecretsOf("sb-read"); got.Ref != testSecretRef("sb-read", "inc-read") {
 		t.Fatalf("SecretsOf = %+v", got)
 	}
 	ports := c.ExposedPortsOf("sb-read")
@@ -735,8 +832,48 @@ func TestAgentPlacementPageHarness(t *testing.T) {
 	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
 
 	out := agent.PlacementPage(PlacementPageRequest{Limit: 5})
-	if out.NextPageToken != "next" || len(out.Placements) != 1 {
+	if !out.Authoritative || out.NextPageToken != "next" || len(out.Placements) != 1 {
 		t.Fatalf("PlacementPage = %+v", out)
+	}
+}
+
+func TestAgentPlacementsByIDsBatch(t *testing.T) {
+	var gotIDs []string
+	var gotAuthoritative bool
+	agent := newAgentControlPlaneHarness(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != PublicInternalPlacementsByIDsPath {
+			http.NotFound(w, r)
+			return
+		}
+		gotAuthoritative = r.URL.Query().Get("authoritative") == "true"
+		var req placementsByIDsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		gotIDs = append([]string(nil), req.IDs...)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]Placement{
+			"sb-a": {SandboxID: "sb-a", Version: 9},
+			"sb-b": {SandboxID: "sb-b", Version: 10},
+		})
+	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
+
+	out := agent.PlacementsByIDs([]string{"sb-a", "", "sb-b", "sb-a"})
+	if len(out) != 2 || out["sb-a"].Version != 9 || out["sb-b"].Version != 10 {
+		t.Fatalf("PlacementsByIDs = %+v", out)
+	}
+	if len(gotIDs) != 2 || gotIDs[0] != "sb-a" || gotIDs[1] != "sb-b" {
+		t.Fatalf("batch request ids = %v, want [sb-a sb-b]", gotIDs)
+	}
+	if gotAuthoritative {
+		t.Fatal("ordinary batch unexpectedly requested a leader-only read")
+	}
+	out, err := agent.AuthoritativePlacementsByIDs(context.Background(), []string{"sb-a"})
+	if err != nil || out["sb-a"].Version != 9 {
+		t.Fatalf("AuthoritativePlacementsByIDs = %+v, %v", out, err)
+	}
+	if !gotAuthoritative {
+		t.Fatal("authoritative batch did not request a leader-only read")
 	}
 }
 
@@ -795,16 +932,16 @@ func TestClusterAssertOwnershipClaimOrphanIntegration(t *testing.T) {
 	}
 }
 
-func TestFollowerForwardApplySharedTLSInternalChannel(t *testing.T) {
+func TestFollowerForwardApplyNodeBoundTLSInternalChannel(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
-	tlsDir := writeTestClusterTLSDir(t)
-	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-tls-fwd", true, nil, tlsDir)
+	dirs := writeTestClusterTLSDirs(t, "ldr-tls-fwd", "fol-tls-fwd")
+	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-tls-fwd", true, nil, dirs["ldr-tls-fwd"])
 	defer cleanupLeader()
 	waitForLeader(t, leader, 10*time.Second)
 
-	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-tls-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, tlsDir)
+	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-tls-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, dirs["fol-tls-fwd"])
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 
@@ -817,9 +954,10 @@ func TestFollowerForwardApplySharedTLSInternalChannel(t *testing.T) {
 	})
 
 	payload, err := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   "sb-tls-fwd",
-		OwnerNodeID: follower.nodeID,
+		Op:            opPlace,
+		SandboxID:     "sb-tls-fwd",
+		OwnerNodeID:   follower.nodeID,
+		IncarnationID: "inc-tls-fwd",
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -851,17 +989,49 @@ func TestFSMValidateHostPortLazyIndexRebuild(t *testing.T) {
 	}
 }
 
-func TestRemoveMemberRejectsSelfRemoval(t *testing.T) {
+// TestRemoveMemberRejectsLastVoter pins the removal guard ORDER introduced by
+// the security remediation: the self and leader guards now run BEFORE the
+// last-voter check, so retiring the sole node reports ErrSelfRemoval rather
+// than ErrLastVoter — and the last-voter check still refuses to strip the only
+// voting member in the one configuration that reaches it.
+func TestRemoveMemberRejectsLastVoter(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
 	c, cleanup := newTestCluster(t, "ldr-last-voter", true, nil)
 	defer cleanup()
+
+	// The last-voter backstop is now the LAST guard: the self and leader guards
+	// run first, so the only configuration in which it can fire is one with no
+	// known leader — i.e. the window between New() and raft's first election,
+	// where the sole voter of a single-voter configuration is being removed.
+	// Probe immediately, then again after leadership appears: before the
+	// election the last-voter check answers, afterwards the leader guard does.
+	var err error
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err = c.removeMemberLocal(context.Background(), c.nodeID, true, true)
+		if errors.Is(err, ErrLastVoter) {
+			break
+		}
+		if !errors.Is(err, ErrLeaderRemoval) {
+			t.Fatalf("removeMemberLocal(sole voter, allowSelf=true) = %v, want ErrLastVoter before the first election and ErrLeaderRemoval after", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never observed the no-leader window in which the last-voter check applies")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The refused removal must leave the single voter in the raft configuration.
+	if _, ok := c.configuredServer(c.nodeID); !ok {
+		t.Fatal("last voter disappeared from the raft configuration after refused removal")
+	}
+
 	waitForLeader(t, c, 10*time.Second)
 
-	// Removing self is refused up front by the self-guard (the last-voter
-	// check behind it would refuse too, on this single-voter cluster).
-	err := c.RemoveMember(context.Background(), c.nodeID, true)
+	// Operator path: asking the only node to retire itself is refused by the
+	// self guard, before the leader branch and before any raft read.
+	err = c.RemoveMember(context.Background(), c.nodeID, true)
 	if !errors.Is(err, ErrSelfRemoval) {
 		t.Fatalf("RemoveMember(self) = %v, want ErrSelfRemoval", err)
 	}

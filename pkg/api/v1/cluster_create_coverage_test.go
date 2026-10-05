@@ -112,6 +112,30 @@ type promoteStubCluster struct {
 	deleteCalls   []string
 	deleteErr     error
 	selfNodePanic bool
+	placementInc  string
+}
+
+func (c *promoteStubCluster) PlacementOf(id string) (cluster.Placement, bool) {
+	if strings.TrimSpace(c.placementInc) == "" {
+		return cluster.Placement{}, false
+	}
+	return cluster.Placement{SandboxID: id, OwnerNodeID: c.SelfNodeID(), IncarnationID: c.placementInc}, true
+}
+
+func (c *promoteStubCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out := make(map[string]cluster.Placement, len(ids))
+	for _, id := range ids {
+		incarnationID := strings.TrimSpace(c.placementInc)
+		if incarnationID == "" {
+			incarnationID = "inc-" + id
+		}
+		out[id] = cluster.Placement{
+			SandboxID: id, OwnerNodeID: c.Noop.SelfNodeID(), IncarnationID: incarnationID,
+			SecretRecipients: []string{c.Noop.SelfNodeID()}, State: cluster.PlacementStateReserved,
+			ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		}
+	}
+	return out, nil
 }
 
 func (c *promoteStubCluster) SelfNodeID() string {
@@ -121,13 +145,16 @@ func (c *promoteStubCluster) SelfNodeID() string {
 	return c.Noop.SelfNodeID()
 }
 
-func (c *promoteStubCluster) RecordPlacement(_ context.Context, id string, _ *models.CreateSandboxRequest, _ cluster.PlacementSecrets) error {
+func (c *promoteStubCluster) RecordPlacement(_ context.Context, id string, _ *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
 	if c.recordDelay > 0 {
 		time.Sleep(c.recordDelay)
 	}
 	// Append before returning err so "errored but committed" (§7.2) is the
 	// default stub behavior — a client-side Raft error after FSM apply.
 	c.recordCalls = append(c.recordCalls, id)
+	if incarnationID := strings.TrimSpace(placementSecrets.IncarnationID); incarnationID != "" {
+		c.placementInc = incarnationID
+	}
 	return c.recordErr
 }
 
@@ -139,6 +166,10 @@ func (c *promoteStubCluster) CancelReservation(_ context.Context, id string) err
 func (c *promoteStubCluster) DeletePlacement(_ context.Context, id string) error {
 	c.deleteCalls = append(c.deleteCalls, id)
 	return c.deleteErr
+}
+
+func (c *promoteStubCluster) DeletePlacementExact(ctx context.Context, id, _, _ string) error {
+	return c.DeletePlacement(ctx, id)
 }
 
 func newClusterCreateHarness(t *testing.T, rt *apiRecordingRuntime, stub cluster.Client) (*handlers, *storepkg.Store) {
@@ -159,10 +190,12 @@ func newClusterCreateHarness(t *testing.T, rt *apiRecordingRuntime, stub cluster
 	t.Cleanup(mgr.Close)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	_, singleNode := stub.(*cluster.Noop)
 	cfg := config.Config{
 		Runtime:           models.RuntimeDocker,
 		ToolboxPort:       4321,
 		EnableCaddy:       false,
+		EnableCluster:     !singleNode,
 		HTTPClientTimeout: time.Second,
 	}
 	caddyClient := caddy.New(cfg)
@@ -171,46 +204,10 @@ func newClusterCreateHarness(t *testing.T, rt *apiRecordingRuntime, stub cluster
 		capacity.Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1},
 		nil,
 	)
-	svc := service.New(cfg, logger, st, rt, nil, caddyClient, nil, mgr, admitter)
-	svc.AttachCluster(stub)
-	return &handlers{deps: Deps{Service: svc, Logger: logger}}, st
-}
-
-func newClusterCreateHarnessWithCipher(t *testing.T, rt *apiRecordingRuntime, stub cluster.Client) (*handlers, *storepkg.Store) {
-	t.Helper()
-	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
-	mgr, err := mounts.New(slog.New(slog.NewTextHandler(io.Discard, nil)), mounts.Config{
-		RootDir: filepath.Join(t.TempDir(), "mounts"),
-		CredDir: filepath.Join(t.TempDir(), "cred"),
-	})
-	if err != nil {
-		t.Fatalf("mounts.New: %v", err)
-	}
-	t.Cleanup(mgr.Close)
-
 	ciph, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "secrets.key"))
 	if err != nil {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{
-		Runtime:           models.RuntimeDocker,
-		ToolboxPort:       4321,
-		EnableCaddy:       false,
-		HTTPClientTimeout: time.Second,
-	}
-	caddyClient := caddy.New(cfg)
-	admitter := capacity.New(
-		capacity.HostInfo{CPUCores: 8, MemoryTotalMB: 16384},
-		capacity.Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1},
-		nil,
-	)
 	svc := service.New(cfg, logger, st, rt, nil, caddyClient, ciph, mgr, admitter)
 	svc.AttachCluster(stub)
 	return &handlers{deps: Deps{Service: svc, Logger: logger}}, st
@@ -244,33 +241,46 @@ func TestCreateSandboxOnSelectedNode_PromoteSuccess(t *testing.T) {
 	}
 }
 
-// Overlap wall clock should be ~max(create, promote), not sum — create is
-// delayed past promote so handler duration stays near createDelay, not
-// createDelay+promote.
+// Seal overlaps the local create; promote stays sequential and is instant in
+// this stub. Wall clock should grow by about createDelay, not by another copy
+// of the handler. A same-test baseline subtracts sqlite, keygen, and scheduler
+// delay — a saturated `go test -race ./...` run has measured ~180ms here with
+// the overlap intact, which blows a fixed "50ms + 80ms" budget.
 func TestCreateSandboxOnSelectedNode_OverlapWallClockNearMax(t *testing.T) {
-	const createDelay = 50 * time.Millisecond
-	rt := &apiRecordingRuntime{createDelay: createDelay}
-	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-	h, _ := newClusterCreateHarness(t, rt, stub)
-
-	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
-	rr := httptest.NewRecorder()
-	httpReq := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
-	start := time.Now()
-	h.createSandboxOnSelectedNode(rr, httpReq, req, "sb-overlap-wall")
-	elapsed := time.Since(start)
-
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
-	}
-	// Sequential would be ≥ createDelay + promote; overlapped should finish
-	// shortly after createDelay. Allow generous slack for CI noise.
-	if elapsed > createDelay+80*time.Millisecond {
-		t.Fatalf("elapsed = %v, want near createDelay=%v (overlap), not sum", elapsed, createDelay)
+	const createDelay = 200 * time.Millisecond
+	baseline := measureSelectedNodeCreate(t, 0, "sb-overlap-base")
+	elapsed := measureSelectedNodeCreate(t, createDelay, "sb-overlap-wall")
+	extra := elapsed - baseline
+	// Slack covers the two runs seeing different CPU contention. It stays
+	// below createDelay so paying the stub sleep twice still fails.
+	const slack = 150 * time.Millisecond
+	if extra > createDelay+slack {
+		t.Fatalf("extra = %v (elapsed=%v baseline=%v), want ≤ %v; create delay should be paid once while seal overlaps",
+			extra, elapsed, baseline, createDelay+slack)
 	}
 	if elapsed < createDelay {
 		t.Fatalf("elapsed = %v, want ≥ createDelay=%v", elapsed, createDelay)
 	}
+}
+
+func measureSelectedNodeCreate(t *testing.T, createDelay time.Duration, id string) time.Duration {
+	t.Helper()
+	rt := &apiRecordingRuntime{createDelay: createDelay}
+	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	h, _ := newClusterCreateHarness(t, rt, stub)
+
+	rr := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
+	start := time.Now()
+	h.createSandboxOnSelectedNode(rr, httpReq, models.CreateSandboxRequest{Image: "alpine:3.20"}, id)
+	elapsed := time.Since(start)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Header().Get("Server-Timing"), "cluster_seal;dur=") {
+		t.Fatalf("Server-Timing = %q, want cluster_seal stage", rr.Header().Get("Server-Timing"))
+	}
+	return elapsed
 }
 
 func TestCreateSandboxOnSelectedNode_CreateFailureCancelsReservation(t *testing.T) {
@@ -408,8 +418,8 @@ func TestCreateSandboxOnSelectedNode_SelfLocalWithoutReservation(t *testing.T) {
 
 func TestCreateSandboxOnSelectedNode_PromoteWithRegistrySecrets(t *testing.T) {
 	rt := &apiRecordingRuntime{}
-	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-	h, _ := newClusterCreateHarnessWithCipher(t, rt, stub)
+	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", ""), placementInc: "inc-test"}
+	h, _ := newClusterCreateHarness(t, rt, stub)
 
 	req := models.CreateSandboxRequest{
 		Image: "private.example.com/app:latest",
@@ -610,8 +620,8 @@ func TestCreateSandboxOnSelectedNode_RecordPlacementDestroyAndDeleteErrors(t *te
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
-	if len(stub.deleteCalls) != 1 {
-		t.Fatalf("DeletePlacement calls = %+v, want one attempt despite errors", stub.deleteCalls)
+	if len(stub.deleteCalls) != 0 {
+		t.Fatalf("DeletePlacement calls = %+v, want none while runtime destruction failed", stub.deleteCalls)
 	}
 }
 
@@ -652,7 +662,7 @@ func TestNormalizeCreateRuntimeForPlacement_TemplateImpliesFirecracker(t *testin
 	}
 }
 
-func TestClusterDestroyWrap_SuccessAndDeletePlacementWarn(t *testing.T) {
+func TestClusterDestroyWrap_RetainsRowWhenPlacementDeleteFails(t *testing.T) {
 	rt := &apiRecordingRuntime{}
 	stub := &promoteStubCluster{
 		Noop:      cluster.NewNoop("node-a", "http://node-a", ""),
@@ -662,7 +672,8 @@ func TestClusterDestroyWrap_SuccessAndDeletePlacementWarn(t *testing.T) {
 	now := time.Now().UTC()
 	if err := st.Create(context.Background(), &models.Sandbox{
 		ID: "sb-destroy", Image: "alpine:3.20", Status: models.SandboxStatusStarted,
-		ContainerID: "ctr-sb-destroy", ContainerIP: "10.0.0.9",
+		AuditIncarnationID: "inc-sb-destroy",
+		ContainerID:        "ctr-sb-destroy", ContainerIP: "10.0.0.9",
 		CPU: 1, MemoryMB: 256, DiskGB: 1, OSUser: "root", ToolboxEnabled: true,
 		CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
@@ -674,14 +685,17 @@ func TestClusterDestroyWrap_SuccessAndDeletePlacementWarn(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.clusterDestroyWrap(rr, req)
 
-	if rr.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204; body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
 	if len(rt.destroyIDs) != 1 || rt.destroyIDs[0] != "sb-destroy" {
 		t.Fatalf("destroy ids = %+v, want [sb-destroy]", rt.destroyIDs)
 	}
 	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0] != "sb-destroy" {
 		t.Fatalf("DeletePlacement calls = %+v, want [sb-destroy]", stub.deleteCalls)
+	}
+	if _, err := st.Get(context.Background(), "sb-destroy"); err != nil {
+		t.Fatalf("placement failure removed local reconciliation anchor: %v", err)
 	}
 }
 
@@ -748,13 +762,13 @@ func TestCreateSandboxOnSelectedNode_SelfWinsPromoteRollbackErrors(t *testing.T)
 		recordErr: errors.New("raft commit failed"),
 		deleteErr: errors.New("delete failed"),
 	}
-	h, _ := newClusterCreateHarnessWithCipher(t, rt, stub)
+	h, _ := newClusterCreateHarness(t, rt, stub)
 	rr := httptest.NewRecorder()
 	h.createSandboxOnSelectedNode(rr, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), models.CreateSandboxRequest{Image: "alpine:3.20"}, "")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
-	if len(stub.deleteCalls) != 1 {
-		t.Fatalf("DeletePlacement calls = %+v, want one attempt", stub.deleteCalls)
+	if len(stub.deleteCalls) != 0 {
+		t.Fatalf("DeletePlacement calls = %+v, want none while runtime destruction failed", stub.deleteCalls)
 	}
 }

@@ -1,9 +1,10 @@
 import json
 import unittest
+import urllib.parse
 
 from microvm import Image
 from microvm import client as client_module
-from microvm.client import MicroVM
+from microvm.client import MicroVM, MicroVMError, _to_api_create_options
 
 
 class RecordingMicroVM(MicroVM):
@@ -184,9 +185,9 @@ class RecordingMicroVM(MicroVM):
             }
         raise AssertionError(f"unexpected call: {method} {path} {payload}")
 
-    def _request(self, method, url, body=None, content_type=None):  # type: ignore[override]
+    def _request(self, method, url, body=None, content_type=None, extra_headers=None):  # type: ignore[override]
         path = url.replace(self.api_url, "")
-        self.raw_calls.append((method, path, body, content_type))
+        self.raw_calls.append((method, path, body, content_type, extra_headers))
         if method == "GET" and path == "/v1/sandboxes/sb-1/sessions/ses-1/log":
             return b"session log"
         if method == "GET" and path == "/v1/sandboxes/sb-1/sessions/ses-1/recording":
@@ -325,6 +326,44 @@ class ClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(client_module.MicroVMError, "does not support Image builds"):
             client.build_image(Image.base("alpine"))
+
+    def test_request_retries_421_misdirected(self):
+        # 421: an owner answered for a sandbox it doesn't hold (connection
+        # coalescing / stale route). The server closes the connection, so
+        # the retry reconnects and the ingress re-routes it.
+        import http.server
+        import threading
+
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hits.append(self.path)
+                if len(hits) == 1:
+                    self.send_response(421)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "misdirected request; reconnect"}')
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = "http://127.0.0.1:%d" % server.server_port
+            client = MicroVM(base, "pat", config={"retry": {"maxRetries": 2, "baseDelayMs": 1, "maxDelayMs": 1}})
+            self.assertEqual(client._request("GET", base + "/x"), b"ok")
+            self.assertEqual(len(hits), 2)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_create_serializes_selective_egress(self):
         client = RecordingMicroVM()
@@ -924,6 +963,10 @@ class ListFilterTests(unittest.TestCase):
                 captured["paths"].append((method, path, payload))
                 return []
 
+            def _do_json_headers(self, method, path, payload):  # type: ignore[override]
+                captured["paths"].append((method, path, payload))
+                return [], {}
+
         return CapturingClient(), captured
 
     def test_list_with_tags_renders_tag_prefix(self):
@@ -951,6 +994,123 @@ class ListFilterTests(unittest.TestCase):
         client.list(tags={})
         for _, path, _ in captured["paths"]:
             self.assertEqual(path, "/v1/sandboxes")
+
+    def test_get_and_list_include_env(self):
+        client, captured = self._client_capturing()
+        client.get("sb-1", include_env=True)
+        client.list(tags={"team": "a"}, include_env=True)
+        self.assertEqual(captured["paths"][0][1], "/v1/sandboxes/sb-1?include_env=true")
+        self.assertIn("tag.team=a", captured["paths"][1][1])
+        self.assertIn("include_env=true", captured["paths"][1][1])
+
+    def test_list_forwards_name_filter(self):
+        client, captured = self._client_capturing()
+        client.list(name=" agent ", tags={"team": "a"})
+        _, path, _ = captured["paths"][0]
+        self.assertIn("name=agent", path)
+        self.assertIn("tag.team=a", path)
+
+    def test_get_by_name_verifies_the_reply(self):
+        replies = {
+            "agent": [{"id": "sb-1", "name": "agent", "tags": {"team": "x"}, "status": "started"}],
+            "missing": [],
+            "old": [{"id": "sb-1", "name": "a"}, {"id": "sb-2", "name": "b"}],
+            "mismatch": [{"id": "sb-3", "name": "someone-else"}],
+        }
+        seen = []
+
+        class NameClient(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                seen.append(path)
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+                return replies[query["name"][0]]
+
+        client = NameClient()
+        found = client.get_by_name(" agent ")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.id, "sb-1")
+        self.assertEqual(found.name, "agent")
+        self.assertEqual(found.tags, {"team": "x"})
+        self.assertEqual(seen[0], "/v1/sandboxes?name=agent")
+        self.assertIsNone(client.get_by_name("missing"))
+        for name in ("old", "mismatch"):
+            with self.assertRaisesRegex(MicroVMError, "does not support sandbox name lookup"):
+                client.get_by_name(name)
+        with self.assertRaises(ValueError):
+            client.get_by_name("  ")
+
+    def test_create_sends_name_and_tags(self):
+        payload = _to_api_create_options({"image": "alpine", "name": "agent", "tags": {"a": "b"}})
+        self.assertEqual(payload["name"], "agent")
+        self.assertEqual(payload["tags"], {"a": "b"})
+        self.assertNotIn("name", _to_api_create_options({"image": "alpine"}))
+
+    def test_list_drains_cluster_pages(self):
+        captured = {"paths": []}
+
+        class PagingClient(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json_headers(self, method, path, payload):  # type: ignore[override]
+                captured["paths"].append(path)
+                if "page_token=" not in path:
+                    return (
+                        [{"id": "sb-1", "image": "alpine", "status": "started"}],
+                        {
+                            "X-Cluster-List-Partial": "false",
+                            "X-Cluster-List-Placement-Ready": "true",
+                            "X-Cluster-List-Next-Page-Token": "tok-1",
+                        },
+                    )
+                return (
+                    [{"id": "sb-2", "image": "alpine", "status": "started"}],
+                    {
+                        "X-Cluster-List-Partial": "false",
+                        "X-Cluster-List-Placement-Ready": "true",
+                    },
+                )
+
+        items = PagingClient().list()
+        self.assertEqual([s.id for s in items], ["sb-1", "sb-2"])
+        self.assertEqual(captured["paths"][1], "/v1/sandboxes?page_token=tok-1")
+
+    def test_iter_pages_is_incremental(self):
+        calls = []
+
+        class PagingClient(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json_headers(self, method, path, payload):  # type: ignore[override]
+                calls.append(path)
+                number = len(calls)
+                headers = {"X-Cluster-List-Placement-Ready": "true"}
+                if number == 1:
+                    headers["X-Cluster-List-Next-Page-Token"] = "tok-1"
+                return [{"id": f"sb-{number}", "image": "alpine", "status": "started"}], headers
+
+        pages = PagingClient().iter_pages()
+        self.assertEqual([s.id for s in next(pages)], ["sb-1"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([s.id for s in next(pages)], ["sb-2"])
+        self.assertEqual(len(calls), 2)
+        with self.assertRaises(StopIteration):
+            next(pages)
+
+    def test_list_errors_on_partial_cluster_coverage(self):
+        class PartialClient(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json_headers(self, method, path, payload):  # type: ignore[override]
+                return [], {"X-Cluster-List-Partial": "true", "X-Cluster-List-Placement-Ready": "true"}
+
+        with self.assertRaisesRegex(client_module.MicroVMError, "incomplete cluster list"):
+            PartialClient().list()
 
 
 class CustomDomainsTests(unittest.TestCase):

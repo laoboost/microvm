@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,7 +30,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-var userCommandPID int
+var userCommandPID atomic.Int64
 
 var (
 	hostnameFn = os.Hostname
@@ -75,6 +76,10 @@ type server struct {
 	daytona  *daytonaCompat
 	envd     *envdCompat
 	cloneGen *clonegen.Generation
+
+	// execLiveness overrides the exec-stream keepalive timings; the zero value
+	// means defaultExecStreamLiveness. Only tests set it.
+	execLiveness execStreamLiveness
 }
 
 // authOptionalFromEnv reports whether the dev escape hatch
@@ -296,11 +301,11 @@ func startUserCommand(logger *slog.Logger, args []string) {
 		logger.Error("failed to start user command", "args", args, "error", err)
 		return
 	}
-	userCommandPID = cmd.Process.Pid
+	userCommandPID.Store(int64(cmd.Process.Pid))
 	if err := cmd.Process.Release(); err != nil {
 		logger.Warn("failed to release user command handle", "error", err)
 	}
-	logger.Info("user command started", "pid", userCommandPID, "args", args)
+	logger.Info("user command started", "pid", cmd.Process.Pid, "args", args)
 }
 
 // forwardShutdownSignals catches SIGTERM/SIGINT (sent by `docker stop` to PID 1)
@@ -313,10 +318,10 @@ func forwardShutdownSignals(logger *slog.Logger, srv *http.Server) {
 	sig := <-sigs
 	logger.Info("toolboxd received shutdown signal", "signal", sig.String())
 
-	if userCommandPID > 0 {
+	if pid := int(userCommandPID.Load()); pid > 0 {
 		// Negative PID targets the process group, so children of the user
 		// command also receive the signal.
-		if err := syscall.Kill(-userCommandPID, sig.(syscall.Signal)); err != nil {
+		if err := syscall.Kill(-pid, sig.(syscall.Signal)); err != nil {
 			logger.Warn("failed to forward signal to user command", "error", err)
 		}
 	}
@@ -334,15 +339,21 @@ func startReaper(logger *slog.Logger) {
 	go func() {
 		for range sigs {
 			for {
-				var status syscall.WaitStatus
-				pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
-				if pid <= 0 || err != nil {
+				// Through execChildren, never a bare wait4(-1): an exec
+				// child's status must reach its waiter (see child_table.go).
+				pid, status, tracked, ok := execChildren.reap(-1)
+				if !ok {
 					break
 				}
+				commandPID := int(userCommandPID.Load())
 				switch {
-				case pid == userCommandPID && status.Exited():
+				case tracked:
+					logger.Debug("reaped exec child", "pid", pid)
+				case pid == commandPID && status.Exited():
+					userCommandPID.CompareAndSwap(int64(commandPID), 0)
 					logger.Info("user command exited", "pid", pid, "code", status.ExitStatus())
-				case pid == userCommandPID && status.Signaled():
+				case pid == commandPID && status.Signaled():
+					userCommandPID.CompareAndSwap(int64(commandPID), 0)
 					logger.Info("user command killed", "pid", pid, "signal", status.Signal())
 				default:
 					logger.Debug("reaped orphan", "pid", pid)
@@ -656,7 +667,8 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := cmd.Start(); err != nil {
+	child, err := startTracked(cmd)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -673,7 +685,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		stderrBytes = readCappedCapture(stderr)
 	}()
 	readWG.Wait()
-	waitErr := cmd.Wait()
+	waitErr := child.wait()
 
 	result := models.ExecResult{
 		Stdout:     stdoutBytes,
@@ -739,7 +751,10 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := os.ReadFile(targetPath)
+	// Stream from the file rather than reading it whole: a client that only
+	// wants the head of a multi-GB file (the agent read_file tool reads one
+	// window) must not make toolboxd allocate the entire file in the guest.
+	f, err := os.Open(targetPath)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, os.ErrNotExist) {
@@ -748,11 +763,25 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error())
 		return
 	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if info.IsDir() {
+		// Same status and text os.ReadFile produced for a directory.
+		writeError(w, http.StatusInternalServerError, "read "+targetPath+": is a directory")
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(targetPath)))
+	if info.Mode().IsRegular() {
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	_, _ = io.Copy(w, f)
 }
 
 func (s *server) handleSetAllowedPorts(w http.ResponseWriter, r *http.Request) {

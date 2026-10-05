@@ -25,7 +25,7 @@ func TestCreate_RejectsToolboxBindInjection(t *testing.T) {
 	c := newCreateClient(t, d, true, func(c *Client) {
 		c.toolboxMountPath = "/usr/local/bin/toolboxd:rshared"
 	})
-	getCreateBody := captureCreateBody(t, c)
+	getCreateBody := captureCreateBodyGetter(t, c)
 
 	_, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: "registry.example/app:v1"}, "sb", "tok", nil)
 	if err == nil || !strings.Contains(err.Error(), "bind path") {

@@ -20,13 +20,19 @@ func (f *fakeSpawner) Warm(_ context.Context, slotID, socketPath, modulePath str
 	return nil
 }
 
+func (f *fakeSpawner) Shutdown(string) error { return nil }
+
+func (f *fakeSpawner) warmedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.warmed)
+}
+
 func (f *fakeSpawner) warmedSnapshot() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.warmed...)
 }
-
-func (f *fakeSpawner) Shutdown(string) error { return nil }
 
 func TestPoolAcquireMissAndHit(t *testing.T) {
 	p := New(t.TempDir(), nil)
@@ -90,7 +96,7 @@ func TestPoolWarmOne(t *testing.T) {
 	if slot.WorkerKey == "" || slot.SocketPath == "" {
 		t.Fatalf("slot incomplete: %+v", slot)
 	}
-	if len(spawner.warmedSnapshot()) != 1 {
+	if spawner.warmedCount() != 1 {
 		t.Fatalf("warmed = %v", spawner.warmedSnapshot())
 	}
 }

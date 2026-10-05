@@ -24,7 +24,9 @@ func (h *handlers) clusterForwardWrap(pathKey string, local http.Handler) http.H
 
 		owner, err := c.OwnerOf(strings.TrimSpace(r.PathValue(pathKey)))
 		if errors.Is(err, cluster.ErrUnknownSandbox) && pathKey == "idOrName" {
-			_, owner, err = c.OwnerOfName(r.PathValue(pathKey))
+			// Names are unique per owner: resolve in the caller's namespace,
+			// the same one resolveSandbox uses on the owner node.
+			_, owner, err = c.OwnerOfName(service.OwnerRefForCreate(r.Context()), r.PathValue(pathKey))
 		}
 		if errors.Is(err, cluster.ErrUnknownSandbox) {
 			local.ServeHTTP(w, r)
@@ -52,6 +54,6 @@ func (h *handlers) clusterForwardWrap(pathKey string, local http.Handler) http.H
 			apihttp.WriteError(w, http.StatusMisdirectedRequest, "cluster: forwarding loop detected")
 			return
 		}
-		c.ForwardHTTP(cluster.Endpoint{InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
+		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	})
 }

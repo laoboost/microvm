@@ -51,11 +51,11 @@ type linuxQuiesceOps struct{}
 // entropy after resume see distinct streams. Errors are returned but the
 // caller logs and continues — a sandbox without fresh entropy is
 // degraded, not broken.
-func (linuxQuiesceOps) ReseedRandom() error {
+func (linuxQuiesceOps) ReseedRandom() (err error) {
 	const entropyBytes = 32
 	var buf [entropyBytes]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return fmt.Errorf("read entropy: %w", err)
+	if _, readErr := rand.Read(buf[:]); readErr != nil {
+		return fmt.Errorf("read entropy: %w", readErr)
 	}
 
 	// struct rnd_pool_info { int entropy_count; int buf_size; __u32 buf[]; }
@@ -71,7 +71,13 @@ func (linuxQuiesceOps) ReseedRandom() error {
 	if err != nil {
 		return fmt.Errorf("open /dev/random: %w", err)
 	}
-	defer f.Close()
+	// Close can drop the last ioctl if the fd is torn down early. Keep that
+	// error when the ioctls themselves succeeded.
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
 
 	// Step 1: credit the input pool. This is the load-bearing op — if it
 	// fails the clone has no fresh entropy, so surface the error.
@@ -173,7 +179,7 @@ var readNetClassDir = func() ([]os.DirEntry, error) {
 }
 
 func runNetworkCmd(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	out, err := trackedCombinedOutput(exec.Command(name, args...))
 	if err != nil {
 		return fmt.Errorf("%s %s: %w (%s)", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
@@ -181,7 +187,7 @@ func runNetworkCmd(name string, args ...string) error {
 }
 
 func runNetworkCmdIgnoreExists(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	out, err := trackedCombinedOutput(exec.Command(name, args...))
 	if err == nil {
 		return nil
 	}

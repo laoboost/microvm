@@ -25,7 +25,7 @@ func TestCreate_NormalizesRootOSUserForColdPath(t *testing.T) {
 		},
 	}
 	c := newCreateClient(t, d, true, nil)
-	getCreateBody := captureCreateBody(t, c)
+	getCreateBody := captureCreateBodyGetter(t, c)
 
 	_, err := c.Create(context.Background(), models.CreateSandboxRequest{
 		Image:  "registry.example/app:v1",

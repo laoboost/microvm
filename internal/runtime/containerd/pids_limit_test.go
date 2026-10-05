@@ -14,8 +14,9 @@ func TestResourceSpecOpts_SetsPidsLimit(t *testing.T) {
 	if spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil {
 		t.Fatal("pids limit not set in Linux resources")
 	}
-	if got := spec.Linux.Resources.Pids.Limit; got != 1024 {
-		t.Fatalf("Pids.Limit = %d, want 1024", got)
+	limit := spec.Linux.Resources.Pids.Limit
+	if limit == nil || *limit != 1024 {
+		t.Fatalf("Pids.Limit = %v, want 1024", limit)
 	}
 }
 
@@ -38,13 +39,14 @@ func TestResize_PreservesPidsLimitOnResourceUpdate(t *testing.T) {
 	if res.Pids == nil {
 		t.Fatal("resize resources missing Pids limit")
 	}
-	if res.Pids.Limit != 1024 {
-		t.Fatalf("Pids.Limit = %d, want 1024", res.Pids.Limit)
+	if res.Pids.Limit == nil || *res.Pids.Limit != 1024 {
+		t.Fatalf("Pids.Limit = %v, want 1024", res.Pids.Limit)
 	}
 
 	// Pids limit alone must still produce an update (no memory/cpu change).
 	resOnlyPids := resizeLinuxResources(models.ResizeSandboxRequest{}, 1024)
-	if resOnlyPids == nil || resOnlyPids.Pids == nil || resOnlyPids.Pids.Limit != 1024 {
+	if resOnlyPids == nil || resOnlyPids.Pids == nil ||
+		resOnlyPids.Pids.Limit == nil || *resOnlyPids.Pids.Limit != 1024 {
 		t.Fatalf("pids-only resize lost: %+v", resOnlyPids)
 	}
 }

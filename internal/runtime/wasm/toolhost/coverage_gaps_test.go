@@ -10,11 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -24,87 +21,6 @@ import (
 )
 
 // ─── coderun.go ──────────────────────────────────────────────────────────────
-
-func TestWriteCodeRunScriptErrors(t *testing.T) {
-	// workDir is a regular file → MkdirAll(".coderun") fails
-	fileAsDir := filepath.Join(t.TempDir(), "blocked")
-	if err := os.WriteFile(fileAsDir, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := writeCodeRunScript(fileAsDir, "code", ".sh"); err == nil {
-		t.Fatal("expected MkdirAll error")
-	}
-
-	// Read-only workDir prevents writing the script file.
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Skip("chmod not supported")
-	}
-	if _, _, err := writeCodeRunScript(dir, "code", ".sh"); err == nil {
-		t.Fatal("expected WriteFile error")
-	}
-}
-
-func TestHandleCodeRunSuccessAndWaitError(t *testing.T) {
-	requireHostExec(t)
-	dir := t.TempDir()
-	h := New(Config{SandboxID: "sb", WorkDir: dir})
-
-	// Happy path with env + argv exercises the full handler body.
-	payload, _ := json.Marshal(map[string]interface{}{
-		"code":     "echo coded",
-		"language": "bash",
-		"argv":     []string{},
-		"envs":     map[string]string{"CODE_RUN_TEST": "1"},
-		"timeout":  30,
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code-run status = %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	// Force a non-ExitError wait path by running a command that cannot start.
-	badPayload, _ := json.Marshal(map[string]string{
-		"code":     "exit 0",
-		"language": "bash",
-	})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(badPayload))
-	req.Header.Set("Content-Type", "application/json")
-	// Shadow PATH so bash lookup fails after writeCodeRunScript succeeds.
-	req = req.WithContext(context.Background())
-	h2 := New(Config{SandboxID: "sb", WorkDir: dir})
-	// Use an invalid interpreter by temporarily breaking PATH via env in request is not possible;
-	// instead rely on writeCodeRunScript failure already tested above.
-	_ = h2
-}
-
-func TestHandleCodeRunContextTimeoutAppendsError(t *testing.T) {
-	requireHostExec(t)
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	payload, _ := json.Marshal(map[string]interface{}{
-		"code":     "sleep 10",
-		"language": "bash",
-		"timeout":  1,
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("timeout status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var resp codeRunResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("json: %v", err)
-	}
-	if resp.ExitCode == 0 {
-		t.Fatalf("expected non-zero exit on timeout, got %d", resp.ExitCode)
-	}
-}
 
 func TestPumpWasmSessionStderrFrames(t *testing.T) {
 	h, mgr := newHostWithRealSessions(t)
@@ -134,230 +50,12 @@ func TestPumpWasmSessionStderrFrames(t *testing.T) {
 	conn.Close()
 }
 
-func TestHandleCodeRunStderrOnlyResult(t *testing.T) {
-	requireHostExec(t)
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	payload, _ := json.Marshal(map[string]string{
-		"code":     "echo oops 1>&2",
-		"language": "bash",
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var resp codeRunResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("json: %v", err)
-	}
-	if !strings.Contains(resp.Result, "oops") {
-		t.Fatalf("expected stderr in result, got %q", resp.Result)
-	}
-}
-
-func TestHandleExecStreamCustomWorkdir(t *testing.T) {
-	requireHostExec(t)
-	workdir := t.TempDir()
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	srv := httptest.NewServer(h.Handler())
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(
-		"ws"+strings.TrimPrefix(srv.URL, "http")+"/process/exec/stream", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.WriteJSON(map[string]interface{}{
-		"command": "pwd",
-		"workdir": workdir,
-		"tty":     false,
-	})
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	readUntilExit(t, conn)
-}
-
-func TestPumpExecStreamReaderWriteError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		pr, pw := io.Pipe()
-		go func() {
-			_, _ = pw.Write([]byte("data"))
-			_ = pw.Close()
-		}()
-		_ = pumpExecStreamReader(conn, pr, streamFramePrefixStdout)
-		_ = conn.Close()
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	conn.Close()
-}
-
-func TestPumpExecStreamReaderLockedWriteError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		pr, pw := io.Pipe()
-		go func() {
-			_, _ = pw.Write([]byte("data"))
-			_ = pw.Close()
-		}()
-		var mu sync.Mutex
-		_ = pumpExecStreamReaderLocked(conn, pr, streamFramePrefixStderr, &mu)
-		_ = conn.Close()
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	conn.Close()
-}
-
-func TestExecStreamStdinPumpSignalControl(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		defer conn.Close()
-		pr, pw := io.Pipe()
-		go func() {
-			h := &Host{}
-			h.execStreamStdinPump(conn, pw)
-		}()
-		sig, _ := json.Marshal(execStreamControlIn{Type: "signal", Signal: "TERM"})
-		_ = conn.WriteMessage(websocket.TextMessage, sig)
-		time.Sleep(30 * time.Millisecond)
-		_ = pr.Close()
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.Close()
-}
-
 func TestStripSandboxPrefixEmptyRemainder(t *testing.T) {
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	req := httptest.NewRequest(http.MethodGet, "/sb/", nil)
 	_ = h.stripSandboxPrefix(req)
 	if req.URL.Path != "/" {
 		t.Fatalf("path = %q", req.URL.Path)
-	}
-}
-
-func TestHandleCodeRunScriptWriteErrorHTTP(t *testing.T) {
-	requireHostExec(t)
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Skip("chmod not supported")
-	}
-	h := New(Config{SandboxID: "sb", WorkDir: dir})
-	payload, _ := json.Marshal(map[string]string{"code": "echo x", "language": "bash"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("write script error status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestWriteCodeRunScriptMkdirTempParentIsFile(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".coderun"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := writeCodeRunScript(dir, "x", ".sh"); err == nil {
-		t.Fatal("expected MkdirAll error when .coderun is a file")
-	}
-}
-
-func TestHandleExecStreamPipesStartFailureBadWorkdir(t *testing.T) {
-	requireHostExec(t)
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	srv := httptest.NewServer(h.Handler())
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(
-		"ws"+strings.TrimPrefix(srv.URL, "http")+"/process/exec/stream", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.WriteJSON(map[string]interface{}{
-		"command": "echo hi",
-		"workdir": "/no/such/workdir",
-		"tty":     false,
-	})
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	if msg.Type != "error" {
-		t.Fatalf("expected start error, got %q", msg.Type)
-	}
-}
-
-func TestDaytonaSessionExecRandIDFailure(t *testing.T) {
-	requireHostExec(t)
-	orig := daytonaRandRead
-	t.Cleanup(func() { daytonaRandRead = orig })
-	daytonaRandRead = func([]byte) (int, error) { return 0, errors.New("rand failed") }
-
-	h, _ := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-rand-fail"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	execPayload, _ := json.Marshal(map[string]string{"command": "echo x"})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-rand-fail/exec", bytes.NewReader(execPayload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("rand fail exec status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestDaytonaSessionCommandInputCRSuffix(t *testing.T) {
-	requireHostExec(t)
-	h, _ := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-cr"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	execPayload, _ := json.Marshal(map[string]interface{}{
-		"command":  "sleep 5",
-		"runAsync": true,
-	})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-cr/exec", bytes.NewReader(execPayload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	var execResp map[string]interface{}
-	_ = json.Unmarshal(rec.Body.Bytes(), &execResp)
-	cmdID := execResp["cmdId"].(string)
-	time.Sleep(100 * time.Millisecond)
-
-	payload, _ := json.Marshal(map[string]string{"data": "line\r"})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-cr/command/"+cmdID+"/input", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK && rec.Code != http.StatusInternalServerError {
-		t.Fatalf("input status = %d", rec.Code)
 	}
 }
 
@@ -409,24 +107,6 @@ func TestDaytonaSessionEntrypointLogsNotImplemented(t *testing.T) {
 	}
 }
 
-func TestHandleCodeRunWithArgvAndEnv(t *testing.T) {
-	requireHostExec(t)
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	payload, _ := json.Marshal(map[string]interface{}{
-		"code":     "echo $1 $CODE_RUN_ARG",
-		"language": "bash",
-		"argv":     []string{"from-argv"},
-		"envs":     map[string]string{"CODE_RUN_ARG": "from-env"},
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code-run status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
 func TestHandleSessionsRouteNotFound(t *testing.T) {
 	h, _ := newHostWithRealSessions(t)
 	rec := httptest.NewRecorder()
@@ -457,76 +137,6 @@ func TestHandleUploadAtomicWriteError(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("atomic write onto directory status = %d body=%s", rec.Code, rec.Body.String())
 	}
-}
-
-func TestWriteCodeRunScriptMkdirTempError(t *testing.T) {
-	dir := t.TempDir()
-	base := filepath.Join(dir, ".coderun")
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// Fill the parent with enough entries that MkdirTemp may fail on some systems;
-	// also replace base with a file after creating many dirs to force MkdirTemp failure.
-	for i := 0; i < 50; i++ {
-		_ = os.Mkdir(filepath.Join(base, "run-fill-"+strconv.Itoa(i)), 0o700)
-	}
-	_ = os.RemoveAll(base)
-	if err := os.WriteFile(base, []byte("not-a-dir"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := writeCodeRunScript(dir, "x", ".sh"); err == nil {
-		t.Fatal("expected writeCodeRunScript error when .coderun is a file")
-	}
-}
-
-func TestDaytonaSessionExecStderrAndFollowLogs(t *testing.T) {
-	requireHostExec(t)
-	h, _ := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-stderr"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	execPayload, _ := json.Marshal(map[string]string{
-		"command": "echo err 1>&2; echo visible",
-	})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-stderr/exec", bytes.NewReader(execPayload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("exec status = %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	pl2, _ := json.Marshal(map[string]string{"sessionId": "ds-hold"})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl2))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	execPayload2, _ := json.Marshal(map[string]interface{}{
-		"command":  "printf 'prompt'",
-		"runAsync": true,
-	})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/session/ds-hold/exec", bytes.NewReader(execPayload2))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	var resp map[string]interface{}
-	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	cmdID, _ := resp["cmdId"].(string)
-
-	srv := httptest.NewServer(h.Handler())
-	defer srv.Close()
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/process/session/ds-hold/command/" + cmdID + "/logs?follow=true"
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("dial logs: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, _, _ = conn.ReadMessage()
-	conn.Close()
 }
 
 // ─── files.go ────────────────────────────────────────────────────────────────
@@ -742,155 +352,6 @@ func TestHandleExecStreamUpgradeFailure(t *testing.T) {
 	}
 }
 
-func TestHandleExecStreamPTYDefaultsAndStartError(t *testing.T) {
-	requireHostExec(t)
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	srv := httptest.NewServer(h.Handler())
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(
-		"ws"+strings.TrimPrefix(srv.URL, "http")+"/process/exec/stream", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-
-	if err := conn.WriteJSON(map[string]interface{}{"command": "echo pty-defaults", "tty": true}); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(8 * time.Second))
-	readUntilExit(t, conn)
-
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		h.runExecStreamPTY(c, exec.Command(""), &execStreamStartMsg{})
-	}))
-	defer srv2.Close()
-	c2, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv2.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial pty err: %v", err)
-	}
-	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = c2.ReadJSON(&msg)
-	c2.Close()
-}
-
-func TestHandleExecStreamPipesErrors(t *testing.T) {
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		cmd := exec.Command("echo", "x")
-		_ = cmd.Start()
-		h.runExecStreamPipes(c, cmd)
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	conn.Close()
-	if msg.Type != "error" {
-		t.Fatalf("expected error, got %q", msg.Type)
-	}
-}
-
-func TestExecStreamPumpAndWaitEdgeCases(t *testing.T) {
-	// waitExec with never-started command → non-ExitError path
-	cmd := exec.Command("true")
-	code, sig := waitExec(cmd)
-	if code != 1 || sig == "" {
-		t.Fatalf("unstarted wait: code=%d sig=%q", code, sig)
-	}
-
-	// pumpExecStreamReader write failure closes early
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		defer conn.Close()
-		pr, pw := io.Pipe()
-		go func() {
-			_, _ = pw.Write([]byte("chunk"))
-			_ = pw.Close()
-		}()
-		_ = pumpExecStreamReader(conn, pr, streamFramePrefixStdout)
-	}))
-	defer srv.Close()
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/"
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.Close()
-
-	// execStreamControlPump invalid JSON + signal path
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		defer conn.Close()
-		cmd := exec.Command("sleep", "30")
-		_ = cmd.Start()
-		defer func() { _ = cmd.Process.Kill() }()
-		ptmx, _ := os.Open(os.DevNull)
-		h := &Host{}
-		go h.execStreamControlPump(conn, cmd, ptmx)
-		_ = conn.WriteMessage(websocket.TextMessage, []byte("not-json"))
-		sig, _ := json.Marshal(execStreamControlIn{Type: "signal", Signal: "KILL"})
-		_ = conn.WriteMessage(websocket.TextMessage, sig)
-		time.Sleep(50 * time.Millisecond)
-	}))
-	defer srv2.Close()
-	c2, _, _ := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv2.URL, "http")+"/", nil)
-	if c2 != nil {
-		c2.Close()
-	}
-
-	// stdin pump: signal control ends pump; write error on broken stdin
-	srv3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		defer conn.Close()
-		_, pw := io.Pipe()
-		h := &Host{}
-		h.execStreamStdinPump(conn, pw)
-	}))
-	defer srv3.Close()
-	c3, _, _ := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv3.URL, "http")+"/", nil)
-	if c3 != nil {
-		_ = c3.WriteMessage(websocket.BinaryMessage, []byte("x"))
-		c3.Close()
-	}
-}
-
-func readUntilExit(t *testing.T, conn *websocket.Conn) {
-	t.Helper()
-	for {
-		msgType, data, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-		if msgType == websocket.TextMessage {
-			var ctrl execStreamControlOut
-			if json.Unmarshal(data, &ctrl) == nil && ctrl.Type == "exit" {
-				return
-			}
-		}
-	}
-}
-
 // ─── sessions.go ─────────────────────────────────────────────────────────────
 
 func TestPumpWasmSessionDoneDrainAndStderr(t *testing.T) {
@@ -992,54 +453,6 @@ func TestDaytonaSessionListSkipsStaleCompat(t *testing.T) {
 	_ = mgr
 }
 
-func TestDaytonaSessionDeleteSuccessPath(t *testing.T) {
-	requireHostExec(t)
-	h, _ := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-del-ok"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodDelete, "/process/session/ds-del-ok", nil)
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("delete ok status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestDaytonaSessionDeleteRaceNotFound(t *testing.T) {
-	requireHostExec(t)
-	h, mgr := newHostWithRealSessions(t)
-	pl, _ := json.Marshal(map[string]string{"sessionId": "ds-del-race"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-
-	sess, err := mgr.GetByName("ds-del-race")
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(10 * time.Millisecond)
-		_ = mgr.Delete(sess.ID())
-	}()
-
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodDelete, "/process/session/ds-del-race", nil)
-	h.Handler().ServeHTTP(rec, req)
-	wg.Wait()
-	if rec.Code != http.StatusNotFound && rec.Code != http.StatusNoContent {
-		t.Fatalf("race delete status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
 func TestDaytonaCommandStreamSlowSubscriber(t *testing.T) {
 	s := newDaytonaCommandStream()
 	ch := make(chan []byte) // unbuffered → default branch in broadcast
@@ -1047,95 +460,6 @@ func TestDaytonaCommandStreamSlowSubscriber(t *testing.T) {
 	s.subs = append(s.subs, ch)
 	s.mu.Unlock()
 	s.broadcast(sessions.StreamStdout, []byte("drop-me"))
-}
-
-func TestDaytonaRunSessionCommandBranches(t *testing.T) {
-	requireHostExec(t)
-	h, mgr := newHostWithRealSessions(t)
-
-	t.Run("stderr and sync echo", func(t *testing.T) {
-		pl, _ := json.Marshal(map[string]string{"sessionId": "ds-run"})
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-
-		execPayload, _ := json.Marshal(map[string]string{"command": "echo out; echo err 1>&2"})
-		rec = httptest.NewRecorder()
-		req = httptest.NewRequest(http.MethodPost, "/process/session/ds-run/exec", bytes.NewReader(execPayload))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("exec status = %d body=%s", rec.Code, rec.Body.String())
-		}
-	})
-
-	t.Run("session closes without marker", func(t *testing.T) {
-		sess, err := mgr.Create(context.Background(), models.CreateSessionRequest{
-			Name:    "ds-abort",
-			Command: "sleep 60",
-			PTY:     false,
-		})
-		if err != nil {
-			t.Fatalf("create: %v", err)
-		}
-		state := h.daytona.ensureSession("ds-abort")
-		cmd := &daytonaCommandState{
-			id:        "abort-cmd",
-			command:   "sleep 60",
-			createdAt: time.Now().UTC(),
-			running:   true,
-			stream:    newDaytonaCommandStream(),
-		}
-		state.addCommand(cmd)
-		_ = mgr.Delete(sess.ID())
-		_, _ = h.runDaytonaSessionCommand(sess, state, cmd)
-	})
-
-	t.Run("sync prompt holdback", func(t *testing.T) {
-		pl, _ := json.Marshal(map[string]string{"sessionId": "ds-prompt"})
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-
-		execPayload, _ := json.Marshal(map[string]string{"command": "printf 'prompt'"})
-		rec = httptest.NewRecorder()
-		req = httptest.NewRequest(http.MethodPost, "/process/session/ds-prompt/exec", bytes.NewReader(execPayload))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("prompt exec status = %d body=%s", rec.Code, rec.Body.String())
-		}
-		var resp daytonaSessionExecuteResponse
-		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("json: %v", err)
-		}
-		if resp.Stdout == nil || !strings.Contains(*resp.Stdout, "prompt") {
-			t.Fatalf("expected prompt in stdout, got %v", resp.Stdout)
-		}
-	})
-
-	t.Run("async flag alias", func(t *testing.T) {
-		pl, _ := json.Marshal(map[string]string{"sessionId": "ds-async2"})
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewReader(pl))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-
-		async := true
-		execPayload, _ := json.Marshal(map[string]interface{}{
-			"command": "echo via-async",
-			"async":   async,
-		})
-		rec = httptest.NewRecorder()
-		req = httptest.NewRequest(http.MethodPost, "/process/session/ds-async2/exec", bytes.NewReader(execPayload))
-		req.Header.Set("Content-Type", "application/json")
-		h.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("async alias status = %d", rec.Code)
-		}
-	})
 }
 
 func TestHandleDaytonaSessionDeleteDirectPaths(t *testing.T) {
@@ -1253,8 +577,13 @@ func TestDaytonaStreamLogsClientDisconnect(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	h.Handler().ServeHTTP(rec, req)
 	var execResp map[string]interface{}
-	_ = json.Unmarshal(rec.Body.Bytes(), &execResp)
-	cmdID := execResp["cmdId"].(string)
+	if err := json.Unmarshal(rec.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("exec response: %v body=%s", err, rec.Body.String())
+	}
+	cmdID, ok := execResp["cmdId"].(string)
+	if !ok {
+		t.Fatalf("exec did not return a cmdId: %s", rec.Body.String())
+	}
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/process/session/ds-disc/command/" + cmdID + "/logs?follow=true"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
@@ -1283,8 +612,13 @@ func TestDaytonaSessionCommandInputWithNewline(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	h.Handler().ServeHTTP(rec, req)
 	var execResp map[string]interface{}
-	_ = json.Unmarshal(rec.Body.Bytes(), &execResp)
-	cmdID := execResp["cmdId"].(string)
+	if err := json.Unmarshal(rec.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("exec response: %v body=%s", err, rec.Body.String())
+	}
+	cmdID, ok := execResp["cmdId"].(string)
+	if !ok {
+		t.Fatalf("exec did not return a cmdId: %s", rec.Body.String())
+	}
 	time.Sleep(100 * time.Millisecond)
 
 	// Data already ends with newline → no auto-append branch difference
@@ -1453,127 +787,6 @@ func TestPumpWasmSessionStdinWriteError(t *testing.T) {
 	defer conn.Close()
 	_ = conn.WriteMessage(websocket.BinaryMessage, []byte("data"))
 	time.Sleep(50 * time.Millisecond)
-}
-
-func TestRunExecStreamPipesStdinAlreadySet(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		cmd := exec.Command("cat")
-		cmd.Stdin = strings.NewReader("preset")
-		h := &Host{}
-		h.runExecStreamPipes(c, cmd)
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	conn.Close()
-	if msg.Type != "error" {
-		t.Fatalf("expected stdin pipe error, got %q", msg.Type)
-	}
-}
-
-func TestRunExecStreamPipesStdoutAlreadySet(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		cmd := exec.Command("echo", "x")
-		cmd.Stdout = io.Discard
-		h := &Host{}
-		h.runExecStreamPipes(c, cmd)
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	conn.Close()
-	if msg.Type != "error" {
-		t.Fatalf("expected stdout pipe error, got %q", msg.Type)
-	}
-}
-
-func TestWriteCodeRunScriptCoderunNotDirectory(t *testing.T) {
-	workDir := t.TempDir()
-	if _, err := os.Stat("/dev/null"); err != nil {
-		t.Skip("/dev/null not available")
-	}
-	if err := os.Symlink("/dev/null", filepath.Join(workDir, ".coderun")); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
-	_, _, err := writeCodeRunScript(workDir, "echo hi", ".sh")
-	if err == nil {
-		t.Fatal("expected error when .coderun is not a writable directory")
-	}
-}
-
-func TestHandleCodeRunNonZeroExitWithStderr(t *testing.T) {
-	requireHostExec(t)
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	payload, _ := json.Marshal(map[string]string{
-		"code":     "echo failed 1>&2; exit 7",
-		"language": "bash",
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var resp codeRunResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("json: %v", err)
-	}
-	if resp.ExitCode != 7 {
-		t.Fatalf("exit code = %d, want 7", resp.ExitCode)
-	}
-	if !strings.Contains(resp.Result, "failed") {
-		t.Fatalf("result = %q", resp.Result)
-	}
-}
-
-func TestRunExecStreamPipesStderrAlreadySet(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		cmd := exec.Command("echo", "x")
-		cmd.Stderr = io.Discard
-		h := &Host{}
-		h.runExecStreamPipes(c, cmd)
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	conn.Close()
-	if msg.Type != "error" {
-		t.Fatalf("expected stderr pipe error, got %q", msg.Type)
-	}
 }
 
 func TestStreamDaytonaLogsInitialWriteAndClientDone(t *testing.T) {

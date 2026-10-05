@@ -11,7 +11,11 @@ func TestMountSpecValidate(t *testing.T) {
 		{Type: MountTypeS3, Source: "bare-bucket-name", Target: "/data"},
 		{Type: MountTypeNFS, Source: "nfs.internal:/exports/work", Target: "/mnt/nfs"},
 		{Type: MountTypeSSHFS, Source: "ubuntu@build-host:/home/ubuntu", Target: "/home/dev"},
+		// Dashes inside an absolute remote path stay legal; a relative remote
+		// path is rejected (see mounts_sshfs_source_test.go).
+		{Type: MountTypeSSHFS, Source: "deploy@10.0.0.5:/data/-cache", Target: "/home/dev"},
 		{Type: MountTypeRclone, Source: "myremote:bucket/prefix", Target: "/workspace"},
+		{Type: MountTypeS3, Source: "s3://my-bucket/-odd-prefix", Target: "/workspace"},
 	}
 	for _, m := range good {
 		if err := m.Validate("/usr/local/bin/toolboxd"); err != nil {
@@ -37,6 +41,21 @@ func TestMountSpecValidate(t *testing.T) {
 		{"nfs malformed", MountSpec{Type: MountTypeNFS, Source: "no-colon-slash", Target: "/mnt"}},
 		{"sshfs malformed", MountSpec{Type: MountTypeSSHFS, Source: "no-at-sign", Target: "/mnt"}},
 		{"rclone local path", MountSpec{Type: MountTypeRclone, Source: "/var/data", Target: "/workspace"}},
+		// Argv-injection regression guards: each adapter passes source (or its
+		// bucket) positionally to a host-side tool, so a leading '-' would be
+		// parsed as an option. The sshfs case is the host-RCE shape: it carries
+		// '@' and ':' and passed the old check.
+		{"sshfs ProxyCommand injection", MountSpec{Type: MountTypeSSHFS, Source: "-oProxyCommand=touch /tmp/pwned @h:/x", Target: "/mnt"}},
+		{"sshfs leading dash after space", MountSpec{Type: MountTypeSSHFS, Source: "  -oProxyCommand=x @h:/x", Target: "/mnt"}},
+		{"sshfs dash host", MountSpec{Type: MountTypeSSHFS, Source: "u@-oProxyCommand=x:/x", Target: "/mnt"}},
+		{"sshfs empty user", MountSpec{Type: MountTypeSSHFS, Source: "@host:/x", Target: "/mnt"}},
+		{"sshfs empty host", MountSpec{Type: MountTypeSSHFS, Source: "u@:/x", Target: "/mnt"}},
+		{"sshfs whitespace in host", MountSpec{Type: MountTypeSSHFS, Source: "u@h -oX:/x", Target: "/mnt"}},
+		{"rclone flag source", MountSpec{Type: MountTypeRclone, Source: "--rc-no-auth", Target: "/mnt"}},
+		{"nfs flag source", MountSpec{Type: MountTypeNFS, Source: "-oremount:/x", Target: "/mnt"}},
+		{"s3 flag source", MountSpec{Type: MountTypeS3, Source: "--endpoint-url=http://x", Target: "/mnt"}},
+		{"s3 flag bucket after scheme", MountSpec{Type: MountTypeS3, Source: "s3://-oProxyCommand=x/p", Target: "/mnt"}},
+		{"control character in source", MountSpec{Type: MountTypeSSHFS, Source: "u@h:/x\n-oProxyCommand=x", Target: "/mnt"}},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,5 +166,72 @@ func TestRedactMounts(t *testing.T) {
 	}
 	if redacted[0].Source != "s3://my-bucket" {
 		t.Errorf("Source = %q, want s3://my-bucket", redacted[0].Source)
+	}
+}
+
+// source and options are stored and replicated in the clear; a credential
+// placed there (an rclone connection-string parameter, a mount-tool flag, an
+// NFS option, an invented key) would be replicated unsealed. Intake refuses
+// credential-shaped names and points at the credentials field.
+func TestMountSpecValidateRefusesCredentialsOutsideCredentials(t *testing.T) {
+	const toolbox = "/usr/local/bin/toolboxd"
+	rejected := []struct {
+		name string
+		m    MountSpec
+		want string
+	}{
+		{"s3 extra_args secret flag", MountSpec{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"extra_args": "--allow-delete --s3-secret-access-key=XYZ"}}, "options.extra_args flag"},
+		{"s3 extra_args token flag space form", MountSpec{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"extra_args": "--session-token ABC"}}, "options.extra_args flag"},
+		{"options key password", MountSpec{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"password": "x"}}, "options key"},
+		{"options key mixed case", MountSpec{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"Access-Key-Id": "x"}}, "options key"},
+		{"nfs opts credential entry", MountSpec{Type: MountTypeNFS, Source: "h:/e", Target: "/d", Options: map[string]string{"opts": "vers=4,password=x"}}, "options.opts entry"},
+		{"rclone backend connection string", MountSpec{Type: MountTypeRclone, Source: ":s3,access_key_id=A,secret_access_key=B:bucket", Target: "/d"}, "rclone source parameter"},
+		{"rclone remote override token", MountSpec{Type: MountTypeRclone, Source: "drive,token=abc:path", Target: "/d"}, "rclone source parameter"},
+		{"rclone remote override pass", MountSpec{Type: MountTypeRclone, Source: "sftp,pass=x:path", Target: "/d"}, "rclone source parameter"},
+		{"rclone key_file_pass", MountSpec{Type: MountTypeRclone, Source: "sftp,key_file_pass=x:path", Target: "/d"}, "rclone source parameter"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.m.Validate(toolbox); err != nil {
+				t.Fatalf("the shape is valid; only the placement rule must refuse it: %v", err)
+			}
+			err := tc.m.ValidateSecretsPlacement()
+			if err == nil {
+				t.Fatalf("accepted %+v", tc.m)
+			}
+			if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "put it in credentials") {
+				t.Fatalf("error %q must name %s and point at credentials", err, tc.want)
+			}
+		})
+	}
+	if err := (*MountSpec)(nil).ValidateSecretsPlacement(); err == nil {
+		t.Fatal("nil spec accepted")
+	}
+	accepted := []MountSpec{
+		{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"region": "us-east-1", "endpoint": "https://s3.example", "extra_args": "--sse aws:kms --sse-kms-key-id arn:aws:kms:us-east-1:1:key/abc --allow-delete --expected-bucket-owner 123"}},
+		{Type: MountTypeNFS, Source: "h:/e", Target: "/d", Options: map[string]string{"opts": "vers=4.1,sec=krb5,hard,timeo=600,nolock"}},
+		{Type: MountTypeRclone, Source: "myremote,region=eu-west-1:bucket/prefix", Target: "/d", Credentials: map[string]string{"rclone_conf": "[myremote]\ntype = s3\n"}},
+		{Type: MountTypeRclone, Source: ":s3,provider=AWS,env_auth=true:bucket", Target: "/d"},
+		{Type: MountTypeRclone, Source: "myremote:bucket", Target: "/d", Options: map[string]string{"vfs_cache_mode": "full"}},
+		{Type: MountTypeS3, Source: "bucket", Target: "/d", Credentials: map[string]string{"access_key_id": "A", "secret_access_key": "B", "session_token": "C"}},
+	}
+	for _, m := range accepted {
+		if err := m.Validate(toolbox); err != nil {
+			t.Errorf("Validate(%+v) = %v, want accepted", m, err)
+		}
+		if err := m.ValidateSecretsPlacement(); err != nil {
+			t.Errorf("ValidateSecretsPlacement(%+v) = %v, want accepted", m, err)
+		}
+	}
+	names := map[string]bool{
+		"--s3-secret-access-key": true, "SECRET-ACCESS-KEY": true, "session_token": true, "pass": true, "key_file_pass": true,
+		"client_secret": true, "sas_url": true, "private-key": true, "api_key": true, "customer-key": true,
+		"sec": false, "region": false, "extra_args": false, "opts": false, "vfs_cache_mode": false, "sse-kms-key-id": false,
+		"expected-bucket-owner": false, "passthrough": false, "bypass": false, "": false, "--": false,
+	}
+	for name, want := range names {
+		if got := isMountCredentialName(name); got != want {
+			t.Errorf("isMountCredentialName(%q) = %v, want %v", name, got, want)
+		}
 	}
 }

@@ -28,7 +28,7 @@ func TestNoopAdditionalMethods(t *testing.T) {
 	if n.SelfAPIURL() != "http://localhost:21212" {
 		t.Fatalf("SelfAPIURL() = %q", n.SelfAPIURL())
 	}
-	if _, _, err := n.OwnerOfName("demo"); !errors.Is(err, ErrUnknownSandbox) {
+	if _, _, err := n.OwnerOfName("", "demo"); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("OwnerOfName() error = %v, want ErrUnknownSandbox", err)
 	}
 	if n.SpecOf("demo") != nil {
@@ -230,6 +230,29 @@ func TestTLSStreamLayerDialAcceptAndClose(t *testing.T) {
 	}
 	if err := layer.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestTLSStreamLayerPublishesKernelAssignedPort(t *testing.T) {
+	cert := mustSelfSignedCert(t)
+	layer, err := newTLSStreamLayer(
+		"127.0.0.1:0",
+		&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0},
+		&tls.Config{Certificates: []tls.Certificate{cert}},
+		&tls.Config{InsecureSkipVerify: true},
+	)
+	if err != nil {
+		t.Fatalf("newTLSStreamLayer() error = %v", err)
+	}
+	defer layer.Close()
+
+	bound := layer.listener.Addr().(*net.TCPAddr)
+	advertised := layer.Addr().(*net.TCPAddr)
+	if advertised.Port == 0 || advertised.Port != bound.Port {
+		t.Fatalf("advertised port = %d, bound port = %d; want the same non-zero port", advertised.Port, bound.Port)
+	}
+	if got := advertised.IP.String(); got != "127.0.0.1" {
+		t.Fatalf("advertised IP = %q, want configured loopback IP", got)
 	}
 }
 

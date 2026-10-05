@@ -27,7 +27,7 @@ func TestCreate_RejectsBindPathsWithOptionInjection(t *testing.T) {
 		},
 	}
 	c := newCreateClient(t, d, true, nil)
-	getCreateBody := captureCreateBody(t, c)
+	getCreateBody := captureCreateBodyGetter(t, c)
 
 	bad := []mounts.ContainerBind{
 		{HostPath: "/tmp/host", ContainerPath: "/data:rshared"},

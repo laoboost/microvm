@@ -23,7 +23,7 @@ func TestCreate_SetsNoNewPrivilegesSecurityOpt(t *testing.T) {
 		},
 	}
 	c := newCreateClient(t, d, true, nil)
-	getCreateBody := captureCreateBody(t, c)
+	getCreateBody := captureCreateBodyGetter(t, c)
 
 	_, err := c.Create(context.Background(), models.CreateSandboxRequest{
 		Image:  "registry.example/app:v1",
@@ -64,7 +64,7 @@ func TestCreate_SetsUserFromOSUser(t *testing.T) {
 		},
 	}
 	c := newCreateClient(t, d, true, nil)
-	getCreateBody := captureCreateBody(t, c)
+	getCreateBody := captureCreateBodyGetter(t, c)
 
 	_, err := c.Create(context.Background(), models.CreateSandboxRequest{
 		Image:  "registry.example/app:v1",
@@ -95,7 +95,7 @@ func TestCreate_PrivilegedExemptsNoNewPrivileges(t *testing.T) {
 		},
 	}
 	c := newCreateClient(t, d, true, func(c *Client) { c.privileged = true })
-	getCreateBody := captureCreateBody(t, c)
+	getCreateBody := captureCreateBodyGetter(t, c)
 
 	_, err := c.Create(context.Background(), models.CreateSandboxRequest{
 		Image:  "registry.example/app:v1",
@@ -128,7 +128,7 @@ func TestCreate_OmitsUserWhenOSUserEmpty(t *testing.T) {
 		},
 	}
 	c := newCreateClient(t, d, true, nil)
-	getCreateBody := captureCreateBody(t, c)
+	getCreateBody := captureCreateBodyGetter(t, c)
 
 	_, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: "registry.example/app:v1"}, "sb", "tok", nil)
 	if err == nil {

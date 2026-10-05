@@ -226,7 +226,9 @@ source can never be parsed as a flag by the host-side mount tool.
 - Credentials never enter the sandbox.
 - Credentials are encrypted at rest with AES-256-GCM.
 - Read APIs return `has_credentials: true` but never the actual values.
-- Mount fields are passed to host-side mount tools (`mount`, `mount-s3`, `sshfs`, `rclone`) running as the daemon user, outside the sandbox isolation boundary. Sources are checked against a dash-prefix guard, S3 `extra_args` is filtered through a denylist of daemon-pinned flags, and the S3 endpoint must be an absolute `http(s)://` URL. The platform assumes PAT holders are host operators; the guards are hardening, not a tenant boundary.
+- Mount fields (`source`, NFS `options.opts`, S3 `options.extra_args`, etc.) are passed verbatim to host-side mount tools (`mount`, `mount-s3`, `sshfs`, `rclone`) running as the daemon user, outside the sandbox isolation boundary. The platform assumes PAT holders are host operators.
+- `source` and `options` are **not secrets**. Read APIs return them, and in cluster mode they are replicated in the clear into the Raft placement spec and the recovery store so another node can re-run the mount. Only `credentials` is sealed and never replicated unencrypted, so every credential belongs there. A create request is rejected when a name that means credential appears in `options` (a key, an `extra_args` flag such as `--s3-secret-access-key`, or an NFS `opts` entry) or as an rclone connection-string parameter in `source` (for example `:s3,secret_access_key=...:bucket`); the error names the field to use instead.
+- Mount inputs are additionally guarded before they reach a host tool: sources are checked against a dash-prefix guard (and refused if they contain control characters), S3 `extra_args` is filtered through a denylist of daemon-pinned flags, and the S3 endpoint must be an absolute `http(s)://` URL. These guards are hardening, not a tenant boundary.
 
 ## Operational Notes
 

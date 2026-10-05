@@ -41,16 +41,16 @@ func fsmReplicatedStateDigest(t *testing.T, fsm *placementFSM) string {
 		refs[id] = p.RecoveryRef
 	}
 	state := struct {
-		Placements map[string]Placement           `json:"placements"`
-		Refs       map[string]string              `json:"refs"`
-		NameIndex  map[string]string              `json:"name_index"`
-		OwnerIndex map[string]map[string]struct{} `json:"owner_index"`
-		Reserved   map[string]struct{}            `json:"reserved_index"`
+		Placements map[string]Placement `json:"placements"`
+		Refs       map[string]string    `json:"refs"`
+		NameIndex  map[string]string    `json:"name_index"`
+		OwnerIndex map[string][]string  `json:"owner_index"`
+		Reserved   map[string]struct{}  `json:"reserved_index"`
 	}{
 		Placements: fsm.placements,
 		Refs:       refs,
 		NameIndex:  fsm.nameIndex,
-		OwnerIndex: fsm.ownerIndex,
+		OwnerIndex: ownerIndexDigest(fsm.ownerIndex),
 		Reserved:   fsm.reservedIndex,
 	}
 	raw, err := json.Marshal(state)
@@ -72,12 +72,15 @@ func TestFSMRecoveryReadFailureConverges(t *testing.T) {
 
 	reserve := command{
 		Op: opReserve, SandboxID: "sb-recv", OwnerNodeID: "owner-a",
-		Spec:        &models.CreateSandboxRequest{Name: "recv", Image: "alpine"},
-		NowUnix:     100,
-		ExpiresUnix: 1000,
+		IncarnationID: "inc-recv",
+		Spec:          &models.CreateSandboxRequest{Name: "recv", Image: "alpine"},
+		NowUnix:       100,
+		ExpiresUnix:   1000,
 	}
 	promote := command{
 		Op: opPlace, SandboxID: "sb-recv", OwnerNodeID: "owner-a", NowUnix: 200,
+		IncarnationID:         "inc-recv",
+		ExpectedIncarnationID: "inc-recv",
 	}
 
 	for i, fsm := range []*placementFSM{broken, healthy} {

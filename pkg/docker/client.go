@@ -53,6 +53,7 @@ type Client struct {
 	toolboxBinaryPath  string
 	toolboxMountPath   string
 	toolboxPort        int
+	toolboxLoopback    bool
 	privileged         bool
 	resourceLimitsOff  bool
 	pidsLimit          int
@@ -87,7 +88,7 @@ type Client struct {
 	// artifacts (snapshots + Firecracker templates) from AOCR. nil disables it
 	// (anonymous pulls). Set via ConfigureAOCRPullAuth after construction. See
 	// aocr_pull_auth.go.
-	aocrPullAuth *aocrClusterPullAuth
+	aocrPullAuth *AOCRPullAuth
 }
 
 type imagePull struct {
@@ -128,6 +129,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxBinaryPath:  cfg.ToolboxBinaryPath,
 		toolboxMountPath:   cfg.ToolboxMountPath,
 		toolboxPort:        cfg.ToolboxPort,
+		toolboxLoopback:    cfg.DockerToolboxLoopback,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
 		pidsLimit:          cfg.SandboxPidsLimit,
@@ -594,6 +596,9 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	} else if c.network != "" && c.network != "bridge" {
 		hostConfig["NetworkMode"] = c.network
 	}
+	if !netnsAdopted {
+		c.publishToolboxLoopback(createRequest, hostConfig)
+	}
 
 	// Only set HostConfig.Runtime when we actually need to override the
 	// daemon's default. ResolveOCIRuntime returns "" for the "docker"
@@ -710,8 +715,13 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
+	toolboxAddr, err := c.toolboxAddr(inspect, containerIP)
+	if err != nil {
+		_ = c.removeContainer(ctx, created.ID, true)
+		return nil, err
+	}
 	toolboxWaitStart := time.Now()
-	toolboxSource, err := c.waitForToolboxReady(ctx, containerIP, readyListener)
+	toolboxSource, err := c.waitForToolboxReadyAt(ctx, toolboxAddr, readyListener)
 	toolboxWait := time.Since(toolboxWaitStart)
 	if timing := CreateTimingFrom(ctx); timing != nil {
 		timing.RecordDockerWaits(runtimeWait, toolboxWait, toolboxSource)
@@ -942,7 +952,11 @@ func (c *Client) PushAllowedPorts(ctx context.Context, containerIP, toolboxToken
 		return fmt.Errorf("marshal ports: %w", err)
 	}
 
-	target := fmt.Sprintf("http://%s:%d/admin/allowed-ports", containerIP, c.toolboxPort)
+	toolboxAddr, err := c.toolboxAddrForIP(ctx, containerIP)
+	if err != nil {
+		return fmt.Errorf("push allowed ports: %w", err)
+	}
+	target := "http://" + toolboxAddr + "/admin/allowed-ports"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -1351,7 +1365,11 @@ func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*Sand
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.waitForToolboxReady(ctx, containerIP, nil); err != nil {
+	toolboxAddr, err := c.toolboxAddr(inspect, containerIP)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := c.waitForToolboxReadyAt(ctx, toolboxAddr, nil); err != nil {
 		return nil, err
 	}
 	return &SandboxRuntime{
@@ -1383,13 +1401,19 @@ func (c *Client) waitForContainerRunning(ctx context.Context, containerRef strin
 }
 
 func (c *Client) waitForToolboxReady(ctx context.Context, containerIP string, listener *ReadyListener) (string, error) {
+	return c.waitForToolboxReadyAt(ctx, c.containerToolboxAddr(containerIP), listener)
+}
+
+// waitForToolboxReadyAt is waitForToolboxReady against an already-resolved
+// toolbox host:port (see toolboxAddr).
+func (c *Client) waitForToolboxReadyAt(ctx context.Context, toolboxAddr string, listener *ReadyListener) (string, error) {
 	if listener == nil {
 		// Push disabled (non-cluster) — plain health poll. Deliberately do not
 		// touch readySocketFallbackHealth: there was no socket to fall back
 		// from, and counting disabled-path creates here would make the metric
 		// useless for spotting real socket losses (old toolbox image, gVisor
 		// without host-uds) in cluster mode.
-		if err := c.pollToolboxHealth(ctx, containerIP); err != nil {
+		if err := c.pollToolboxHealthAt(ctx, toolboxAddr); err != nil {
 			return "", err
 		}
 		return "health", nil
@@ -1421,7 +1445,7 @@ func (c *Client) waitForToolboxReady(ctx context.Context, containerIP string, li
 		case <-raceCtx.Done():
 			return
 		}
-		err := c.pollToolboxHealth(raceCtx, containerIP)
+		err := c.pollToolboxHealthAt(raceCtx, toolboxAddr)
 		select {
 		case ch <- result{source: "health", err: err}:
 		case <-raceCtx.Done():
@@ -1460,7 +1484,11 @@ func (c *Client) waitForToolboxReady(ctx context.Context, containerIP string, li
 }
 
 func (c *Client) pollToolboxHealth(ctx context.Context, containerIP string) error {
-	target := fmt.Sprintf("http://%s:%d/health", containerIP, c.toolboxPort)
+	return c.pollToolboxHealthAt(ctx, c.containerToolboxAddr(containerIP))
+}
+
+func (c *Client) pollToolboxHealthAt(ctx context.Context, toolboxAddr string) error {
+	target := "http://" + toolboxAddr + "/health"
 	deadline := time.Now().Add(c.toolboxWaitTimeout)
 	sleep := c.readinessPollInterval()
 	for time.Now().Before(deadline) {
@@ -1535,7 +1563,17 @@ func (c *Client) doJSON(ctx context.Context, method, path string, query url.Valu
 	return json.NewDecoder(response.Body).Decode(responseBody)
 }
 
+// ErrClientNotConfigured is returned instead of dereferencing a nil transport.
+// Every caller already handles a request error; a nil dereference here does
+// not stay local, because several callers run on detached janitor goroutines
+// (built-image GC, image GC, the events stream) where a panic takes the whole
+// daemon down rather than failing one sweep.
+var ErrClientNotConfigured = errors.New("docker: client has no HTTP transport configured")
+
 func (c *Client) doRequest(ctx context.Context, method, path string, query url.Values, requestBody any, headers map[string]string) (*http.Response, error) {
+	if c == nil || c.httpClient == nil {
+		return nil, ErrClientNotConfigured
+	}
 	var body io.Reader
 	if requestBody != nil {
 		encoded, err := json.Marshal(requestBody)
@@ -1648,6 +1686,7 @@ type containerInspect struct {
 		Networks map[string]struct {
 			IPAddress string `json:"IPAddress"`
 		} `json:"Networks"`
+		Ports map[string][]portBinding `json:"Ports"`
 	} `json:"NetworkSettings"`
 	HostConfig struct {
 		Binds       []string `json:"Binds"`

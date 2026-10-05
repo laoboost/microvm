@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,7 +65,7 @@ type ClientOptions struct {
 	// guarantee stability across SDK upgrades.
 	APIVersion APIVersion
 	// Retry configures the policy for transient transport errors and retryable
-	// HTTP status codes (429, 502, 503, 504).
+	// HTTP status codes (421, 429, 502, 503, 504).
 	Retry *RetryConfig
 }
 
@@ -261,37 +262,141 @@ func (c *Client) BuildImageWithPush(ctx context.Context, dockerfile string, push
 }
 
 func (c *Client) List(ctx context.Context, tags map[string]string) ([]*Sandbox, error) {
+	return c.ListWithOptions(ctx, tags, false)
+}
+
+const maxClusterListPages = 100000
+
+// ListWithOptions lists sandboxes; includeEnv appends ?include_env=true.
+// In cluster mode the daemon pages via X-Cluster-List-Next-Page-Token; this
+// drains pages until the next token is empty. maxClusterListPages is a safety
+// cap (enough for 100k sandboxes at page size 1, or far more at default 100).
+// Partial coverage or an unready placement view is returned as an error rather
+// than a silent incomplete list.
+func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, includeEnv bool) ([]*Sandbox, error) {
+	return c.ListWithQuery(ctx, ListQuery{Tags: tags, IncludeEnv: includeEnv})
+}
+
+// ListWithQuery is ListWithOptions with every list filter.
+func (c *Client) ListWithQuery(ctx context.Context, q ListQuery) ([]*Sandbox, error) {
+	var items []*Sandbox
+	pageToken := ""
+	for page := 0; page < maxClusterListPages; page++ {
+		response, next, err := c.ListPageWithQuery(ctx, q, pageToken)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, response...)
+		pageToken = next
+		if pageToken == "" {
+			return items, nil
+		}
+	}
+	return nil, errors.New("incomplete cluster list: exceeded max pages")
+}
+
+// ListPageWithOptions fetches exactly one cluster list page. The returned
+// token is opaque and empty on the final page. This is the bounded-memory path
+// for fleet inventory callers; partial/unready coverage is always an error.
+func (c *Client) ListPageWithOptions(ctx context.Context, tags map[string]string, includeEnv bool, pageToken string) ([]*Sandbox, string, error) {
+	return c.ListPageWithQuery(ctx, ListQuery{Tags: tags, IncludeEnv: includeEnv}, pageToken)
+}
+
+// ListQuery is the full set of GET /sandboxes filters.
+type ListQuery struct {
+	Tags       map[string]string
+	IncludeEnv bool
+	// Name filters to the caller's sandbox with this name (?name=). Servers
+	// that predate name lookup ignore it; GetByName verifies the reply.
+	Name string
+	// Limit asks for at most this many rows per page (?limit=); 0 leaves the
+	// server default. Single-node servers that predate single-node paging
+	// return every row in one page, so callers that need a bound must also
+	// cap the reply themselves.
+	Limit int
+}
+
+// ListPageWithQuery is ListPageWithOptions with every list filter.
+func (c *Client) ListPageWithQuery(ctx context.Context, q ListQuery, pageToken string) ([]*Sandbox, string, error) {
+	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(q.Tags, q.IncludeEnv)
+	basePath = appendQueryParam(basePath, "name", strings.TrimSpace(q.Name))
+	if q.Limit > 0 {
+		basePath = appendQueryParam(basePath, "limit", strconv.Itoa(q.Limit))
+	}
+	path := appendQueryParam(basePath, "page_token", pageToken)
 	var response []models.Sandbox
-	path := c.versionPrefix + "/sandboxes" + buildTagQuery(tags)
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
-		return nil, err
+	hdrs, err := c.doJSONHeaders(ctx, http.MethodGet, path, nil, &response)
+	if err != nil {
+		return nil, "", err
+	}
+	if hdrs.Get("X-Cluster-List-Partial") == "true" || hdrs.Get("X-Cluster-List-Placement-Ready") == "false" {
+		return nil, "", errors.New("incomplete cluster list")
 	}
 	items := make([]*Sandbox, 0, len(response))
 	for _, item := range response {
 		items = append(items, c.wrap(item))
 	}
-	return items, nil
+	return items, strings.TrimSpace(hdrs.Get("X-Cluster-List-Next-Page-Token")), nil
 }
 
-// buildTagQuery renders the tag filter as the server's `?tag.<key>=<value>`
-// wire format. The `tag.` prefix is literal — parseTagFilter on the server
-// inspects the *decoded* query key — so only the user-supplied key and value
-// get percent-encoded. An empty or nil map returns "" so the URL is identical
-// to the pre-filter call (no stray trailing "?").
-func buildTagQuery(tags map[string]string) string {
-	if len(tags) == 0 {
-		return ""
+func appendQueryParam(path, key, value string) string {
+	if strings.TrimSpace(value) == "" {
+		return path
 	}
-	values := make(url.Values, len(tags))
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + url.QueryEscape(key) + "=" + url.QueryEscape(value)
+}
+
+func buildSandboxQuery(tags map[string]string, includeEnv bool) string {
+	values := make(url.Values)
 	for k, v := range tags {
 		values.Set("tag."+k, v)
+	}
+	if includeEnv {
+		values.Set("include_env", "true")
+	}
+	if len(values) == 0 {
+		return ""
 	}
 	return "?" + values.Encode()
 }
 
+// GetByName returns the caller's sandbox called name with one request, or an
+// error matching ErrNotFound. Names are unique per owner. The reply is only
+// trusted when it holds at most one sandbox carrying the requested name: a
+// server that predates ?name= ignores the filter and returns an ordinary list
+// page, and acting on its first row would target the wrong sandbox. That case
+// returns an error matching ErrNameLookupUnsupported.
+func (c *Client) GetByName(ctx context.Context, name string, includeEnv bool) (*Sandbox, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, errors.New("sandbox name is required")
+	}
+	items, _, err := c.ListPageWithQuery(ctx, ListQuery{Name: name, IncludeEnv: includeEnv}, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("sandbox %q: %w", name, ErrNotFound)
+	}
+	if len(items) > 1 || items[0].Name != name {
+		return nil, fmt.Errorf("%s does not support sandbox name lookup; use the sandbox ID or upgrade the server: %w", c.baseURL, ErrNameLookupUnsupported)
+	}
+	return items[0], nil
+}
+
 func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
+	return c.GetWithOptions(ctx, id, false)
+}
+
+// GetWithOptions fetches a sandbox; includeEnv appends ?include_env=true.
+func (c *Client) GetWithOptions(ctx context.Context, id string, includeEnv bool) (*Sandbox, error) {
 	var response models.Sandbox
-	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+resourcePath(id), nil, &response); err != nil {
+	path := c.versionPrefix + "/sandboxes/" + resourcePath(id) + buildSandboxQuery(nil, includeEnv)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
 		return nil, err
 	}
 	return c.wrap(response), nil
@@ -609,6 +714,75 @@ func (c *Client) UploadFile(ctx context.Context, id, targetPath string, data []b
 	return nil
 }
 
+// UploadFileStream uploads r to targetPath without holding the file in
+// memory: the multipart body is produced through an io.Pipe while the request
+// is sent, so memory stays at the copy buffer no matter the file size. Unlike
+// a []byte upload it can't be retried by the client (the reader is consumed),
+// which matches UploadFile, whose request is not retried either.
+func (c *Client) UploadFileStream(ctx context.Context, id, targetPath string, r io.Reader) error {
+	pr, pw := io.Pipe()
+	// Closing the read side unblocks the writer goroutine if the request
+	// fails before the body is fully read.
+	defer pr.Close()
+	writer := multipart.NewWriter(pw)
+	go func() {
+		pw.CloseWithError(func() error {
+			if err := writer.WriteField("path", targetPath); err != nil {
+				return err
+			}
+			part, err := writer.CreateFormFile("file", filepath.Base(targetPath))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(part, r); err != nil {
+				return err
+			}
+			return writer.Close()
+		}())
+	}()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/toolbox/files/upload", pr)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	c.addAuth(request)
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 400 {
+		return decodeError(response)
+	}
+	return nil
+}
+
+// DownloadFileStream opens targetPath for reading without buffering it. The
+// caller reads the returned body and must Close it; closing early (after the
+// first window of a large file, say) ends the transfer. The request retries
+// like any other GET until the response headers arrive.
+func (c *Client) DownloadFileStream(ctx context.Context, id, targetPath string) (io.ReadCloser, error) {
+	path := c.versionPrefix + "/sandboxes/" + resourcePath(id) + "/toolbox/files/download?path=" + url.QueryEscape(targetPath)
+	response, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.addAuth(request)
+		return request, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode >= 400 {
+		defer response.Body.Close()
+		return nil, decodeError(response)
+	}
+	return response.Body, nil
+}
+
 func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byte, error) {
 	encodedPath := url.QueryEscape(targetPath)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+c.versionPrefix+"/sandboxes/"+resourcePath(id)+"/toolbox/files/download?path="+encodedPath, nil)
@@ -729,6 +903,16 @@ func (s *Sandbox) UploadFile(ctx context.Context, targetPath string, data []byte
 	return s.client.UploadFile(ctx, s.ID, targetPath, data)
 }
 
+// UploadFileStream uploads r to targetPath without buffering it.
+func (s *Sandbox) UploadFileStream(ctx context.Context, targetPath string, r io.Reader) error {
+	return s.client.UploadFileStream(ctx, s.ID, targetPath, r)
+}
+
+// DownloadFileStream opens targetPath for reading; the caller must Close it.
+func (s *Sandbox) DownloadFileStream(ctx context.Context, targetPath string) (io.ReadCloser, error) {
+	return s.client.DownloadFileStream(ctx, s.ID, targetPath)
+}
+
 func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, error) {
 	return s.client.DownloadFile(ctx, s.ID, targetPath)
 }
@@ -790,12 +974,17 @@ func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle models.Lifecycl
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, responseBody any) error {
+	_, err := c.doJSONHeaders(ctx, method, path, requestBody, responseBody)
+	return err
+}
+
+func (c *Client) doJSONHeaders(ctx context.Context, method, path string, requestBody any, responseBody any) (http.Header, error) {
 	var encoded []byte
 	var err error
 	if requestBody != nil {
 		encoded, err = json.Marshal(requestBody)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -815,17 +1004,20 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 		return request, nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode >= 400 {
-		return decodeError(response)
+		return response.Header, decodeError(response)
 	}
 	if responseBody == nil || response.StatusCode == http.StatusNoContent {
-		return nil
+		return response.Header.Clone(), nil
 	}
-	return json.NewDecoder(response.Body).Decode(responseBody)
+	if err := json.NewDecoder(response.Body).Decode(responseBody); err != nil {
+		return response.Header, err
+	}
+	return response.Header.Clone(), nil
 }
 
 // isTransientTransportError loosely matches the Node.js SDK logic by checking
@@ -856,10 +1048,13 @@ func isTransientTransportError(err error) bool {
 	return false
 }
 
-// isRetryableStatusCode returns true for HTTP 429 and 502/503/504.
+// isRetryableStatusCode returns true for HTTP 421, 429 and 502/503/504. 421
+// Misdirected Request means an owner answered for a sandbox it doesn't hold
+// (connection coalescing or a stale route after failover). The server closes
+// the connection, so the retry reconnects and the ingress re-routes it.
 func isRetryableStatusCode(code int) bool {
 	switch code {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusMisdirectedRequest, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	}
 	return false
@@ -981,12 +1176,4 @@ func effectivePort(u *url.URL) string {
 
 func (c *Client) wrap(sandbox models.Sandbox) *Sandbox {
 	return &Sandbox{Sandbox: sandbox, client: c}
-}
-
-func decodeError(response *http.Response) error {
-	var payload models.ErrorResponse
-	if err := json.NewDecoder(response.Body).Decode(&payload); err == nil && payload.Error != "" {
-		return errors.New(payload.Error)
-	}
-	return fmt.Errorf("request failed with status %d", response.StatusCode)
 }

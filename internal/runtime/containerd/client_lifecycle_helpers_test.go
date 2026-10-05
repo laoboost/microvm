@@ -11,10 +11,11 @@ import (
 	"testing"
 	"time"
 
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/opencontainers/runtime-spec/specs-go"
+
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/models"
-	cntr "github.com/containerd/containerd"
-	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func TestClientNilSafe(t *testing.T) {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -12,10 +14,22 @@ import (
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
-const (
-	defaultAPIURL            = "http://127.0.0.1:21212"
-	authRequiredErrorMessage = "PAT token is required. Set PATToken or SB_PAT_TOKEN."
+// APIError is an HTTP error response from sandboxd: status, the server's
+// optional stable error code, and its message (Error() returns the message
+// unchanged). Use errors.As to read it.
+type APIError = apiclient.APIError
+
+// Sentinels for errors.Is. ErrNotFound matches a 404 (and a GetByName miss),
+// ErrConflict a 409, and ErrNameLookupUnsupported a server that ignored
+// `?name=`.
+var (
+	ErrNotFound              = apiclient.ErrNotFound
+	ErrConflict              = apiclient.ErrConflict
+	ErrNameLookupUnsupported = apiclient.ErrNameLookupUnsupported
 )
+
+const defaultAPIURL = "http://127.0.0.1:21212"
+const authRequiredErrorMessage = "PAT token is required. Set PATToken or SB_PAT_TOKEN."
 
 type Client struct {
 	apiURL   string
@@ -172,7 +186,35 @@ func (c *Client) CreateWithImage(ctx context.Context, image *Image, opts sdktype
 type ListOption func(*listOptions)
 
 type listOptions struct {
-	tags map[string]string
+	tags       map[string]string
+	includeEnv bool
+	name       string
+	limit      int
+}
+
+func (o listOptions) query() apiclient.ListQuery {
+	return apiclient.ListQuery{Tags: o.tags, IncludeEnv: o.includeEnv, Name: o.name, Limit: o.limit}
+}
+
+// WithLimit asks for at most n sandboxes per page (`?limit=<n>`); with
+// ListPage that bounds one call, and List still drains every page. The
+// server clamps n to its maximum (500). Servers that predate single-node
+// paging ignore it there and return every row, so a caller that needs a hard
+// bound must also cap the slice it gets back.
+func WithLimit(n int) ListOption {
+	return func(o *listOptions) {
+		if n > 0 {
+			o.limit = n
+		}
+	}
+}
+
+// WithName filters to the caller's sandbox with exactly this name
+// (`?name=<name>`); the result has zero or one entries. Names are unique per
+// owner. Servers that predate name lookup ignore the filter and return a
+// normal list, so prefer GetByName, which checks the reply.
+func WithName(name string) ListOption {
+	return func(o *listOptions) { o.name = strings.TrimSpace(name) }
 }
 
 // WithTags filters the result to sandboxes whose Tags map contains every
@@ -183,12 +225,18 @@ func WithTags(tags map[string]string) ListOption {
 	return func(o *listOptions) { o.tags = tags }
 }
 
+// WithIncludeEnv requests sandbox env vars on List/Get (`?include_env=true`).
+// Env is omitted by default; opt-in reads are audited server-side.
+func WithIncludeEnv() ListOption {
+	return func(o *listOptions) { o.includeEnv = true }
+}
+
 func (c *Client) List(ctx context.Context, opts ...ListOption) ([]*Sandbox, error) {
 	var cfg listOptions
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	items, err := c.inner.List(ctx, cfg.tags)
+	items, err := c.inner.ListWithQuery(ctx, cfg.query())
 	if err != nil {
 		return nil, err
 	}
@@ -199,8 +247,60 @@ func (c *Client) List(ctx context.Context, opts ...ListOption) ([]*Sandbox, erro
 	return wrapped, nil
 }
 
-func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
-	item, err := c.inner.Get(ctx, id)
+// ListPage fetches one bounded page and returns the server's opaque token for
+// the next page. Callers inventorying large fleets should loop until the token
+// is empty instead of materializing every sandbox in one slice.
+func (c *Client) ListPage(ctx context.Context, pageToken string, opts ...ListOption) ([]*Sandbox, string, error) {
+	var cfg listOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	items, next, err := c.inner.ListPageWithQuery(ctx, cfg.query(), pageToken)
+	if err != nil {
+		return nil, "", err
+	}
+	wrapped := make([]*Sandbox, 0, len(items))
+	for _, item := range items {
+		wrapped = append(wrapped, wrapSandbox(c, item))
+	}
+	return wrapped, next, nil
+}
+
+// GetOption customizes a Get call.
+type GetOption func(*getOptions)
+
+type getOptions struct {
+	includeEnv bool
+}
+
+// WithGetIncludeEnv requests env on Get (`?include_env=true`).
+func WithGetIncludeEnv() GetOption {
+	return func(o *getOptions) { o.includeEnv = true }
+}
+
+func (c *Client) Get(ctx context.Context, id string, opts ...GetOption) (*Sandbox, error) {
+	var cfg getOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	item, err := c.inner.GetWithOptions(ctx, id, cfg.includeEnv)
+	if err != nil {
+		return nil, err
+	}
+	return wrapSandbox(c, item), nil
+}
+
+// GetByName returns the caller's sandbox called name, with one request.
+// Names are unique per owner. A missing name returns an error matching
+// ErrNotFound. A server that predates name lookup ignores `?name=` and
+// returns an unfiltered list; GetByName detects that and returns an error
+// matching ErrNameLookupUnsupported instead of picking a row.
+func (c *Client) GetByName(ctx context.Context, name string, opts ...GetOption) (*Sandbox, error) {
+	var cfg getOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	item, err := c.inner.GetByName(ctx, name, cfg.includeEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -444,6 +544,30 @@ func (s *Sandbox) UploadFile(ctx context.Context, targetPath string, data []byte
 
 func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, error) {
 	return s.client.inner.DownloadFile(ctx, s.ID, targetPath)
+}
+
+// UploadFileStream uploads r to targetPath without holding the file in
+// memory; use it instead of UploadFile for large or unbounded inputs. The
+// request is not retried (the reader is consumed as it is sent).
+func (s *Sandbox) UploadFileStream(ctx context.Context, targetPath string, r io.Reader) error {
+	return s.client.inner.UploadFileStream(ctx, s.ID, targetPath, r)
+}
+
+// DownloadFileStream opens targetPath for reading without buffering it. The
+// caller must Close the returned body; closing early ends the transfer, so
+// reading only the head of a large file costs only the head.
+func (s *Sandbox) DownloadFileStream(ctx context.Context, targetPath string) (io.ReadCloser, error) {
+	return s.client.inner.DownloadFileStream(ctx, s.ID, targetPath)
+}
+
+// ToolboxRequest sends one raw request to this sandbox's toolbox (path such
+// as "/files" or "/process/execute") and returns the response for the caller
+// to read and close. Use it for toolbox endpoints without a typed method, or
+// to bound how much of a response you read. A 4xx/5xx returns an *APIError.
+// Reads (GET/HEAD) retry on transient statuses; requests with a body are
+// sent once.
+func (s *Sandbox) ToolboxRequest(ctx context.Context, method, path string, query url.Values, body []byte, contentType string) (*http.Response, error) {
+	return s.client.inner.ToolboxRequest(ctx, s.ID, method, path, query, body, contentType)
 }
 
 // ExposeOption customizes an ExposePort call. Build values with WithProtocol;

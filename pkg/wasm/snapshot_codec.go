@@ -46,6 +46,11 @@ const (
 	mediaWASIState = "application/vnd.aerolvm.wasm-snapshot.v2.wasi-state.cbor"
 	engineWazero   = "wazero"
 	wasiPreview1   = "preview1"
+
+	// A snapshot is fully materialized before engine restore. Bound hostile or
+	// corrupt zstd frames so an internal migration/AOCR artifact cannot request
+	// the decoder's 64 GiB default allocation and exhaust a worker.
+	maxSnapshotMemoryBytes = 1 << 30
 )
 
 // legacyGlobalsChecksumWarnOnce ensures the "legacy v1 artifact without a
@@ -283,7 +288,9 @@ func zstdDecompressLimit(src []byte, maxOut int64) ([]byte, error) {
 	if len(src) > maxSnapshotCompressedBytes {
 		return nil, fmt.Errorf("zstd: compressed input of %d bytes exceeds limit %d", len(src), maxSnapshotCompressedBytes)
 	}
-	dec, err := zstd.NewReader(bytes.NewReader(src))
+	// WithDecoderMaxMemory bounds the decoder's own working set (window and
+	// block history); the LimitReader below bounds total decoded output.
+	dec, err := zstd.NewReader(bytes.NewReader(src), zstd.WithDecoderMaxMemory(maxSnapshotMemoryBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -297,6 +304,14 @@ func zstdDecompressLimit(src []byte, maxOut int64) ([]byte, error) {
 		return nil, fmt.Errorf("zstd: decompressed output exceeds limit %d bytes", maxOut)
 	}
 	return buf.Bytes(), nil
+}
+
+// zstdDecompressMax decompresses src under a caller-supplied memory ceiling.
+// It applies the same two bounds as zstdDecompressLimit — a cap on the
+// compressed input and a cap on the decoded output — with the decoder's
+// working set additionally pinned to maxBytes.
+func zstdDecompressMax(src []byte, maxBytes uint64) ([]byte, error) {
+	return zstdDecompressLimit(src, int64(maxBytes))
 }
 
 func countGlobals(b []byte) int {

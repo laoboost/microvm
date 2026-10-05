@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -27,6 +28,16 @@ type Client struct {
 	l4TLSListen   string
 	l4TLSFallback string
 	httpClient    *http.Client
+
+	// gate/batch route admin requests into an open Batch (batch.go).
+	// batchMu serializes batches.
+	gate    sync.RWMutex
+	batch   *configEmulator
+	batchMu sync.Mutex
+
+	// adminMu serializes config mutations from every writer in the process
+	// (admin_lock.go). Lock order: adminMu before gate.
+	adminMu sync.Mutex
 }
 
 func New(cfg config.Config) *Client {
@@ -34,7 +45,10 @@ func New(cfg config.Config) *Client {
 	// bare "unix://" into "unix:" and skip the socket branch entirely.
 	rawAdmin := strings.TrimSpace(cfg.CaddyAdminURL)
 	baseURL := strings.TrimRight(rawAdmin, "/")
-	transport := http.RoundTripper(http.DefaultTransport)
+	// Keep-alives stay off for admin traffic: a pooled connection belongs to
+	// the admin server that accepted it, and the next config change shuts that
+	// server down (see newAdminTransport in admin_lock.go).
+	transport := http.RoundTripper(newAdminTransport())
 	// The admin endpoint is bound to a unix socket (see
 	// packaging/Caddyfile.template) so no local TCP port offers unauthenticated
 	// route/cert-key control. unix:// URLs dial the socket; http(s):// keeps
@@ -47,12 +61,14 @@ func New(cfg config.Config) *Client {
 			// first admin call instead of silently dialing a truncated path.
 			cfgErr := perr
 			transport = &http.Transport{
+				DisableKeepAlives: true,
 				DialContext: func(context.Context, string, string) (net.Conn, error) {
 					return nil, cfgErr
 				},
 			}
 		} else {
 			transport = &http.Transport{
+				DisableKeepAlives: true,
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 					var d net.Dialer
 					return d.DialContext(ctx, "unix", sockPath)
@@ -143,7 +159,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return err
 	}
@@ -621,14 +637,22 @@ func (c *Client) inFluxMatchPort(id string, port int) []map[string]any {
 // it doesn't exist yet (404), we insert it at index 0 of the server's routes
 // list with PUT so it sits ahead of the fallback "Sandbox not found" route.
 // Per-route admin calls keep this O(1) regardless of how many sandboxes exist.
+//
+// The PATCH and the PUT run under one admin lock, so no other in-process
+// writer can insert the same @id between them.
 func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[string]any) error {
 	body, err := json.Marshal(route)
 	if err != nil {
 		return fmt.Errorf("marshal caddy route: %w", err)
 	}
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.upsertRouteLocked(ctx, routeID, body)
+	})
+}
 
+func (c *Client) upsertRouteLocked(ctx context.Context, routeID string, body []byte) error {
 	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
+	status, detail, err := c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
 	if err != nil {
 		return err
 	}
@@ -636,21 +660,53 @@ func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[stri
 		return nil
 	}
 	if status != http.StatusNotFound {
-		return fmt.Errorf("patch caddy route failed: %d", status)
+		return caddyErr("patch caddy route", status, detail)
 	}
 
 	// Fresh route: insert at the front of the routes array. PUT to an array
 	// index is Caddy's "insert before" — existing entries shift right, so
 	// the catch-all fallback (if any) stays at the tail.
 	insertURL := fmt.Sprintf("%s/config/apps/http/servers/%s/routes/0", c.baseURL, c.serverID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
+	status, detail, err = c.sendJSONDetail(ctx, http.MethodPut, insertURL, body)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
-		return fmt.Errorf("insert caddy route failed: %d", status)
+		// Caddy rebuilds its @id index when it loads a config, and
+		// /id/<routeID> answers 404 while that rebuild is in flight even
+		// though the route IS in the config. The PATCH above then looks like
+		// "route absent", this PUT inserts a SECOND copy, and Caddy rejects
+		// the whole config with "duplicate ID ... found at ... and ...".
+		//
+		// The duplicate is proof the route exists, so the in-place update was
+		// the right operation all along — just issued a moment too early.
+		// Re-run it rather than failing the caller's start/expose_port.
+		//
+		// Measured live on single-node 2026-09-23: 2 of 8 stop→start cycles
+		// on a public sandbox failed this way, surfacing as a bare 400 from
+		// POST /v1/sandboxes/{id}/start.
+		if isDuplicateRouteID(detail) {
+			status, detail, err = c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
+			if err != nil {
+				return err
+			}
+			if status < 400 {
+				return nil
+			}
+		}
+		// routeID is named explicitly: this error reaches the API as a bare
+		// 400 on POST /v1/sandboxes/{id}/start, and without it there is
+		// nothing tying the failure to a sandbox.
+		return caddyErr("insert caddy route "+routeID, status, detail)
 	}
 	return nil
+}
+
+// isDuplicateRouteID reports whether Caddy rejected an insert because the @id
+// is already present. Matched on the message because the admin API returns a
+// plain {"error":"..."} with no code to switch on.
+func isDuplicateRouteID(detail string) bool {
+	return strings.Contains(detail, "duplicate ID")
 }
 
 // DeleteRouteByID is the zombie-GC entry point: the reconcile sweep finds an
@@ -676,7 +732,7 @@ func (c *Client) DeleteTCPServer(ctx context.Context, serverID string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("delete l4 server: %w", err)
 	}
@@ -698,7 +754,7 @@ func (c *Client) deleteRoute(ctx context.Context, routeID string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("delete caddy route: %w", err)
 	}
@@ -713,17 +769,54 @@ func (c *Client) deleteRoute(ctx context.Context, routeID string) error {
 }
 
 func (c *Client) sendJSON(ctx context.Context, method, target string, body []byte) (int, error) {
+	status, _, err := c.sendJSONDetail(ctx, method, target, body)
+	return status, err
+}
+
+// caddyErrDetailMax bounds how much of an admin-API error body we keep. Caddy
+// returns a short JSON object ({"error":"..."}), so this is generous; the cap
+// only exists so a pathological response cannot blow up a log line.
+const caddyErrDetailMax = 512
+
+// sendJSONDetail is sendJSON plus the response body on an error status.
+//
+// WHY it exists: Caddy's admin API explains itself ("unknown object ID 'x'",
+// "invalid traversal path", …) and this client used to throw that away, so
+// every failure surfaced as a bare "insert caddy route failed: 400". An
+// intermittent 400 on the restart path (live, 2026-09-23) could not be
+// diagnosed from the daemon logs at all — only by reading Caddy's own journal
+// on the box, which is not available after teardown.
+//
+// The body is read ONLY for status >= 400, so the success path keeps the same
+// "drain nothing, close" behaviour and cost.
+func (c *Client) sendJSONDetail(ctx context.Context, method, target string, body []byte) (int, string, error) {
 	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
-		return 0, fmt.Errorf("%s %s: %w", method, target, err)
+		return 0, "", fmt.Errorf("%s %s: %w", method, target, err)
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode, nil
+	if resp.StatusCode < 400 {
+		return resp.StatusCode, "", nil
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, caddyErrDetailMax))
+	if readErr != nil {
+		return resp.StatusCode, "", nil
+	}
+	return resp.StatusCode, strings.TrimSpace(string(raw)), nil
+}
+
+// caddyErr formats an admin-API failure with Caddy's own explanation when it
+// gave one, so the status code is never the only clue.
+func caddyErr(what string, status int, detail string) error {
+	if detail == "" {
+		return fmt.Errorf("%s failed: %d", what, status)
+	}
+	return fmt.Errorf("%s failed: %d: %s", what, status, detail)
 }
 
 func sandboxRouteID(id string) string {
@@ -864,7 +957,14 @@ func (c *Client) EnsureOnDemandTLS(ctx context.Context, askURL string, burst int
 	if burst <= 0 || interval <= 0 {
 		return errors.New("burst and interval must be > 0")
 	}
+	// The policy check and the append run under one admin lock so two
+	// callers cannot both see "no policy" and both append one.
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.ensureOnDemandTLSLocked(ctx, askURL)
+	})
+}
 
+func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) error {
 	onDemand := map[string]any{"ask": askURL}
 	onDemandBody, err := json.Marshal(onDemand)
 	if err != nil {
@@ -915,7 +1015,7 @@ func (c *Client) hasOnDemandPolicy(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return false, fmt.Errorf("get policies: %w", err)
 	}
@@ -967,7 +1067,15 @@ func (c *Client) EnsureLayer4(ctx context.Context, tlsListen, tlsFallback string
 	if tlsListen != "" && tlsFallback == "" {
 		return errors.New("tls fallback required when tls listen is set")
 	}
+	// One admin lock across the GETs and the write: the tls-mux update below
+	// POSTs the whole server back, so a route another goroutine inserted
+	// between the GET and the POST would be dropped.
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.ensureLayer4Locked(ctx, tlsListen, tlsFallback)
+	})
+}
 
+func (c *Client) ensureLayer4Locked(ctx context.Context, tlsListen, tlsFallback string) error {
 	// Ensure /config/apps/layer4 exists. We only PUT it if it isn't there;
 	// otherwise we'd clobber any servers added since last boot.
 	exists, err := c.pathExists(ctx, "/config/apps/layer4")
@@ -1224,7 +1332,7 @@ func (c *Client) DeleteTCPRoute(ctx context.Context, hostPort int) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("delete tcp server: %w", err)
 	}
@@ -1278,28 +1386,46 @@ func (c *Client) UpsertTLSSNIRoute(ctx context.Context, id, sniHost, containerIP
 	if err != nil {
 		return fmt.Errorf("marshal tls sni route: %w", err)
 	}
+	return c.upsertTLSMuxRoute(ctx, "tls sni route", routeID, body)
+}
 
-	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
-	if err != nil {
-		return err
-	}
-	if status < 400 {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("patch tls sni route failed: %d", status)
-	}
-
-	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("insert tls sni route failed: %d", status)
-	}
-	return nil
+// upsertTLSMuxRoute is upsertRoute for the tls-mux layer4 server: PATCH
+// /id/<routeID> in place, or insert at routes/0 (ahead of the fallback) when
+// it is absent. Both requests run under one admin lock, and a "duplicate ID"
+// answer to the insert means the route is there after all (see upsertRoute),
+// so it is PATCHed instead of failing the caller.
+func (c *Client) upsertTLSMuxRoute(ctx context.Context, what, routeID string, body []byte) error {
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
+		status, detail, err := c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
+		if err != nil {
+			return err
+		}
+		if status < 400 {
+			return nil
+		}
+		if status != http.StatusNotFound {
+			return caddyErr("patch "+what+" "+routeID, status, detail)
+		}
+		insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
+		status, detail, err = c.sendJSONDetail(ctx, http.MethodPut, insertURL, body)
+		if err != nil {
+			return err
+		}
+		if status < 400 {
+			return nil
+		}
+		if isDuplicateRouteID(detail) {
+			status, detail, err = c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
+			if err != nil {
+				return err
+			}
+			if status < 400 {
+				return nil
+			}
+		}
+		return caddyErr("insert "+what+" "+routeID, status, detail)
+	})
 }
 
 // UpsertWakeTLSSNIRoute publishes a TLS-SNI exposure in serverless mode. Caddy
@@ -1333,28 +1459,7 @@ func (c *Client) UpsertWakeTLSSNIRoute(ctx context.Context, id, sniHost, socketP
 	if err != nil {
 		return fmt.Errorf("marshal wake tls sni route: %w", err)
 	}
-
-	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
-	if err != nil {
-		return err
-	}
-	if status < 400 {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("patch wake tls sni route failed: %d", status)
-	}
-
-	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("insert wake tls sni route failed: %d", status)
-	}
-	return nil
+	return c.upsertTLSMuxRoute(ctx, "wake tls sni route", routeID, body)
 }
 
 // UpsertSNIPassthroughRoute publishes a layer4 SNI route that does not
@@ -1382,26 +1487,7 @@ func (c *Client) UpsertSNIPassthroughRoute(ctx context.Context, routeID, sniHost
 	if err != nil {
 		return fmt.Errorf("marshal sni passthrough route: %w", err)
 	}
-	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
-	if err != nil {
-		return err
-	}
-	if status < 400 {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("patch sni passthrough route failed: %d", status)
-	}
-	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("insert sni passthrough route failed: %d", status)
-	}
-	return nil
+	return c.upsertTLSMuxRoute(ctx, "sni passthrough route", routeID, body)
 }
 
 // DeleteTLSSNIRoute removes one SNI route by @id. 404 is treated as success
@@ -1439,7 +1525,7 @@ func (c *Client) Snapshot(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return snap, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return snap, fmt.Errorf("get caddy config: %w", err)
 	}
@@ -1468,7 +1554,7 @@ func (c *Client) Snapshot(ctx context.Context) (Snapshot, error) {
 
 	for _, server := range cfg.Apps.HTTP.Servers {
 		for _, route := range server.Routes {
-			if id, _ := route["@id"].(string); strings.HasPrefix(id, "sandbox-") {
+			if id, _ := route["@id"].(string); strings.HasPrefix(id, "sandbox-") && !IsStaticRouteID(id) {
 				snap.HTTPRouteIDs = append(snap.HTTPRouteIDs, id)
 			}
 		}
@@ -1479,7 +1565,7 @@ func (c *Client) Snapshot(ctx context.Context) (Snapshot, error) {
 		}
 		if serverID == tlsMuxServerID {
 			for _, route := range server.Routes {
-				if id, _ := route["@id"].(string); strings.HasPrefix(id, "sandbox-") {
+				if id, _ := route["@id"].(string); strings.HasPrefix(id, "sandbox-") && !IsStaticRouteID(id) {
 					snap.L4TLSRouteIDs = append(snap.L4TLSRouteIDs, id)
 				}
 			}
@@ -1496,7 +1582,7 @@ func (c *Client) pathExists(ctx context.Context, path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return false, fmt.Errorf("get %s: %w", path, err)
 	}
@@ -1521,7 +1607,7 @@ func (c *Client) getConfigMap(ctx context.Context, path string) (map[string]any,
 	if err != nil {
 		return nil, false, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, false, fmt.Errorf("get %s: %w", path, err)
 	}
