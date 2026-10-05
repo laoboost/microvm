@@ -161,7 +161,7 @@ func TestNFSBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NFS.Build: %v", err)
 	}
-want := []string{"mount", "-t", "nfs", "-o", "ro,nosuid,nodev", "--", "10.0.0.2:/exports/data", "/mnt/nfs"}
+	want := []string{"mount", "-t", "nfs", "-o", "ro,nosuid,nodev", "--", "10.0.0.2:/exports/data", "/mnt/nfs"}
 	if !reflect.DeepEqual(plan.Argv, want) {
 		t.Fatalf("NFS argv mismatch: got=%v want=%v", plan.Argv, want)
 	}
