@@ -150,16 +150,15 @@ func ValidateSandboxID(s string) error {
 // slowest single mount. On any failure already-mounted entries are torn down
 // before returning.
 func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []models.MountSpec) ([]ContainerBind, error) {
-	if err := ValidateSandboxID(sandboxID); err != nil {
-		return nil, err
-	}
 	if len(mounts) == 0 {
 		return nil, nil
 	}
 	// sandboxID is a path component for every host dir and bind below. Validate
 	// it here as well as at the create entry: the mount manager must be
 	// self-protecting so a '..' id can never escape rootDir (host-dir creation,
-	// bind source, or the rollback RemoveAll).
+	// bind source, or the rollback RemoveAll). Use the models validator — it is
+	// the stricter of the two (empty, length, and pattern) and the one callers
+	// assert on.
 	if err := models.ValidateSandboxID(sandboxID); err != nil {
 		return nil, fmt.Errorf("mount: %w", err)
 	}

@@ -1165,7 +1165,11 @@ func isNetrulesHostUnavailable(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "iptables") ||
 		strings.Contains(msg, "netlink netrules") ||
-		strings.Contains(msg, "create netrules manager")
+		strings.Contains(msg, "create netrules manager") ||
+		// The egress policy is IPv4-only and the daemon fails closed when the
+		// sandbox bridge still carries IPv6 — the same "this host cannot run
+		// the enabled path" category as a missing iptables, not a product bug.
+		strings.Contains(msg, "IPv6 is not disabled")
 }
 
 func TestCoverage95DaemonWiringGuards(t *testing.T) {

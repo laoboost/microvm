@@ -1,6 +1,7 @@
 package wasmmod
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -26,8 +27,8 @@ func TestResolvePathRejectsRelativeTraversal(t *testing.T) {
 			if err == nil {
 				t.Fatalf("resolvePath(%q) = %q, nil; want escape rejection", ref, got)
 			}
-			if !strings.Contains(err.Error(), "escapes modules dir") {
-				t.Fatalf("resolvePath(%q) error = %v; want escapes-modules-dir", ref, err)
+			if !errors.Is(err, ErrUnsafeModuleRef) {
+				t.Fatalf("resolvePath(%q) error = %v; want ErrUnsafeModuleRef", ref, err)
 			}
 		})
 	}
