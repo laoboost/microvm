@@ -19,7 +19,8 @@ func blockingResolverSetup(t *testing.T) (sink *placementFSM, started chan struc
 	if res := applyOp(t, src, command{
 		Op: opPlace, SandboxID: "sb-stall", OwnerNodeID: "A", OwnerAPIURL: "http://a",
 		Spec:      &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "stall-me", CPU: 1, MemoryMB: 512},
-		SecretRef: "cluster-secret://sandbox/sb-stall/v1", SecretVersion: 1,
+		SecretRef: "cluster-secret://sandbox/sb-stall/i/inc-stall/v1", SecretVersion: 1,
+		IncarnationID: "inc-stall", SecretSealGeneration: 1,
 	}); res != nil {
 		t.Fatalf("place: %v", res)
 	}

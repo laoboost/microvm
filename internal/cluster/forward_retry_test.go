@@ -2,12 +2,15 @@ package cluster
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 // countingTransport counts RoundTripper attempts (including failed dials) so
@@ -29,12 +32,35 @@ func (t *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 // attempt. A fake leader that503s once (leadership moved) and then accepts
 // must end with a successful forward.
 func TestForwardApplyToLeaderRetriesOn503ThenSucceeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
 	var requests atomic.Int32
+	var applied atomic.Pointer[command]
+	// The fake leader answers exactly like the internal apply server: the
+	// first round replies with the {"error","code"} envelope for ErrNotLeader
+	// (the retry signal), the second decodes the forwarded command — the
+	// handler refuses anything it cannot decode — and accepts it.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if requests.Add(1) == 1 {
-			http.Error(w, "not leader", http.StatusServiceUnavailable)
+		if r.URL.Path != InternalAPIPath {
+			http.NotFound(w, r)
 			return
 		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cmd, err := decodeCommand(body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if requests.Add(1) == 1 {
+			writeInternalError(w, http.StatusServiceUnavailable, ErrNotLeader)
+			return
+		}
+		applied.Store(&cmd)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
@@ -43,7 +69,26 @@ func TestForwardApplyToLeaderRetriesOn503ThenSucceeds(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 5*time.Second)
 
-	payload := []byte("cluster-test-forward-payload")
+	// Peer RPC never downgrades to the public API, so the leader's gossiped
+	// internal endpoint is what the forwarder posts to — point it at the fake
+	// leader rather than at the node's own internal server.
+	c.gossip.memberIndex.upsert(Member{
+		NodeID:      c.nodeID,
+		InternalURL: srv.URL,
+		APIURL:      srv.URL,
+		Alive:       true,
+		Role:        config.NodeRoleServer,
+	})
+
+	payload, err := encodeCommand(command{
+		Op:            opPlace,
+		SandboxID:     "sb-retry",
+		OwnerNodeID:   c.nodeID,
+		IncarnationID: "inc-retry",
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := c.forwardApplyToLeader(ctx, payload); err != nil {
@@ -51,6 +96,10 @@ func TestForwardApplyToLeaderRetriesOn503ThenSucceeds(t *testing.T) {
 	}
 	if got := requests.Load(); got != 2 {
 		t.Fatalf("leader saw %d requests, want 2 (one 503 + one success)", got)
+	}
+	got := applied.Load()
+	if got == nil || got.SandboxID != "sb-retry" || got.OwnerNodeID != c.nodeID {
+		t.Fatalf("forwarded command = %+v, want the encoded opPlace for sb-retry", got)
 	}
 }
 

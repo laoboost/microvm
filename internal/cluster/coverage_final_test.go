@@ -414,17 +414,18 @@ func TestForwardRemoveMemberToLeaderInternalMock(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
-	// Both nodes are TLS-equipped and share one cert dir: internalClient must be
+	// Both nodes are TLS-equipped under a shared CA: internalClient must be
 	// installed by New (before the capacity-lease loop starts reading it), which
 	// is what the TLS path does — assigning follower.internalClient after New
 	// would race that loop. A mixed pair (TLS follower, plaintext leader) cannot
-	// complete a raft handshake, so the leader is TLS too.
-	tlsDir := writeTestClusterTLSDir(t, "ldr-rm-fwd")
-	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-rm-fwd", true, nil, tlsDir)
+	// complete a raft handshake, so the leader is TLS too. Each node needs its
+	// OWN leaf: New rejects a certificate whose identity is not the node id.
+	tlsDirs := writeTestClusterTLSDirs(t, "ldr-rm-fwd", "fol-rm-fwd")
+	leader, cleanupLeader := newTestClusterWithTLSDir(t, "ldr-rm-fwd", true, nil, tlsDirs["ldr-rm-fwd"])
 	defer cleanupLeader()
 	waitForLeader(t, leader, 10*time.Second)
 
-	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-rm-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, tlsDir)
+	follower, cleanupFollower := newTestClusterWithTLSDir(t, "fol-rm-fwd", false, []string{leader.gossip.ml.LocalNode().Address()}, tlsDirs["fol-rm-fwd"])
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 	// forwardRemoveMemberToLeader resolves the leader via the follower's own raft

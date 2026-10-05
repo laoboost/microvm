@@ -345,6 +345,11 @@ func TestPruneBuildCacheIsNoopWhenUnderLimit(t *testing.T) {
 // NAME, which meant every scenario except one literally called
 // "cluster-hetero" silently skipped them.
 func TestAllowDisruptiveIsDrivenByCapsNotName(t *testing.T) {
+	// The helper under test shells out to yq; without it every case would
+	// report "yq: command not found" as a behavioural failure.
+	if _, err := exec.LookPath("yq"); err != nil {
+		t.Skip("yq not installed")
+	}
 	run := func(t *testing.T, caps string, env map[string]string, noDisruptive bool) string {
 		t.Helper()
 		dir := t.TempDir()

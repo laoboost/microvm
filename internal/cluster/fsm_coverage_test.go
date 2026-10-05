@@ -972,22 +972,47 @@ func TestFSMPageScanAndPendingHelperEdges(t *testing.T) {
 func TestFSMRestoreFailStoreAndEmptySandboxID(t *testing.T) {
 	payload := fsmSnapshotPayload{
 		Version: 1,
-		Placements: map[string]Placement{
-			"":    {OwnerNodeID: "n"}, // key empty → SandboxID filled from key still empty skip? id from range key
-			"sb1": {SandboxID: "sb1", OwnerNodeID: "n", Spec: &models.CreateSandboxRequest{Image: "x"}},
-		},
-		Recovery: map[string]placementRecovery{
-			"sb1": {Spec: &models.CreateSandboxRequest{Image: "from-rec"}},
+		// A row with no sandbox id is dropped by the compact Rows format; the
+		// legacy Placements map has no key to reject it with.
+		Rows: []placementSnapshotRow{
+			{Placement: Placement{OwnerNodeID: "n"}},
+			{Placement: Placement{SandboxID: "sb1", OwnerNodeID: "n"}},
+			{
+				Placement: Placement{SandboxID: "sb2", OwnerNodeID: "n"},
+				Recovery:  placementRecovery{Spec: &models.CreateSandboxRequest{Image: "from-rec"}},
+			},
 		},
 	}
-	// Force store failure during Restore.
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(payload); err != nil {
 		t.Fatal(err)
 	}
+	// C6a: a local recovery-store Put failure is NOT a restore failure. The
+	// outcome would differ per replica, so Restore keeps the payload inline
+	// (in-memory recovery map) and restores the row like any other.
 	fsm := newPlacementFSMWithRecoveryStore(failPutRecoveryStore{})
-	if err := fsm.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err == nil {
-		t.Fatal("Restore should fail when recovery Put fails")
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatalf("Restore must fall back inline when recovery Put fails, got %v", err)
+	}
+	fsm.mu.RLock()
+	defer fsm.mu.RUnlock()
+	if _, ok := fsm.placements[""]; ok {
+		t.Fatal("restore kept a row with an empty sandbox id")
+	}
+	for _, id := range []string{"sb1", "sb2"} {
+		if _, ok := fsm.placements[id]; !ok {
+			t.Fatalf("restore dropped %s despite the inline fallback", id)
+		}
+	}
+	inline, ok := fsm.recovery["sb2"]
+	if !ok {
+		t.Fatal("failing recovery Put must keep the payload inline")
+	}
+	if inline.Spec == nil || inline.Spec.Image != "from-rec" {
+		t.Fatalf("inline recovery payload = %+v, want the snapshot spec", inline.Spec)
+	}
+	if ref := fsm.placements["sb2"].RecoveryRef; ref == "" {
+		t.Fatal("hot row lost its content-addressed RecoveryRef under the inline fallback")
 	}
 
 	// Decode failure (neither envelope nor legacy map).

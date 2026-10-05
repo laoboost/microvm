@@ -989,17 +989,51 @@ func TestFSMValidateHostPortLazyIndexRebuild(t *testing.T) {
 	}
 }
 
+// TestRemoveMemberRejectsLastVoter pins the removal guard ORDER introduced by
+// the security remediation: the self and leader guards now run BEFORE the
+// last-voter check, so retiring the sole node reports ErrSelfRemoval rather
+// than ErrLastVoter — and the last-voter check still refuses to strip the only
+// voting member in the one configuration that reaches it.
 func TestRemoveMemberRejectsLastVoter(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
 	c, cleanup := newTestCluster(t, "ldr-last-voter", true, nil)
 	defer cleanup()
+
+	// The last-voter backstop is now the LAST guard: the self and leader guards
+	// run first, so the only configuration in which it can fire is one with no
+	// known leader — i.e. the window between New() and raft's first election,
+	// where the sole voter of a single-voter configuration is being removed.
+	// Probe immediately, then again after leadership appears: before the
+	// election the last-voter check answers, afterwards the leader guard does.
+	var err error
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err = c.removeMemberLocal(context.Background(), c.nodeID, true, true)
+		if errors.Is(err, ErrLastVoter) {
+			break
+		}
+		if !errors.Is(err, ErrLeaderRemoval) {
+			t.Fatalf("removeMemberLocal(sole voter, allowSelf=true) = %v, want ErrLastVoter before the first election and ErrLeaderRemoval after", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never observed the no-leader window in which the last-voter check applies")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The refused removal must leave the single voter in the raft configuration.
+	if _, ok := c.configuredServer(c.nodeID); !ok {
+		t.Fatal("last voter disappeared from the raft configuration after refused removal")
+	}
+
 	waitForLeader(t, c, 10*time.Second)
 
-	err := c.RemoveMember(context.Background(), c.nodeID, true)
-	if !errors.Is(err, ErrLastVoter) {
-		t.Fatalf("RemoveMember(self) = %v, want ErrLastVoter", err)
+	// Operator path: asking the only node to retire itself is refused by the
+	// self guard, before the leader branch and before any raft read.
+	err = c.RemoveMember(context.Background(), c.nodeID, true)
+	if !errors.Is(err, ErrSelfRemoval) {
+		t.Fatalf("RemoveMember(self) = %v, want ErrSelfRemoval", err)
 	}
 }
 

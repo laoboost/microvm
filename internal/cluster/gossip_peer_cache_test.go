@@ -218,6 +218,11 @@ func TestRestartedSeedRejoinsAfterEviction(t *testing.T) {
 			ClusterCapacityGossipInterval: 500 * time.Millisecond,
 			ClusterTLSDir:                 seedTLS,
 			ClusterInternalListenAddr:     "127.0.0.1:0",
+			// This harness runs plaintext gossip (no fleet key). Voter
+			// auto-promotion is gated on encrypted gossip or this explicit
+			// operator opt-in, and the restarted seed re-entering the raft
+			// configuration as a Voter is exactly what the test asserts.
+			ClusterInsecureGossip: true,
 		}
 	}
 

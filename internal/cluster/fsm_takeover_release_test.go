@@ -24,18 +24,26 @@ func TestFSMReserveExpiredOverwriteReleasesHostClaims(t *testing.T) {
 		}
 	}
 
-	apply(command{Op: opReserve, SandboxID: "sb-take", OwnerNodeID: "owner-a", Spec: spec, NowUnix: 100, ExpiresUnix: 1000})
+	apply(command{
+		Op: opReserve, SandboxID: "sb-take", OwnerNodeID: "owner-a",
+		IncarnationID: "inc-take-a", Spec: spec, NowUnix: 100, ExpiresUnix: 1000,
+	})
 	apply(command{
 		Op: opAddExposedPort, SandboxID: "sb-take", Port: 8080,
 		Protocol: models.ExposedPortProtocolTCP, HostPort: 40000, NowUnix: 110,
+		ExpectedIncarnationID: "inc-take-a",
 	})
-	apply(command{Op: opAddCustomDomain, SandboxID: "sb-take", Hostname: "app.example.com", NowUnix: 120})
+	apply(command{
+		Op: opAddCustomDomain, SandboxID: "sb-take", Hostname: "app.example.com", NowUnix: 120,
+		ExpectedIncarnationID: "inc-take-a",
+	})
 
 	// The proposer authorized taking over the (expired) reservation for a
 	// different owner. Apply must release every claim the old row held.
 	apply(command{
 		Op: opReserve, SandboxID: "sb-take", OwnerNodeID: "owner-b", Spec: spec,
-		NowUnix: 200, ExpiresUnix: 2000, AllowExpiredOverwrite: true,
+		IncarnationID: "inc-take-b",
+		NowUnix:       200, ExpiresUnix: 2000, AllowExpiredOverwrite: true,
 	})
 
 	fsm.mu.RLock()

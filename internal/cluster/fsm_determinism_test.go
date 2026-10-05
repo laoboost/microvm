@@ -69,12 +69,14 @@ func TestFSMReserveExpiredOverwriteRequiresExplicitFlag(t *testing.T) {
 
 	reserveA := command{
 		Op: opReserve, SandboxID: "sb-det", OwnerNodeID: "owner-a",
-		Spec:        &models.CreateSandboxRequest{Name: "det", Image: "alpine"},
-		NowUnix:     now,
-		ExpiresUnix: expiredAt,
+		IncarnationID: "inc-det-a",
+		Spec:          &models.CreateSandboxRequest{Name: "det", Image: "alpine"},
+		NowUnix:       now,
+		ExpiresUnix:   expiredAt,
 	}
 	reserveBNoSteal := command{
 		Op: opReserve, SandboxID: "sb-det", OwnerNodeID: "owner-b",
+		IncarnationID:         "inc-det-b",
 		Spec:                  &models.CreateSandboxRequest{Name: "det", Image: "alpine"},
 		NowUnix:               now,
 		ExpiresUnix:           freshExpires,
@@ -82,6 +84,7 @@ func TestFSMReserveExpiredOverwriteRequiresExplicitFlag(t *testing.T) {
 	}
 	reserveBSteal := command{
 		Op: opReserve, SandboxID: "sb-det", OwnerNodeID: "owner-b",
+		IncarnationID:         "inc-det-b",
 		Spec:                  &models.CreateSandboxRequest{Name: "det", Image: "alpine"},
 		NowUnix:               now,
 		ExpiresUnix:           freshExpires,
@@ -180,8 +183,9 @@ func TestFSMApplyStoresOnlyCommandSuppliedTimes(t *testing.T) {
 
 	if got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-times", OwnerNodeID: "node-a",
-		Spec:    &models.CreateSandboxRequest{Name: "times", Image: "alpine"},
-		NowUnix: 111,
+		IncarnationID: "inc-times",
+		Spec:          &models.CreateSandboxRequest{Name: "times", Image: "alpine"},
+		NowUnix:       111,
 	}); got != nil {
 		t.Fatalf("opPlace: %v", got)
 	}
@@ -195,7 +199,8 @@ func TestFSMApplyStoresOnlyCommandSuppliedTimes(t *testing.T) {
 
 	if got := applyOp(t, fsm, command{
 		Op: opUpsertSpec, SandboxID: "sb-times", NowUnix: 222,
-		Spec: &models.CreateSandboxRequest{Name: "times", Image: "alpine:3.20"},
+		ExpectedIncarnationID: "inc-times",
+		Spec:                  &models.CreateSandboxRequest{Name: "times", Image: "alpine:3.20"},
 	}); got != nil {
 		t.Fatalf("opUpsertSpec: %v", got)
 	}
@@ -206,7 +211,8 @@ func TestFSMApplyStoresOnlyCommandSuppliedTimes(t *testing.T) {
 
 	if got := applyOp(t, fsm, command{
 		Op: opReserve, SandboxID: "sb-rsv", OwnerNodeID: "node-a",
-		NowUnix: 333, ExpiresUnix: 999,
+		IncarnationID: "inc-rsv",
+		NowUnix:       333, ExpiresUnix: 999,
 	}); got != nil {
 		t.Fatalf("opReserve: %v", got)
 	}
@@ -218,7 +224,10 @@ func TestFSMApplyStoresOnlyCommandSuppliedTimes(t *testing.T) {
 		t.Fatalf("opReserve times = created %d updated %d, want 333/333 from command", r.CreatedUnix, r.UpdatedUnix)
 	}
 
-	if got := applyOp(t, fsm, command{Op: opReassign, SandboxID: "sb-times", OwnerNodeID: "", NowUnix: 444}); got != nil {
+	if got := applyOp(t, fsm, command{
+		Op: opReassign, SandboxID: "sb-times", OwnerNodeID: "", NowUnix: 444,
+		ExpectedIncarnationID: "inc-times",
+	}); got != nil {
 		t.Fatalf("opReassign orphan: %v", got)
 	}
 	p, _ = fsm.get("sb-times")

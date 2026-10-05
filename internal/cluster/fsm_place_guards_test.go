@@ -98,11 +98,14 @@ func TestFSMOpPlaceWithFailingRecoveryStoreFallsBackToInlineAndAppliesAllOrNothi
 	}
 }
 
-// TestFSMOpPlaceRunsRecoveryPutBeforeIndexMutations pins the C6a ordering:
-// the fallible recovery Put happens BEFORE the name/owner indexes are
-// touched. At Put time the old name is still claimed and the new name is not
-// yet — so a Put failure can never leave a half-released index behind.
-func TestFSMOpPlaceRunsRecoveryPutBeforeIndexMutations(t *testing.T) {
+// TestFSMOpPlaceRecoversInlineWhenRecoveryPutFails pins C6a as it applies to
+// opPlace: the recovery Put is still attempted, and when it fails the apply
+// must not error or half-apply — the payload is kept inline and the placement
+// is stored like any other. The index ordering that used to matter (Put before
+// index mutation, so a failed Put could not leave a half-released index) is
+// subsumed: the invariant now is that the indexes end up fully consistent
+// with the applied command.
+func TestFSMOpPlaceRecoversInlineWhenRecoveryPutFails(t *testing.T) {
 	spy := newSpyRecoveryStore(nil)
 	fsm := newPlacementFSMWithRecoveryStore(spy)
 	spy.fsm = fsm
@@ -115,23 +118,24 @@ func TestFSMOpPlaceRunsRecoveryPutBeforeIndexMutations(t *testing.T) {
 		t.Fatalf("initial place: %v", got)
 	}
 
-	spy.nameAtPut = nil
+	spy.putErr = errors.New("forced put failure")
+	spy.putCalls = 0
 	if got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-order", OwnerNodeID: "node-a",
 		ExpectedIncarnationID: "inc-order",
 		Spec:                  &models.CreateSandboxRequest{Name: "new-name", Image: "alpine:2"},
 	}); got != nil {
-		t.Fatalf("re-place: %v", got)
+		t.Fatalf("re-place with failing recovery store = %v, want nil (inline fallback)", got)
 	}
 
 	if spy.putCalls == 0 {
 		t.Fatal("recovery Put was never invoked")
 	}
-	if owner, ok := spy.nameAtPut["new-name"]; ok {
-		t.Fatalf("name index already claimed new-name (%q) at Put time; indexes must be mutated only after the Put", owner)
+	if owner, ok := fsm.sandboxIDByName("new-name"); !ok || owner != "sb-order" {
+		t.Fatalf("name index after fallback = new-name -> (%q, %v), want (sb-order, true)", owner, ok)
 	}
-	if owner, ok := spy.nameAtPut["old-name"]; !ok || owner != "sb-order" {
-		t.Fatalf("name index at Put time = old-name -> (%q, %v); old name must still be claimed until after the Put", owner, ok)
+	if owner, ok := fsm.sandboxIDByName("old-name"); ok {
+		t.Fatalf("old name still claimed after fallback: %q", owner)
 	}
 }
 
@@ -144,16 +148,18 @@ func TestFSMOpPlaceRejectsReservedRowHeldByDifferentOwner(t *testing.T) {
 	fsm := newPlacementFSM()
 	if got := applyOp(t, fsm, command{
 		Op: opReserve, SandboxID: "sb-claim", OwnerNodeID: "owner-a", OwnerAPIURL: "http://a",
-		Spec:        &models.CreateSandboxRequest{Name: "claim", Image: "alpine"},
-		ExpiresUnix: 4_000_000_000,
-		NowUnix:     1_700_000_000,
+		IncarnationID: "inc-claim",
+		Spec:          &models.CreateSandboxRequest{Name: "claim", Image: "alpine"},
+		ExpiresUnix:   4_000_000_000,
+		NowUnix:       1_700_000_000,
 	}); got != nil {
 		t.Fatalf("reserve by owner-a: %v", got)
 	}
 
 	got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-claim", OwnerNodeID: "owner-b", OwnerAPIURL: "http://b",
-		NowUnix: 1_700_000_001,
+		ExpectedIncarnationID: "inc-claim",
+		NowUnix:               1_700_000_001,
 	})
 	err, ok := got.(error)
 	if !ok || !errors.Is(err, ErrReservationConflict) {
@@ -166,7 +172,8 @@ func TestFSMOpPlaceRejectsReservedRowHeldByDifferentOwner(t *testing.T) {
 
 	if got := applyOp(t, fsm, command{
 		Op: opPlace, SandboxID: "sb-claim", OwnerNodeID: "owner-a", OwnerAPIURL: "http://a",
-		NowUnix: 1_700_000_002,
+		ExpectedIncarnationID: "inc-claim",
+		NowUnix:               1_700_000_002,
 	}); got != nil {
 		t.Fatalf("opPlace by owner-a (promotion) = %v, want nil", got)
 	}

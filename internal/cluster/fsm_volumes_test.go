@@ -230,6 +230,7 @@ func TestFSMReservationRemovalPathsReleaseVolumeAttachments(t *testing.T) {
 		if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{
 			Op: opReserve, SandboxID: "sb-1", OwnerNodeID: "node-b",
 			IncarnationID: "inc-new", ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+			AllowExpiredOverwrite: true,
 		})}); got != nil {
 			t.Fatalf("replace expired reservation returned %v", got)
 		}

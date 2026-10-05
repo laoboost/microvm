@@ -72,12 +72,15 @@ func TestFSMRecoveryReadFailureConverges(t *testing.T) {
 
 	reserve := command{
 		Op: opReserve, SandboxID: "sb-recv", OwnerNodeID: "owner-a",
-		Spec:        &models.CreateSandboxRequest{Name: "recv", Image: "alpine"},
-		NowUnix:     100,
-		ExpiresUnix: 1000,
+		IncarnationID: "inc-recv",
+		Spec:          &models.CreateSandboxRequest{Name: "recv", Image: "alpine"},
+		NowUnix:       100,
+		ExpiresUnix:   1000,
 	}
 	promote := command{
 		Op: opPlace, SandboxID: "sb-recv", OwnerNodeID: "owner-a", NowUnix: 200,
+		IncarnationID:         "inc-recv",
+		ExpectedIncarnationID: "inc-recv",
 	}
 
 	for i, fsm := range []*placementFSM{broken, healthy} {
