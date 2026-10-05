@@ -1577,7 +1577,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if req.Image == "" && strings.TrimSpace(req.ModuleRef) == "" {
 		return nil, errors.New("image is required")
 	}
-// Name rules are intake-only: a failover recreate replays whatever name
+	// Name rules are intake-only: a failover recreate replays whatever name
 	// the replicated spec holds, including legacy names that predate them.
 	if !isStoredSpecReplay(ctx) {
 		if err := models.ValidateSandboxName(req.Name); err != nil {
