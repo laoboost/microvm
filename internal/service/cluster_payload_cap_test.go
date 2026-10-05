@@ -12,10 +12,19 @@ import (
 )
 
 // oversizedClusterSpec builds a request whose non-secret recovery record
-// encodes well past the raft inline cap.
+// encodes well past the raft inline cap. The bloat rides on ContainerCommand
+// rather than Image: the image is gated by ValidateImageRef, which rejects a
+// 5000-char repository name before the cap check ever runs. It cannot ride on
+// Env either — RedactClusterSecrets nils Env out as secret-bearing, so it never
+// reaches the recovery record.
 func oversizedClusterSpec() models.CreateSandboxRequest {
+	cmd := make([]string, 64)
+	for i := range cmd {
+		cmd[i] = strings.Repeat("x", 256)
+	}
 	return models.CreateSandboxRequest{
-		Image: "registry.example/" + strings.Repeat("x", 5000),
+		Image:            "registry.example/oversized:latest",
+		ContainerCommand: cmd,
 	}
 }
 

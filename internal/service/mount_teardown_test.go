@@ -70,14 +70,17 @@ func newMountTeardownFixture(t *testing.T, id string) *mountTeardownFixture {
 	}}
 	now := time.Now().UTC()
 	if err := st.Create(context.Background(), &models.Sandbox{
-		ID:           id,
-		Image:        "alpine:3.20",
-		Status:       models.SandboxStatusStarted,
-		Runtime:      models.RuntimeDocker,
-		ContainerID:  "ctr-" + id,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:          id,
+		Image:       "alpine:3.20",
+		Status:      models.SandboxStatusStarted,
+		Runtime:     models.RuntimeDocker,
+		ContainerID: "ctr-" + id,
+		// Destroy retains the sandbox audit ACL against the local durable
+		// incarnation; upstream now refuses to do that without one.
+		AuditIncarnationID: "inc-" + id,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}
