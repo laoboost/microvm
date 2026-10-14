@@ -36,6 +36,12 @@ func (b *fcRuleBackend) Insert(table, chain string, _ int, spec ...string) error
 	b.rules[b.key(table, chain, spec)] = true
 	return nil
 }
+func (b *fcRuleBackend) Append(table, chain string, spec ...string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rules[b.key(table, chain, spec)] = true
+	return nil
+}
 func (b *fcRuleBackend) Delete(table, chain string, spec ...string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -128,4 +134,5 @@ type fcNoBootstrap struct{}
 
 func (fcNoBootstrap) Exists(string, string, ...string) (bool, error) { return false, nil }
 func (fcNoBootstrap) Insert(string, string, int, ...string) error    { return nil }
+func (fcNoBootstrap) Append(string, string, ...string) error         { return nil }
 func (fcNoBootstrap) Delete(string, string, ...string) error         { return nil }

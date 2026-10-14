@@ -213,8 +213,9 @@ func TestMixedListsAllowWins(t *testing.T) {
 	if be.hasChain(ChainAerolvmInput) {
 		t.Fatal("mixed lists are default-accept: no host-INPUT rules")
 	}
-	// Insert order is the rule order (each Insert lands at the top): the
-	// ACCEPT must be inserted after the DROP so it sits above it.
+	// memBackend.Insert models `iptables -I chain pos` faithfully: rules is
+	// chain order, top-first. The ACCEPT must sit ABOVE the DROP so the more
+	// specific allow wins (D4).
 	accept := memKey("filter", "DOCKER-USER", "-s", ip, "-d", allow[0], "-m", "comment", "--comment", egressPolicyComment, "-j", "ACCEPT")
 	drop := memKey("filter", "DOCKER-USER", "-s", ip, "-d", deny[0], "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP")
 	ai, di := -1, -1
@@ -226,8 +227,8 @@ func TestMixedListsAllowWins(t *testing.T) {
 			di = i
 		}
 	}
-	if ai < 0 || di < 0 || ai < di {
-		t.Fatalf("ACCEPT (inserted %d) must come after DROP (inserted %d) so it ends up above it: %v", ai, di, be.rules)
+	if ai < 0 || di < 0 || ai > di {
+		t.Fatalf("ACCEPT (at %d) must sit above DROP (at %d) so the allow wins: %v", ai, di, be.rules)
 	}
 	if err := mgr.ClearEgressPolicy(ip, allow, deny); err != nil {
 		t.Fatal(err)

@@ -1396,7 +1396,13 @@ class ExecRetryTests(unittest.TestCase):
         probe.close()
         client = MicroVM("http://127.0.0.1:%d" % port, "pat", config=_FAST_RETRY)
 
-        with unittest.mock.patch.object(urllib.request, "urlopen", wraps=urllib.request.urlopen) as opened:
+        real_open = urllib.request.OpenerDirector.open
+        wire = urllib.request.build_opener()
+        with unittest.mock.patch.object(
+            urllib.request.OpenerDirector,
+            "open",
+            side_effect=lambda req, *args, **kwargs: real_open(wire, req, *args, **kwargs),
+        ) as opened:
             with self.assertRaises(urllib.error.URLError) as ctx:
                 client.exec("sb-1", {"command": "true"})
 
@@ -1424,7 +1430,7 @@ class ExecRetryTests(unittest.TestCase):
             for kind, call, idempotent in requests:
                 with self.subTest(error=name, request=kind):
                     client = MicroVM("http://127.0.0.1:1", "pat", config=_FAST_RETRY)
-                    with unittest.mock.patch.object(urllib.request, "urlopen", side_effect=error) as opened:
+                    with unittest.mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=error) as opened:
                         with self.assertRaises(type(error)):
                             call(client)
                     retried = idempotent or exec_retries

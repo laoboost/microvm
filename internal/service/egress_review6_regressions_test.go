@@ -33,6 +33,11 @@ func (b orderedRules) Insert(table, chain string, pos int, spec ...string) error
 	b[k] = slices.Insert(b[k], at, slices.Clone(spec))
 	return nil
 }
+func (b orderedRules) Append(table, chain string, spec ...string) error {
+	k := table + chain
+	b[k] = append(b[k], slices.Clone(spec))
+	return nil
+}
 func (b orderedRules) Delete(table, chain string, spec ...string) error {
 	k := table + chain
 	at := slices.IndexFunc(b[k], func(s []string) bool { return slices.Equal(s, spec) })
