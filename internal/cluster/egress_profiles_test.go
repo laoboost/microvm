@@ -158,6 +158,9 @@ func TestFollowerEgressProfileWriteForwardsToLeader(t *testing.T) {
 	follower, cleanupFollower := newTestCluster(t, "eg-follower", false, []string{leader.gossip.ml.LocalNode().Address()})
 	defer cleanupFollower()
 	waitForVoter(t, leader, "eg-follower", 10*time.Second)
+	// The forward path answers ErrNotLeader until this node knows who the
+	// leader is, which lags the leader-side voter check.
+	waitForLeader(t, follower, 10*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
