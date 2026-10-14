@@ -1,7 +1,7 @@
 package service
 
 // Tests pinning and closing the mount lifecycle gaps from
-// docs/external-storage.md ("On Stop the host mount is torn down. On Start
+// docs/src/content/docs/external-storage.mdx ("On Stop the host mount is torn down. On Start
 // it's re-established."):
 //   - API stop teardown (existing behavior — pinned, not re-implemented)
 //   - die/stop/oom event teardown (Gap A)

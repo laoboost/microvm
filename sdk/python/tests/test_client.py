@@ -1,10 +1,17 @@
+import http.client
+import http.server
 import json
+import socket
+import threading
 import unittest
+import unittest.mock
+import urllib.error
 import urllib.parse
+import urllib.request
 
 from microvm import Image
 from microvm import client as client_module
-from microvm.client import MicroVM, MicroVMError, _to_api_create_options
+from microvm.client import MicroVM, MicroVMError, MicroVMHTTPError, _to_api_create_options
 
 
 class RecordingMicroVM(MicroVM):
@@ -12,9 +19,12 @@ class RecordingMicroVM(MicroVM):
         super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
         self.calls = []
         self.raw_calls = []
+        self.non_idempotent_calls = []
 
-    def _do_json(self, method, path, payload):  # type: ignore[override]
+    def _do_json(self, method, path, payload, *, idempotent=True):  # type: ignore[override]
         self.calls.append((method, path, payload))
+        if not idempotent:
+            self.non_idempotent_calls.append((method, path))
         if method == "POST" and path == "/v1/images/build":
             return {"image": "aerolvm-build/abc123:latest"}
         if method == "POST" and path == "/v1/sandboxes":
@@ -78,6 +88,50 @@ class RecordingMicroVM(MicroVM):
                 "gpu": payload.get("gpu", 0),
                 "memory_mb": payload.get("memory_mb", 0),
                 "disk_gb": payload.get("disk_gb", 0),
+            }
+        if path == "/v1/sandboxes/sb-1/network/learned":
+            return {
+                "mode": "learn",
+                "truncated": True,
+                "entries": [{"host": "pypi.org", "ports": [443], "first_seen": "a", "last_seen": "b", "hits": 2}],
+                "cidrs": None,
+                "suggested_allow_out": [],
+                "suggested_profile": {"allow_out": ["x.example"], "description": "d"},
+            }
+        if path.startswith("/v1/egress-profiles"):
+            if method == "DELETE":
+                return None
+            if method == "GET" and path.startswith("/v1/egress-profiles?"):
+                return {"profiles": [{"name": "python", "allow_out": ["pypi.org"], "generation": 1}], "next_cursor": "python"}
+            return {"name": "python", "allow_out": (payload or {}).get("allow_out", ["pypi.org"]), "description": "pip", "generation": 2, "created_at": "c", "updated_at": "u"}
+        if method == "PUT" and path == "/v1/sandboxes/sb-1/network/policy":
+            out = {
+                "network_block_all": payload.get("network_block_all", False),
+                "network_allow_out": payload.get("network_allow_out") or None,
+                "network_deny_out": payload.get("network_deny_out") or None,
+            }
+            if payload.get("network_allow_out"):
+                out["egress_status"] = "active"
+            if payload.get("network_egress_rules"):
+                out["network_egress_rules"] = payload["network_egress_rules"]
+            return out
+        if method == "POST" and path == "/v1/network/policy/check":
+            return {"allowed": True, "matched_rule": "*.github.com", "default_verdict": "deny", "outside_ceiling": "x.example"}
+        if method == "GET" and path.startswith("/v1/sandboxes/sb-1/audit"):
+            return {
+                "events": [
+                    {
+                        "time": "2026-10-06T10:00:00Z",
+                        "kind": "egress",
+                        "result": "failure",
+                        "reason": "host_not_allowed",
+                        "destination": "evil.example:443",
+                        "event_id": "ae-1",
+                    },
+                    {"time": "2026-10-06T10:00:01Z", "result": "gap", "kind": "gap", "dropped": 3},
+                ],
+                "coverage": {"answered": ["node-a"], "missing": None, "partial": False},
+                "next_cursor": "c2",
             }
         if method == "GET" and path == "/v1/sandboxes/sb-1/network/usage":
             return {
@@ -374,6 +428,39 @@ class ClientTests(unittest.TestCase):
         # network_deny_out is unset, so _compact() drops it from the body.
         self.assertNotIn("network_deny_out", payload)
 
+    def test_create_accepts_keyword_arguments(self):
+        cases = [
+            ("dict", lambda c: c.create({"image": "python:3.12", "memoryMB": 512})),
+            ("keywords camelCase", lambda c: c.create(image="python:3.12", memoryMB=512)),
+            ("keywords snake_case", lambda c: c.create(image="python:3.12", memory_mb=512)),
+            ("keyword overrides dict", lambda c: c.create({"image": "alpine", "memoryMB": 512}, image="python:3.12")),
+        ]
+        for name, call in cases:
+            with self.subTest(name):
+                client = RecordingMicroVM()
+                sandbox = call(client)
+                _, path, payload = client.calls[0]
+                self.assertEqual(path, "/v1/sandboxes")
+                self.assertEqual(payload["image"], "python:3.12")
+                self.assertEqual(payload["memory_mb"], 512)
+                self.assertEqual(sandbox.id, "sb-1")
+
+    def test_sandbox_exec_accepts_plain_command_string(self):
+        client = RecordingMicroVM()
+        sandbox = client.create(image="ubuntu:22.04")
+
+        sandbox.exec("echo hello")
+        sandbox.exec({"command": "echo hello", "workDir": "/tmp"})
+
+        exec_calls = [c for c in client.calls if c[1].endswith("/toolbox/process/execute")]
+        self.assertEqual(
+            exec_calls,
+            [
+                ("POST", "/v1/sandboxes/sb-1/toolbox/process/execute", {"command": "echo hello"}),
+                ("POST", "/v1/sandboxes/sb-1/toolbox/process/execute", {"command": "echo hello", "workdir": "/tmp"}),
+            ],
+        )
+
     def test_create_serializes_allow_public_traffic(self):
         client = RecordingMicroVM()
         client.create({"image": "ubuntu:22.04", "allowPublicTraffic": False})
@@ -391,6 +478,79 @@ class ClientTests(unittest.TestCase):
         client.create({"image": "ubuntu:22.04", "maskRequestHost": "localhost"})
         _, _, payload = client.calls[0]
         self.assertEqual(payload["mask_request_host"], "localhost")
+
+    def test_create_serializes_gpus(self):
+        cases = [
+            (
+                "camelCase deviceIDs",
+                {"vendor": "nvidia", "count": 2, "deviceIDs": ["0", "GPU-abc"]},
+                {"vendor": "nvidia", "count": 2, "device_ids": ["0", "GPU-abc"]},
+            ),
+            (
+                "snake_case device_ids",
+                {"vendor": "nvidia", "device_ids": ["1"]},
+                {"vendor": "nvidia", "device_ids": ["1"]},
+            ),
+            ("all GPUs", {"vendor": "nvidia", "count": -1}, {"vendor": "nvidia", "count": -1}),
+            ("vendor only", {"vendor": "amd"}, {"vendor": "amd"}),
+        ]
+        for name, gpus, want in cases:
+            with self.subTest(name):
+                client = RecordingMicroVM()
+                client.create({"image": "ubuntu:22.04", "gpus": gpus})
+                _, _, payload = client.calls[0]
+                self.assertEqual(payload["gpus"], want)
+
+        client = RecordingMicroVM()
+        client.create({"image": "ubuntu:22.04"})
+        self.assertNotIn("gpus", client.calls[0][2])
+
+    def test_create_serializes_template_id(self):
+        cases = [
+            ("camelCase", {"templateId": "tpl-py312"}),
+            ("snake_case", {"template_id": "tpl-py312"}),
+        ]
+        for name, fields in cases:
+            with self.subTest(name):
+                client = RecordingMicroVM()
+                client.create({"image": "python:3.12", "runtime": "firecracker", **fields})
+                _, _, payload = client.calls[0]
+                self.assertEqual(payload["template_id"], "tpl-py312")
+                self.assertNotIn("templateId", payload)
+
+        client = RecordingMicroVM()
+        client.create({"image": "python:3.12", "runtime": "firecracker"})
+        self.assertNotIn("template_id", client.calls[0][2])
+
+    def test_create_serializes_custom_domains(self):
+        cases = [
+            ("camelCase", lambda c: c.create({"image": "ubuntu:22.04", "customDomains": ["app.example.com"]})),
+            ("snake_case", lambda c: c.create({"image": "ubuntu:22.04", "custom_domains": ["app.example.com"]})),
+            ("keyword", lambda c: c.create(image="ubuntu:22.04", customDomains=["app.example.com"])),
+        ]
+        for name, call in cases:
+            with self.subTest(name):
+                client = RecordingMicroVM()
+                call(client)
+                _, _, payload = client.calls[0]
+                self.assertEqual(payload["custom_domains"], ["app.example.com"])
+                self.assertNotIn("customDomains", payload)
+
+        client = RecordingMicroVM()
+        client.create({"image": "ubuntu:22.04"})
+        self.assertNotIn("custom_domains", client.calls[0][2])
+
+    def test_only_exec_is_sent_as_non_idempotent(self):
+        client = RecordingMicroVM()
+        sandbox = client.create(image="ubuntu:22.04")
+        sandbox.exec("echo a")
+        sandbox.exec({"command": "echo b"})
+        sandbox.exec_command("echo c")
+        client.exec("sb-1", {"command": "echo d"})
+        client.health()
+
+        execute = ("POST", "/v1/sandboxes/sb-1/toolbox/process/execute")
+        self.assertEqual(client.non_idempotent_calls, [execute] * 4)
 
     def test_create_maps_request_and_response_shapes(self):
         client = RecordingMicroVM()
@@ -727,6 +887,173 @@ class ClientTests(unittest.TestCase):
             ),
         )
 
+    def test_check_network_policy(self):
+        client = RecordingMicroVM()
+
+        result = client.check_network_policy({"networkAllowOut": ["*.github.com"], "destination": "api.github.com"})
+
+        method, path, body = client.calls[0]
+        self.assertEqual((method, path), ("POST", "/v1/network/policy/check"))
+        self.assertEqual(body["network_allow_out"], ["*.github.com"])
+        self.assertEqual(body["destination"], "api.github.com")
+        self.assertEqual(
+            result,
+            {"allowed": True, "matchedRule": "*.github.com", "defaultVerdict": "deny", "outsideCeiling": "x.example"},
+        )
+
+    def test_sandbox_maps_egress_status(self):
+        from microvm.client import _from_api_sandbox
+
+        self.assertEqual(_from_api_sandbox({"id": "sb", "egress_status": "unavailable"})["egressStatus"], "unavailable")
+        self.assertNotIn("egressStatus", _from_api_sandbox({"id": "sb"}))
+
+    def test_get_audit_sends_filters_and_maps_page(self):
+        client = RecordingMicroVM()
+
+        page = client.get_audit("sb-1", {"kind": "egress", "limit": 50, "cursor": "c1", "incarnationID": "inc-1"})
+
+        self.assertEqual(
+            client.calls[0],
+            ("GET", "/v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", None),
+        )
+        self.assertEqual(page["events"][0]["reason"], "host_not_allowed")
+        self.assertEqual(page["events"][0]["eventID"], "ae-1")
+        self.assertEqual(page["events"][1]["dropped"], 3)
+        self.assertEqual(page["coverage"], {"answered": ["node-a"], "missing": [], "partial": False})
+        self.assertEqual(page["nextCursor"], "c2")
+
+    def test_sandbox_audit_without_options(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04"})
+
+        sandbox.audit()
+
+        self.assertEqual(client.calls[-1], ("GET", "/v1/sandboxes/sb-1/audit", None))
+
+    def test_set_network_policy_replaces_whole_policy(self):
+        client = RecordingMicroVM()
+
+        policy = client.set_network_policy("sb-1", {"networkAllowOut": ["pypi.org"]})
+
+        self.assertEqual(
+            client.calls[0],
+            ("PUT", "/v1/sandboxes/sb-1/network/policy", {"network_block_all": False, "network_allow_out": ["pypi.org"], "network_deny_out": [], "egress_profiles": []}),
+        )
+        self.assertEqual(
+            policy,
+            {"networkBlockAll": False, "networkAllowOut": ["pypi.org"], "networkDenyOut": [], "egressProfiles": [], "networkEgressMode": "enforce", "networkEgressRules": [], "effectiveHostnameCount": 0, "egressStatus": "active"},
+        )
+
+    def test_egress_profile_crud(self):
+        client = RecordingMicroVM()
+
+        profile = client.put_egress_profile("python", {"allowOut": ["pypi.org"], "description": "pip"})
+        self.assertEqual(client.calls[0], ("PUT", "/v1/egress-profiles/python", {"allow_out": ["pypi.org"], "description": "pip"}))
+        self.assertEqual(
+            profile,
+            {"name": "python", "allowOut": ["pypi.org"], "description": "pip", "generation": 2, "createdAt": "c", "updatedAt": "u"},
+        )
+        self.assertEqual(client.get_egress_profile("python")["generation"], 2)
+        page = client.list_egress_profiles({"cursor": "a", "limit": 10})
+        self.assertEqual(client.calls[2][1], "/v1/egress-profiles?cursor=a&limit=10")
+        self.assertEqual(page["nextCursor"], "python")
+        client.delete_egress_profile("python")
+        self.assertEqual(client.calls[3][:2], ("DELETE", "/v1/egress-profiles/python"))
+
+    def test_learn_mode(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "alpine", "networkEgressMode": "learn"})
+        self.assertEqual(client.calls[0][2]["network_egress_mode"], "learn")
+        sandbox.set_network_policy({"networkEgressMode": "learn"})
+        self.assertEqual(client.calls[-1][2]["network_egress_mode"], "learn")
+        learned = sandbox.learned()
+        self.assertEqual(learned["entries"][0], {"host": "pypi.org", "ports": [443], "firstSeen": "a", "lastSeen": "b", "hits": 2})
+        self.assertEqual(learned["cidrs"], [])
+        self.assertEqual(learned["suggestedProfile"], {"allowOut": ["x.example"], "description": "d"})
+        self.assertTrue(learned["truncated"])
+
+        from microvm.client import _from_api_sandbox
+
+        self.assertEqual(_from_api_sandbox({"id": "sb", "network_egress_mode": "learn"})["networkEgressMode"], "learn")
+
+    def test_egress_rules(self):
+        client = RecordingMicroVM()
+        rule = {"host": "api.github.com", "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": True}
+        sandbox = client.create({"image": "alpine", "networkAllowOut": ["api.github.com"], "networkEgressRules": [rule]})
+        self.assertEqual(client.calls[0][2]["network_egress_rules"], [rule])
+
+        policy = sandbox.set_network_policy({"networkAllowOut": ["api.github.com"], "networkEgressRules": [rule]})
+        self.assertEqual(client.calls[-1][2]["network_egress_rules"], [rule])
+        self.assertEqual(policy["networkEgressRules"], [rule])
+        self.assertEqual(sandbox.networkEgressRules, [rule])
+
+        policy = sandbox.set_network_policy({"networkAllowOut": ["api.github.com"]})
+        self.assertNotIn("network_egress_rules", client.calls[-1][2])
+        self.assertEqual(policy["networkEgressRules"], [])
+        self.assertNotIn("networkEgressRules", sandbox.to_dict())
+
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "network_egress_rules": [{"host": "example.com", "ports": [80], "paths": ["/ok/*"]}]})
+        self.assertEqual(data["networkEgressRules"], [{"host": "example.com", "ports": [80], "paths": ["/ok/*"]}])
+        self.assertNotIn("networkEgressRules", _from_api_sandbox({"id": "sb"}))
+
+    def test_egress_rule_inject(self):
+        client = RecordingMicroVM()
+        rule = {"host": "api.github.com", "paths": ["/repos/**"], "inspect": True, "inject": {"header": "Authorization", "secretRef": "env:GITHUB_TOKEN"}}
+        wire = {"host": "api.github.com", "paths": ["/repos/**"], "inspect": True, "inject": {"header": "Authorization", "secret_ref": "env:GITHUB_TOKEN"}}
+        sandbox = client.create({"image": "alpine", "env": {"GITHUB_TOKEN": "Bearer ghp_x"}, "networkAllowOut": ["api.github.com"], "networkEgressRules": [rule]})
+        self.assertEqual(client.calls[0][2]["network_egress_rules"], [wire])
+
+        # The recorder answers with the wire rules it was sent; the SDK maps
+        # them back. A snake_case secret_ref is accepted on the way in too.
+        policy = sandbox.set_network_policy({"networkAllowOut": ["api.github.com"], "networkEgressRules": [wire, {"host": "api.github.com"}]})
+        self.assertEqual(client.calls[-1][2]["network_egress_rules"], [wire, {"host": "api.github.com"}])
+        self.assertEqual(policy["networkEgressRules"], [rule, {"host": "api.github.com"}])
+        self.assertEqual(sandbox.networkEgressRules, [rule, {"host": "api.github.com"}])
+
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "network_egress_rules": [{**wire, "ports": [443]}]})
+        self.assertEqual(data["networkEgressRules"], [{**rule, "ports": [443]}])
+
+    def test_egress_rule_binaries(self):
+        client = RecordingMicroVM()
+        git = {"host": "github.com", "ports": [22], "binaries": ["/usr/bin/git"]}
+        pip = {"host": "pypi.org", "ports": [443], "binaries": ["/usr/local/bin/pip"]}
+        sandbox = client.create({"image": "alpine", "networkAllowOut": ["github.com:22", "pypi.org"], "networkEgressRules": [git, pip]})
+        self.assertEqual(client.calls[0][2]["network_egress_rules"], [git, pip])
+
+        # A rule without binaries goes out with no binaries key at all.
+        policy = sandbox.set_network_policy({"networkAllowOut": ["github.com:22", "pypi.org"], "networkEgressRules": [git, {"host": "pypi.org", "binaries": []}]})
+        self.assertEqual(client.calls[-1][2]["network_egress_rules"], [git, {"host": "pypi.org"}])
+        self.assertEqual(policy["networkEgressRules"], [git, {"host": "pypi.org"}])
+        self.assertEqual(sandbox.networkEgressRules, [git, {"host": "pypi.org"}])
+
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "network_egress_rules": [git, pip]})
+        self.assertEqual(data["networkEgressRules"], [git, pip])
+
+    def test_sandbox_maps_egress_profiles(self):
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "egress_profiles": ["python"], "egress_profiles_applied": [{"name": "python", "generation": 2}]})
+        self.assertEqual(data["egressProfiles"], ["python"])
+        self.assertEqual(data["egressProfilesApplied"], [{"name": "python", "generation": 2}])
+
+    def test_sandbox_set_network_policy_updates_fields(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04"})
+
+        sandbox.set_network_policy({"networkAllowOut": ["pypi.org"]})
+        self.assertEqual(sandbox.egressStatus, "active")
+        policy = sandbox.set_network_policy({"networkBlockAll": True})
+
+        self.assertTrue(policy["networkBlockAll"])
+        self.assertTrue(sandbox.networkBlockAll)
+        self.assertNotIn("egressStatus", sandbox.to_dict())
+
     def test_get_network_usage_maps_response_shape(self):
         client = RecordingMicroVM()
 
@@ -942,6 +1269,172 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(stdout_chunks, [], "oversized message must not reach onStdout")
         finally:
             client_module._load_websocket_module = original_loader
+
+
+_FAST_RETRY = {"retry": {"maxRetries": 3, "baseDelayMs": 1, "maxDelayMs": 1}}
+_EXEC_PATH = "/v1/sandboxes/sb-1/toolbox/process/execute"
+
+
+def _hang_up(handler, attempt):
+    # Read the request, then close the connection without a status line: the
+    # client cannot tell whether the command started.
+    handler.close_connection = True
+
+
+def _status_then_ok(status):
+    def respond(handler, attempt):
+        if attempt == 1:
+            handler.send_response(status)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            handler.wfile.write(b'{"error": "try again"}')
+            return
+        _ok(handler, attempt)
+
+    return respond
+
+
+def _hang_up_then_ok(handler, attempt):
+    if attempt == 1:
+        _hang_up(handler, attempt)
+        return
+    _ok(handler, attempt)
+
+
+def _ok(handler, attempt):
+    body = json.dumps({"id": "sb-1", "stdout": "ok", "exit_code": 0}).encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+class ExecRetryTests(unittest.TestCase):
+    """A re-sent exec runs the user's command again, so exec retries only
+    failures that prove the server never got the request (plus 429/503).
+    Every other endpoint keeps retrying ambiguous transport failures."""
+
+    def _serve(self, respond):
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _handle(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                hits.append((self.command, self.path, self.rfile.read(length)))
+                respond(self, len(hits))
+
+            do_GET = _handle
+            do_POST = _handle
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        # A short poll keeps shutdown() from adding half a second per test.
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config=_FAST_RETRY), hits
+
+    def test_exec_is_not_resent_when_server_hangs_up_after_reading(self):
+        client, hits = self._serve(_hang_up)
+
+        with self.assertRaises(http.client.RemoteDisconnected):
+            client.exec("sb-1", {"command": "sleep 40"})
+
+        self.assertEqual(hits, [("POST", _EXEC_PATH, b'{"command": "sleep 40"}')])
+
+    def test_sandbox_exec_is_not_resent_when_server_hangs_up(self):
+        client, hits = self._serve(_hang_up)
+        sandbox = client_module.Sandbox(client, {"id": "sb-1"})
+
+        for call in (lambda: sandbox.exec("sleep 40"), lambda: sandbox.exec_command("sleep 40")):
+            with self.assertRaises(http.client.RemoteDisconnected):
+                call()
+
+        self.assertEqual([h[1] for h in hits], [_EXEC_PATH, _EXEC_PATH])
+
+    def test_get_still_retries_a_hang_up(self):
+        client, hits = self._serve(_hang_up_then_ok)
+
+        sandbox = client.get("sb-1")
+
+        self.assertEqual(sandbox.id, "sb-1")
+        self.assertEqual([h[1] for h in hits], ["/v1/sandboxes/sb-1", "/v1/sandboxes/sb-1"])
+
+    def test_exec_retry_by_status(self):
+        cases = [
+            # The server turned the request away before doing work.
+            (429, True),
+            (503, True),
+            # Sent by a hop that already read the request.
+            (421, False),
+            (502, False),
+            (504, False),
+        ]
+        for status, retried in cases:
+            with self.subTest(status=status):
+                client, hits = self._serve(_status_then_ok(status))
+                if retried:
+                    result = client.exec("sb-1", {"command": "true"})
+                    self.assertEqual(result["stdout"], "ok")
+                    self.assertEqual(len(hits), 2)
+                else:
+                    with self.assertRaises(MicroVMHTTPError) as ctx:
+                        client.exec("sb-1", {"command": "true"})
+                    self.assertEqual(ctx.exception.status_code, status)
+                    self.assertEqual(len(hits), 1)
+
+    def test_exec_retries_connection_refused(self):
+        # Bind then close to get a port nothing listens on.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        client = MicroVM("http://127.0.0.1:%d" % port, "pat", config=_FAST_RETRY)
+
+        real_open = urllib.request.OpenerDirector.open
+        wire = urllib.request.build_opener()
+        with unittest.mock.patch.object(
+            urllib.request.OpenerDirector,
+            "open",
+            side_effect=lambda req, *args, **kwargs: real_open(wire, req, *args, **kwargs),
+        ) as opened:
+            with self.assertRaises(urllib.error.URLError) as ctx:
+                client.exec("sb-1", {"command": "true"})
+
+        self.assertIsInstance(ctx.exception.reason, ConnectionRefusedError)
+        self.assertEqual(opened.call_count, 4)
+
+    def test_transport_failures_by_request_kind(self):
+        # (name, error raised by the transport, whether exec may retry it).
+        cases = [
+            ("connection refused", urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), True),
+            ("dns failure", urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided")), True),
+            ("connect timeout", urllib.error.URLError(TimeoutError("timed out")), True),
+            ("reset while sending", urllib.error.URLError(ConnectionResetError(54, "Connection reset by peer")), False),
+            ("broken pipe", urllib.error.URLError(BrokenPipeError(32, "Broken pipe")), False),
+            ("closed without response", http.client.RemoteDisconnected("Remote end closed connection without response"), False),
+            ("read timeout", TimeoutError("timed out"), False),
+            ("reset while reading", ConnectionResetError(54, "Connection reset by peer"), False),
+            ("truncated body", http.client.IncompleteRead(b"", 10), False),
+        ]
+        requests = [
+            ("exec", lambda c: c.exec("sb-1", {"command": "true"}), False),
+            ("get", lambda c: c.get("sb-1"), True),
+        ]
+        for name, error, exec_retries in cases:
+            for kind, call, idempotent in requests:
+                with self.subTest(error=name, request=kind):
+                    client = MicroVM("http://127.0.0.1:1", "pat", config=_FAST_RETRY)
+                    with unittest.mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=error) as opened:
+                        with self.assertRaises(type(error)):
+                            call(client)
+                    retried = idempotent or exec_retries
+                    self.assertEqual(opened.call_count, 4 if retried else 1)
 
 
 class ListFilterTests(unittest.TestCase):

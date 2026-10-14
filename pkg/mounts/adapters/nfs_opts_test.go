@@ -40,7 +40,7 @@ func TestNFSBuild_RejectsDisallowedOptsTokens(t *testing.T) {
 	}
 }
 
-// ro/rw/nosuid/nodev/noexec are safe spellings (docs/external-storage.md
+// ro/rw/nosuid/nodev/noexec are safe spellings (docs/src/content/docs/external-storage.mdx
 // documents opts:"ro,vers=4", and operator NFSOptions reuse this function).
 // The allowlist used to reject them, so documented configs 400'd. They must be
 // accepted without weakening the forced nosuid,nodev suffix.

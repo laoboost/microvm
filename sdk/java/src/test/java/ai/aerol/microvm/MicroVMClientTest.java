@@ -1,13 +1,25 @@
 package ai.aerol.microvm;
 
+import java.io.EOFException;
 import java.io.IOException;
+import java.net.ConnectException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.NoRouteToHostException;
+import java.net.ServerSocket;
+import java.net.SocketException;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.net.http.HttpClient;
+import java.net.http.HttpConnectTimeoutException;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -15,6 +27,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -28,6 +41,19 @@ import ai.aerol.microvm.internal.JsonSupport;
 import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
+import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.EgressProfile;
+import ai.aerol.microvm.model.EgressProfileList;
+import ai.aerol.microvm.model.EgressProfileOptions;
+import ai.aerol.microvm.model.EgressInject;
+import ai.aerol.microvm.model.EgressRule;
+import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.NetworkLearned;
+import ai.aerol.microvm.model.NetworkPolicy;
+import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
+import ai.aerol.microvm.model.NetworkPolicyOptions;
+import ai.aerol.microvm.model.NetworkPolicyCheckResult;
+import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
@@ -40,12 +66,14 @@ import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.Failover;
+import ai.aerol.microvm.model.GpuOptions;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
 import ai.aerol.microvm.model.MountSpecRedacted;
 import ai.aerol.microvm.model.PlatformVolumeMount;
 import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.RegisterSnapshotOptions;
+import ai.aerol.microvm.model.RetryConfig;
 import ai.aerol.microvm.model.SandboxData;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
@@ -852,6 +880,340 @@ class MicroVMClientTest {
     }
 
     @Test
+    void checkNetworkPolicyPostsAndMaps() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/network/policy/check".equals(exchange.getRequestURI().getPath())) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("allowed", true, "matched_rule", "*.github.com", "default_verdict", "deny"));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + exchange.getRequestURI());
+        });
+        try {
+            NetworkPolicyCheckResult res = clientFor(server).checkNetworkPolicy(
+                new NetworkPolicyCheckOptions().setNetworkAllowOut(List.of("*.github.com")).setDestination("api.github.com"));
+            assertTrue(res.allowed);
+            assertEquals("*.github.com", res.matchedRule);
+            assertEquals("deny", res.defaultVerdict);
+            assertEquals(List.of("*.github.com"), body.get().get("network_allow_out"));
+            assertEquals("api.github.com", body.get().get("destination"));
+            assertTrue(!body.get().containsKey("network_block_all"), "unset fields are not sent");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void setNetworkPolicyPutsWholePolicyAndUpdatesSandbox() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("GET".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1".equals(path)) {
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_block_all", true));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("pypi.org"),
+                    "network_deny_out", List.of(),
+                    "egress_status", "active"));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            Sandbox sandbox = clientFor(server).get("sb-1");
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions().setNetworkAllowOut(List.of("pypi.org")));
+            assertEquals(false, body.get().get("network_block_all"));
+            assertEquals(List.of("pypi.org"), body.get().get("network_allow_out"));
+            assertEquals(List.of(), body.get().get("network_deny_out"));
+            assertEquals(List.of(), body.get().get("egress_profiles"));
+            assertEquals(List.of("pypi.org"), policy.networkAllowOut);
+            assertEquals("active", policy.egressStatus);
+            assertTrue(!sandbox.networkBlockAll);
+            assertEquals("active", sandbox.egressStatus);
+
+            clientFor(server).setNetworkPolicy("sb-1", null);
+            assertEquals(List.of(), body.get().get("network_allow_out"), "null options mean open egress");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressRulesOnCreateAndPolicy() throws Exception {
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> policyBody = new AtomicReference<>();
+        Map<String, Object> wireRule = mapOf("host", "api.github.com", "ports", List.of(443), "methods", List.of("GET"), "paths", List.of("/repos/acme/**"), "inspect", true);
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/sandboxes".equals(path)) {
+                createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                policyBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("api.github.com"),
+                    "network_deny_out", List.of(),
+                    "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            EgressRule rule = new EgressRule()
+                .setHost("api.github.com")
+                .setInspect(true)
+                .setMethods(List.of("GET"))
+                .setPaths(List.of("/repos/acme/**"));
+            Map<String, Object> sentRule = mapOf("host", "api.github.com", "methods", List.of("GET"), "paths", List.of("/repos/acme/**"), "inspect", true);
+            Sandbox sandbox = clientFor(server).create(new CreateOptions()
+                .setImage("alpine")
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(rule)));
+            assertEquals(List.of(sentRule), createBody.get().get("network_egress_rules"));
+            assertEquals(List.of(443), sandbox.networkEgressRules.get(0).ports);
+            assertTrue(sandbox.networkEgressRules.get(0).inspect);
+
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(new EgressRule().setHost("api.github.com"))));
+            assertEquals(List.of(mapOf("host", "api.github.com")), policyBody.get().get("network_egress_rules"));
+            assertEquals("/repos/acme/**", policy.networkEgressRules.get(0).paths.get(0));
+            assertEquals(policy.networkEgressRules, sandbox.networkEgressRules);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressRuleInjectGoesOutAsSecretRef() throws Exception {
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> policyBody = new AtomicReference<>();
+        Map<String, Object> wireInject = mapOf("header", "Authorization", "secret_ref", "env:GITHUB_TOKEN");
+        Map<String, Object> wireRule = mapOf("host", "api.github.com", "paths", List.of("/repos/**"), "inspect", true, "inject", wireInject);
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/sandboxes".equals(path)) {
+                createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                policyBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("api.github.com"),
+                    "network_deny_out", List.of(),
+                    "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            EgressRule rule = new EgressRule()
+                .setHost("api.github.com")
+                .setInspect(true)
+                .setPaths(List.of("/repos/**"))
+                .setInject(new EgressInject().setHeader("Authorization").setSecretRef("env:GITHUB_TOKEN"));
+            Sandbox sandbox = clientFor(server).create(new CreateOptions()
+                .setImage("alpine")
+                .setEnv(Map.of("GITHUB_TOKEN", "Bearer ghp_x"))
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(rule)));
+            assertEquals(List.of(wireRule), createBody.get().get("network_egress_rules"));
+            assertEquals("Authorization", sandbox.networkEgressRules.get(0).inject.header);
+            assertEquals("env:GITHUB_TOKEN", sandbox.networkEgressRules.get(0).inject.secretRef);
+
+            // A rule without inject sends no inject key.
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(rule, new EgressRule().setHost("api.github.com"))));
+            assertEquals(List.of(wireRule, mapOf("host", "api.github.com")), policyBody.get().get("network_egress_rules"));
+            assertEquals("env:GITHUB_TOKEN", policy.networkEgressRules.get(0).inject.secretRef);
+            assertEquals("env:GITHUB_TOKEN", sandbox.networkEgressRules.get(0).inject.secretRef);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressRuleBinariesGoOutAndComeBack() throws Exception {
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> policyBody = new AtomicReference<>();
+        Map<String, Object> wireGit = mapOf("host", "github.com", "ports", List.of(22), "binaries", List.of("/usr/bin/git"));
+        Map<String, Object> wirePip = mapOf("host", "pypi.org", "ports", List.of(443), "binaries", List.of("/usr/local/bin/pip"));
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/sandboxes".equals(path)) {
+                createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_egress_rules", List.of(wireGit, wirePip)));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                policyBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("github.com:22", "pypi.org"),
+                    "network_deny_out", List.of(),
+                    "network_egress_rules", List.of(wireGit, wirePip)));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            EgressRule git = new EgressRule()
+                .setHost("github.com")
+                .setPorts(List.of(22))
+                .setBinaries(List.of("/usr/bin/git"));
+            EgressRule pip = new EgressRule()
+                .setHost("pypi.org")
+                .setPorts(List.of(443))
+                .setBinaries(List.of("/usr/local/bin/pip"));
+            Sandbox sandbox = clientFor(server).create(new CreateOptions()
+                .setImage("alpine")
+                .setNetworkAllowOut(List.of("github.com:22", "pypi.org"))
+                .setNetworkEgressRules(List.of(git, pip)));
+            assertEquals(List.of(wireGit, wirePip), createBody.get().get("network_egress_rules"));
+            assertEquals(List.of("/usr/bin/git"), sandbox.networkEgressRules.get(0).binaries);
+            assertEquals(List.of(22), sandbox.networkEgressRules.get(0).ports);
+
+            // A rule without binaries sends no binaries key.
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+                .setNetworkAllowOut(List.of("github.com:22", "pypi.org"))
+                .setNetworkEgressRules(List.of(git, new EgressRule().setHost("pypi.org").setBinaries(null))));
+            assertEquals(List.of(wireGit, mapOf("host", "pypi.org")), policyBody.get().get("network_egress_rules"));
+            assertEquals(List.of("/usr/local/bin/pip"), policy.networkEgressRules.get(1).binaries);
+            assertEquals(List.of("/usr/local/bin/pip"), sandbox.networkEgressRules.get(1).binaries);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void networkLearnedMapsNulls() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            if ("/v1/sandboxes/sb-1/network/learned".equals(exchange.getRequestURI().getPath())) {
+                writeJson(exchange, 200, mapOf(
+                    "mode", "learn",
+                    "truncated", true,
+                    "entries", List.of(mapOf("host", "pypi.org", "ports", null, "hits", 2)),
+                    "cidrs", null,
+                    "suggested_allow_out", null,
+                    "suggested_profile", mapOf("allow_out", List.of("x.example"), "description", "d")));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestURI());
+        });
+        try {
+            NetworkLearned learned = clientFor(server).getNetworkLearned("sb-1");
+            assertEquals("learn", learned.mode);
+            assertTrue(learned.truncated);
+            assertEquals("pypi.org", learned.entries.get(0).host);
+            assertTrue(learned.entries.get(0).ports.isEmpty());
+            assertTrue(learned.cidrs.isEmpty());
+            assertTrue(learned.suggestedAllowOut.isEmpty());
+            assertEquals(List.of("x.example"), learned.suggestedProfile.allowOut);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressProfileCrudMapsWireShape() throws Exception {
+        AtomicReference<String> lastQuery = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("DELETE".equals(method) && "/v1/egress-profiles/python".equals(path)) {
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+            if ("GET".equals(method) && "/v1/egress-profiles".equals(path)) {
+                lastQuery.set(exchange.getRequestURI().getRawQuery());
+                writeJson(exchange, 200, mapOf("profiles", null, "next_cursor", "z"));
+                return;
+            }
+            if ("/v1/egress-profiles/python".equals(path)) {
+                if ("PUT".equals(method)) {
+                    body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                }
+                writeJson(exchange, 200, mapOf("name", "python", "allow_out", List.of("pypi.org"), "description", "pip", "generation", 2));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            EgressProfile profile = client.putEgressProfile("python", new EgressProfileOptions().setAllowOut(List.of("pypi.org")).setDescription("pip"));
+            assertEquals(2, profile.generation);
+            assertEquals(List.of("pypi.org"), body.get().get("allow_out"));
+            assertEquals("pip", body.get().get("description"));
+            assertEquals("pip", client.getEgressProfile("python").description);
+            EgressProfileList page = client.listEgressProfiles(new ListEgressProfilesOptions().setCursor("a").setLimit(5));
+            assertEquals("cursor=a&limit=5", lastQuery.get());
+            assertTrue(page.profiles.isEmpty());
+            assertEquals("z", page.nextCursor);
+            assertTrue(client.listEgressProfiles().profiles.isEmpty());
+            client.deleteEgressProfile("python");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void auditSendsFiltersAndMapsPage() throws Exception {
+        AtomicReference<String> query = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("GET".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/audit".equals(path)) {
+                query.set(exchange.getRequestURI().getRawQuery());
+                if (exchange.getRequestURI().getRawQuery() == null) {
+                    writeJson(exchange, 200, mapOf("events", null));
+                    return;
+                }
+                writeJson(exchange, 200, mapOf(
+                    "events", List.of(mapOf(
+                        "time", "2026-10-06T10:00:00Z",
+                        "kind", "egress",
+                        "result", "failure",
+                        "reason", "host_not_allowed",
+                        "destination", "evil.example:443",
+                        "event_id", "ae-1"
+                    )),
+                    "coverage", mapOf("answered", List.of("n1"), "missing", List.of(), "partial", false),
+                    "next_cursor", "c2"
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            AuditPage page = client.getAudit("sb-1", new AuditOptions().setKind("egress").setLimit(50).setCursor("c1").setIncarnationId("inc-1"));
+            assertEquals("kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", query.get());
+            assertEquals("host_not_allowed", page.events.get(0).reason);
+            assertEquals("ae-1", page.events.get(0).eventId);
+            assertEquals(List.of("n1"), page.coverage.answered);
+            assertEquals("c2", page.nextCursor);
+
+            AuditPage empty = client.getAudit("sb-1");
+            assertTrue(empty.events.isEmpty());
+            assertTrue(!empty.coverage.partial);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void execHealthAndUploadMapApiShapes() throws Exception {
         AtomicReference<String> multipartBody = new AtomicReference<>();
         AtomicReference<String> multipartContentType = new AtomicReference<>();
@@ -911,6 +1273,276 @@ class MicroVMClientTest {
             assertTrue(multipartBody.get().contains("name=\"path\""));
             assertTrue(multipartBody.get().contains("/workspace/file.txt"));
             assertTrue(multipartBody.get().contains("hello"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sandboxExecAcceptsPlainCommandString() throws Exception {
+        List<Map<String, Object>> execBodies = new java.util.ArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("POST".equals(method) && "/v1/sandboxes".equals(path)) {
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started"));
+                return;
+            }
+            if ("POST".equals(method) && "/v1/sandboxes/sb-1/toolbox/process/execute".equals(path)) {
+                execBodies.add(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("stdout", "hello\n", "stderr", "", "exit_code", 0, "duration_ms", 3));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            Sandbox sandbox = clientFor(server).create(new CreateOptions().setImage("alpine"));
+
+            ExecResult result = sandbox.exec("echo hello");
+
+            assertEquals("hello\n", result.stdout);
+            assertEquals(0, result.exitCode);
+            assertEquals(List.of(mapOf("command", "echo hello")), execBodies);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // Re-sending exec after the server may have received it runs the command
+    // again (the Rust SDK ran a 40 s command four times). The server reads the
+    // body and drops the connection unanswered, which is how a response
+    // timeout or a mid-run reset looks from the client.
+    @Test
+    void execIsNotResentOnceTheServerMayHaveReceivedIt() throws Exception {
+        AtomicInteger execHits = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("GET".equals(method) && "/v1/sandboxes/sb-1".equals(path)) {
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started"));
+                return;
+            }
+            if ("POST".equals(method) && "/v1/sandboxes/sb-1/toolbox/process/execute".equals(path)) {
+                execHits.incrementAndGet();
+                exchange.getRequestBody().readAllBytes();
+                // Returning without a response makes the exchange close the
+                // connection.
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            ScriptedHttpClient http = new ScriptedHttpClient();
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), http);
+
+            MicroVMException clientError = assertThrows(
+                MicroVMException.class,
+                () -> client.exec("sb-1", new ExecRequest().setCommand("sleep 40"))
+            );
+            assertTrue(clientError.getMessage().contains("not retried"), clientError.getMessage());
+            assertEquals(1, execHits.get());
+            assertEquals(1, http.sends.get());
+
+            Sandbox sandbox = client.get("sb-1");
+            assertThrows(MicroVMException.class, () -> sandbox.exec("sleep 40"));
+            assertEquals(2, execHits.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void execRetriesConnectionRefused() throws Exception {
+        ScriptedHttpClient http = new ScriptedHttpClient();
+        MicroVMClient client = clientFor("http://127.0.0.1:" + closedPort(), fastRetry(), http);
+
+        MicroVMException error = assertThrows(
+            MicroVMException.class,
+            () -> client.exec("sb-1", new ExecRequest().setCommand("true"))
+        );
+
+        assertEquals(4, http.sends.get());
+        assertTrue(error.getCause() instanceof ConnectException, String.valueOf(error.getCause()));
+    }
+
+    @Test
+    void execRetriesConnectTimeoutThenRunsOnce() throws Exception {
+        AtomicInteger execHits = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            execHits.incrementAndGet();
+            writeJson(exchange, 200, mapOf("stdout", "ok\n", "stderr", "", "exit_code", 0, "duration_ms", 1));
+        });
+
+        try {
+            ScriptedHttpClient http = new ScriptedHttpClient(new HttpConnectTimeoutException("HTTP connect timed out"));
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), http);
+
+            ExecResult result = client.exec("sb-1", new ExecRequest().setCommand("echo ok"));
+
+            assertEquals("ok\n", result.stdout);
+            assertEquals(2, http.sends.get());
+            assertEquals(1, execHits.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // 429 and 503 mean the daemon refused before running anything. 421, 502
+    // and 504 can come from an ingress whose upstream already ran the command.
+    @Test
+    void execRetriesOnlyStatusesThatProveTheCommandDidNotRun() throws Exception {
+        AtomicInteger execHits = new AtomicInteger();
+        AtomicInteger firstStatus = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            if (execHits.incrementAndGet() == 1) {
+                writeJson(exchange, firstStatus.get(), mapOf("error", "status " + firstStatus.get()));
+                return;
+            }
+            writeJson(exchange, 200, mapOf("stdout", "", "stderr", "", "exit_code", 0, "duration_ms", 1));
+        });
+
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+            Map<Integer, Integer> expectedHits = new LinkedHashMap<>();
+            expectedHits.put(429, 2);
+            expectedHits.put(503, 2);
+            expectedHits.put(421, 1);
+            expectedHits.put(502, 1);
+            expectedHits.put(504, 1);
+
+            for (Map.Entry<Integer, Integer> entry : expectedHits.entrySet()) {
+                execHits.set(0);
+                firstStatus.set(entry.getKey());
+                if (entry.getValue() == 1) {
+                    MicroVMException error = assertThrows(
+                        MicroVMException.class,
+                        () -> client.exec("sb-1", new ExecRequest().setCommand("true"))
+                    );
+                    assertEquals("status " + entry.getKey(), error.getMessage());
+                } else {
+                    assertEquals(0, client.exec("sb-1", new ExecRequest().setCommand("true")).exitCode);
+                }
+                assertEquals(entry.getValue().intValue(), execHits.get(), "status " + entry.getKey());
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void unsentOnlyRetryModeRetriesOnlyConnectPhaseFailures() {
+        Map<IOException, Boolean> cases = new LinkedHashMap<>();
+        cases.put(new ConnectException("Connection refused"), true);
+        cases.put(new HttpConnectTimeoutException("HTTP connect timed out"), true);
+        cases.put(new UnknownHostException("sandbox.invalid"), true);
+        cases.put(new NoRouteToHostException("No route to host"), true);
+        cases.put(new HttpTimeoutException("request timed out"), false);
+        cases.put(new SocketException("Connection reset"), false);
+        cases.put(new SocketException("Broken pipe"), false);
+        cases.put(new EOFException("EOF reached while reading"), false);
+        cases.put(new IOException("HTTP/1.1 header parser received no bytes"), false);
+
+        for (Map.Entry<IOException, Boolean> entry : cases.entrySet()) {
+            assertEquals(entry.getValue(), MicroVMClient.RetryMode.UNSENT_ONLY.retriesTransportFailure(entry.getKey()), entry.getKey().toString());
+            assertTrue(MicroVMClient.RetryMode.IDEMPOTENT.retriesTransportFailure(entry.getKey()), entry.getKey().toString());
+        }
+    }
+
+    // Scripted rather than a dropped socket: java.net.http re-sends a GET once
+    // by itself after an unanswered close, which would hide the SDK's retry.
+    @Test
+    void getStillRetriesAmbiguousTransportFailures() throws Exception {
+        AtomicInteger hits = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            hits.incrementAndGet();
+            writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started"));
+        });
+
+        try {
+            ScriptedHttpClient http = new ScriptedHttpClient(
+                new SocketException("Connection reset"),
+                new HttpTimeoutException("request timed out")
+            );
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry(), http);
+
+            Sandbox sandbox = client.get("sb-1");
+
+            assertEquals("sb-1", sandbox.id);
+            assertEquals(3, http.sends.get());
+            assertEquals(1, hits.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createSendsGpusAndTemplateIdInWireShape() throws Exception {
+        List<Map<String, Object>> bodies = new ArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            bodies.add(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started"));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            client.create(new CreateOptions()
+                .setImage("python:3.12")
+                .setRuntime("firecracker")
+                .setTemplateId("tpl-1")
+                .setGpus(new GpuOptions().setVendor("nvidia").setCount(2).setDeviceIds(List.of("0", "1"))));
+            client.create(new CreateOptions().setImage("alpine").setGpus(new GpuOptions().setVendor("amd")));
+            client.create(new CreateOptions().setImage("alpine"));
+
+            assertEquals("tpl-1", bodies.get(0).get("template_id"));
+            assertEquals(mapOf("vendor", "nvidia", "count", 2, "device_ids", List.of("0", "1")), bodies.get(0).get("gpus"));
+            assertEquals(mapOf("vendor", "amd"), bodies.get(1).get("gpus"));
+            assertFalse(bodies.get(1).containsKey("template_id"));
+            assertEquals(mapOf("image", "alpine"), bodies.get(2));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // createWithImage rebuilds the options around the built tag; every field
+    // it forgets to copy is silently dropped from the create.
+    @Test
+    void createWithImageForwardsEveryCreateField() throws Exception {
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("/v1/images/build".equals(path)) {
+                writeJson(exchange, 200, mapOf("image", "aerolvm-build/abc123:latest"));
+                return;
+            }
+            createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 200, mapOf("id", "sb-1", "image", "aerolvm-build/abc123:latest", "status", "started"));
+        });
+
+        try {
+            CreateOptions options = new CreateOptions()
+                .setEgressProfiles(List.of("pypi"))
+                .setNetworkEgressMode("enforce")
+                .setNetworkEgressRules(List.of(new EgressRule().setHost("api.github.com")))
+                .setPlatformVolumes(List.of(new PlatformVolumeMount().setName("data").setPath("/workspace")))
+                .setRuntime("firecracker")
+                .setTemplateId("tpl-1")
+                .setGpus(new GpuOptions().setVendor("nvidia"));
+            options.name = "web";
+            options.tags = Map.of("team", "a");
+            clientFor(server).createWithImage(Image.base("alpine"), options);
+
+            Map<String, Object> body = createBody.get();
+            assertEquals("aerolvm-build/abc123:latest", body.get("image"));
+            assertEquals("web", body.get("name"));
+            assertEquals(mapOf("team", "a"), body.get("tags"));
+            assertEquals(List.of("pypi"), body.get("egress_profiles"));
+            assertEquals("enforce", body.get("network_egress_mode"));
+            assertEquals(List.of(mapOf("host", "api.github.com")), body.get("network_egress_rules"));
+            assertEquals(List.of(mapOf("name", "data", "path", "/workspace")), body.get("platform_volumes"));
+            assertEquals("tpl-1", body.get("template_id"));
+            assertEquals(mapOf("vendor", "nvidia"), body.get("gpus"));
         } finally {
             server.stop(0);
         }
@@ -1663,6 +2295,27 @@ class MicroVMClientTest {
         );
     }
 
+    private static MicroVMClient clientFor(String apiUrl, RetryConfig retry, HttpClient httpClient) {
+        return new MicroVMClient(
+            new MicroVMConfig().setApiUrl(apiUrl).setPatToken("pat-token").setRetry(retry),
+            httpClient,
+            new FakeWebSocketConnector(),
+            name -> null
+        );
+    }
+
+    // Backoff timing is not under test; a 1 ms delay keeps retry tests fast.
+    private static RetryConfig fastRetry() {
+        return new RetryConfig().setMaxRetries(3).setBaseDelayMs(1).setMaxDelayMs(1);
+    }
+
+    // A loopback port nothing listens on, so a connect is refused at once.
+    private static int closedPort() throws IOException {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            return socket.getLocalPort();
+        }
+    }
+
     private static HttpServer startServer(ThrowingHandler handler) throws IOException {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
@@ -1723,6 +2376,91 @@ class MicroVMClientTest {
         @Override
         public void close() {
             exchange.close();
+        }
+    }
+
+    /**
+     * Counts the SDK's send attempts and fails the first ones with scripted
+     * transport errors before delegating to a real client, so a test can pin
+     * the retry decision for a failure a loopback socket can't produce on
+     * demand.
+     */
+    private static final class ScriptedHttpClient extends HttpClient {
+        private final HttpClient delegate = HttpClient.newHttpClient();
+        private final java.util.ArrayDeque<IOException> failures;
+        private final AtomicInteger sends = new AtomicInteger();
+
+        private ScriptedHttpClient(IOException... failures) {
+            this.failures = new java.util.ArrayDeque<>(List.of(failures));
+        }
+
+        @Override
+        public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) throws IOException, InterruptedException {
+            sends.incrementAndGet();
+            IOException failure = failures.poll();
+            if (failure != null) {
+                throw failure;
+            }
+            return delegate.send(request, handler);
+        }
+
+        @Override
+        public <T> java.util.concurrent.CompletableFuture<HttpResponse<T>> sendAsync(HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+            return delegate.sendAsync(request, handler);
+        }
+
+        @Override
+        public <T> java.util.concurrent.CompletableFuture<HttpResponse<T>> sendAsync(
+            HttpRequest request,
+            HttpResponse.BodyHandler<T> handler,
+            HttpResponse.PushPromiseHandler<T> pushPromiseHandler
+        ) {
+            return delegate.sendAsync(request, handler, pushPromiseHandler);
+        }
+
+        @Override
+        public java.util.Optional<java.net.CookieHandler> cookieHandler() {
+            return delegate.cookieHandler();
+        }
+
+        @Override
+        public java.util.Optional<java.time.Duration> connectTimeout() {
+            return delegate.connectTimeout();
+        }
+
+        @Override
+        public Redirect followRedirects() {
+            return delegate.followRedirects();
+        }
+
+        @Override
+        public java.util.Optional<java.net.ProxySelector> proxy() {
+            return delegate.proxy();
+        }
+
+        @Override
+        public javax.net.ssl.SSLContext sslContext() {
+            return delegate.sslContext();
+        }
+
+        @Override
+        public javax.net.ssl.SSLParameters sslParameters() {
+            return delegate.sslParameters();
+        }
+
+        @Override
+        public java.util.Optional<java.net.Authenticator> authenticator() {
+            return delegate.authenticator();
+        }
+
+        @Override
+        public Version version() {
+            return delegate.version();
+        }
+
+        @Override
+        public java.util.Optional<java.util.concurrent.Executor> executor() {
+            return delegate.executor();
         }
     }
 

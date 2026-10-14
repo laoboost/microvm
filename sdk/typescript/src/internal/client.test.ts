@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { createServer, type RequestListener } from "node:http";
+import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import { APIClient, SandboxResource } from "./client.js";
 import { Image } from "../Image.js";
-import type { Sandbox } from "../types.js";
+import type { CreateOptions, Sandbox } from "../types.js";
 
 test("internal client uses config object and auth header", async () => {
   let seenAuthorization = "";
@@ -1232,6 +1234,45 @@ test("internal client create forwards customDomains as snake_case", async () => 
   assert.deepEqual(body?.custom_domains, ["api.acme.com", "www.acme.com"]);
 });
 
+test("internal client create sends gpus and template_id in the wire shape", async () => {
+  const cases: Array<{ name: string; options: Partial<CreateOptions>; want: Record<string, unknown> }> = [
+    {
+      name: "nvidia with count and device ids",
+      options: { gpus: { vendor: "nvidia", count: 2, deviceIDs: ["0", "GPU-abc123"] } },
+      want: { gpus: { vendor: "nvidia", count: 2, device_ids: ["0", "GPU-abc123"] } },
+    },
+    {
+      name: "vendor only leaves count and device_ids out",
+      options: { gpus: { vendor: "amd" } },
+      want: { gpus: { vendor: "amd" } },
+    },
+    {
+      name: "firecracker template",
+      options: { runtime: "firecracker", templateId: "py311" },
+      want: { runtime: "firecracker", template_id: "py311" },
+    },
+    {
+      name: "neither set stays omitted",
+      options: {},
+      want: {},
+    },
+  ];
+
+  for (const tc of cases) {
+    let body: Record<string, unknown> | undefined;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      fetch: async (input, init) => {
+        body = (await new Request(input, init).json()) as Record<string, unknown>;
+        return jsonResponse(apiSandbox("sb-create-fields"));
+      },
+    });
+    await client.create({ image: "python:3.11", ...tc.options });
+    assert.deepEqual(body, { image: "python:3.11", ...tc.want }, tc.name);
+  }
+});
+
 test("internal client ingressDNS GETs and returns target verbatim", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({
@@ -1408,4 +1449,490 @@ test("internal client retries 421 Misdirected Request", async () => {
   const sandbox = await client.get("sb-421");
   assert.equal(calls, 2);
   assert.ok(sandbox instanceof SandboxResource);
+});
+
+// A re-sent exec runs the caller's command again (the Rust SDK once ran a 40 s
+// command 4 times), so exec must not retry once the request may have arrived.
+test("internal client exec is not re-sent after the server read it", async () => {
+  const seen: string[] = [];
+  await withServer((req) => {
+    seen.push(`${req.method} ${req.url}`);
+    req.resume();
+    // Read the whole request, then hang up without answering: the command
+    // may be running, and the client cannot know.
+    req.on("end", () => req.socket.destroy());
+  }, async (baseURL) => {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL,
+      patToken: "pat-token",
+      retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: (input, init) => {
+        attempts++;
+        return fetch(input, init);
+      },
+    });
+    await assert.rejects(client.exec("sb-exec", { command: "sleep 40" }), TypeError);
+    assert.equal(attempts, 1);
+  });
+  assert.deepEqual(seen, ["POST /v1/sandboxes/sb-exec/toolbox/process/execute"]);
+});
+
+test("internal client exec retries a refused connection", async () => {
+  // Grab a free port, then close it so the connect is refused.
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise((resolve) => server.close(resolve));
+
+  let attempts = 0;
+  const client = new APIClient({
+    baseURL: `http://127.0.0.1:${port}`,
+    patToken: "pat-token",
+    retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: (input, init) => {
+      attempts++;
+      return fetch(input, init);
+    },
+  });
+  await assert.rejects(client.exec("sb-exec", { command: "true" }), TypeError);
+  assert.equal(attempts, 3);
+});
+
+test("internal client get still retries a connection closed after the request was read", async () => {
+  let served = 0;
+  await withServer((req, res) => {
+    served++;
+    req.resume();
+    if (served === 1) {
+      req.on("end", () => req.socket.destroy());
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(apiSandbox("sb-get-retry")));
+  }, async (baseURL) => {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL,
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: (input, init) => {
+        attempts++;
+        return fetch(input, init);
+      },
+    });
+    const sandbox = await client.get("sb-get-retry");
+    assert.equal(sandbox.id, "sb-get-retry");
+    assert.equal(attempts, 2);
+  });
+  assert.equal(served, 2);
+});
+
+test("internal client exec retries only transport errors that prove the request was never sent", async () => {
+  const errno = (code: string, syscall?: string, message = code): NodeJS.ErrnoException =>
+    Object.assign(new Error(message), { code, syscall });
+  // Shape every error the way undici's fetch does: a TypeError whose cause
+  // carries the Node / undici code.
+  const fetchFailed = (cause: unknown) => new TypeError("fetch failed", { cause });
+  const cases: Array<{ name: string; error: unknown; retried: boolean }> = [
+    { name: "connection refused", error: fetchFailed(errno("ECONNREFUSED", "connect")), retried: true },
+    {
+      name: "connection refused on every address",
+      error: fetchFailed(Object.assign(
+        new AggregateError([errno("ECONNREFUSED", "connect"), errno("ECONNREFUSED", "connect")]),
+        { code: "ECONNREFUSED" },
+      )),
+      retried: true,
+    },
+    { name: "DNS lookup failed transiently", error: fetchFailed(errno("EAI_AGAIN", "getaddrinfo")), retried: true },
+    { name: "undici connect timeout", error: fetchFailed(errno("UND_ERR_CONNECT_TIMEOUT")), retried: true },
+    { name: "TCP connect timed out", error: fetchFailed(errno("ETIMEDOUT", "connect")), retried: true },
+    {
+      name: "TCP connect timed out on every address",
+      error: fetchFailed(Object.assign(
+        new AggregateError([errno("ETIMEDOUT", "connect"), errno("ETIMEDOUT", "connect")]),
+        { code: "ETIMEDOUT" },
+      )),
+      retried: true,
+    },
+    { name: "open socket timed out", error: fetchFailed(errno("ETIMEDOUT", "read")), retried: false },
+    { name: "ETIMEDOUT with no syscall", error: fetchFailed(errno("ETIMEDOUT")), retried: false },
+    { name: "headers timeout", error: fetchFailed(errno("UND_ERR_HEADERS_TIMEOUT")), retried: false },
+    { name: "body timeout", error: fetchFailed(errno("UND_ERR_BODY_TIMEOUT")), retried: false },
+    { name: "connection reset", error: fetchFailed(errno("ECONNRESET", "read")), retried: false },
+    { name: "broken pipe", error: fetchFailed(errno("EPIPE", "write")), retried: false },
+    { name: "other side closed", error: fetchFailed(errno("UND_ERR_SOCKET", undefined, "other side closed")), retried: false },
+    { name: "socket hang up", error: fetchFailed(new Error("socket hang up")), retried: false },
+  ];
+
+  for (const tc of cases) {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: async () => {
+        attempts++;
+        throw tc.error;
+      },
+    });
+    await assert.rejects(client.exec("sb-exec", { command: "true" }), (err) => err === tc.error, tc.name);
+    assert.equal(attempts, tc.retried ? 3 : 1, tc.name);
+  }
+});
+
+test("internal client exec retries 429 and 503 but surfaces other gateway statuses", async () => {
+  const cases: Array<{ status: number; retried: boolean }> = [
+    { status: 429, retried: true },
+    { status: 503, retried: true },
+    { status: 421, retried: false },
+    { status: 502, retried: false },
+    { status: 504, retried: false },
+  ];
+
+  for (const tc of cases) {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: async () => {
+        attempts++;
+        if (attempts === 1) {
+          return jsonResponse({ error: `status ${tc.status}` }, tc.status);
+        }
+        return jsonResponse({ stdout: "ok\n", stderr: "", exit_code: 0, duration_ms: 1 });
+      },
+    });
+    const run = client.exec("sb-exec", { command: "echo ok" });
+    if (tc.retried) {
+      assert.equal((await run).stdout, "ok\n", `status ${tc.status}`);
+      assert.equal(attempts, 2, `status ${tc.status}`);
+    } else {
+      await assert.rejects(run, { message: `status ${tc.status}` });
+      assert.equal(attempts, 1, `status ${tc.status}`);
+    }
+  }
+});
+
+async function withServer(handler: RequestListener, fn: (baseURL: string) => Promise<void>): Promise<void> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  try {
+    await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+test("internal client getAudit sends filters and maps the page", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        events: [
+          {
+            time: "2026-10-06T10:00:00Z",
+            kind: "egress",
+            result: "failure",
+            reason: "host_not_allowed",
+            destination: "evil.example:443",
+            network: "tcp",
+            event_id: "ae-1",
+            incarnation_id: "inc-1",
+          },
+        ],
+        coverage: { answered: ["node-a"], missing: null, partial: false },
+        next_cursor: "c2",
+      });
+    },
+  });
+
+  const page = await client.getAudit("sb-audit", { kind: "egress", limit: 50, cursor: "c1", incarnationID: "inc-1" });
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  const url = new URL(seenRequest.url);
+  assert.equal(url.pathname, "/v1/sandboxes/sb-audit/audit");
+  assert.equal(url.searchParams.get("kind"), "egress");
+  assert.equal(url.searchParams.get("limit"), "50");
+  assert.equal(url.searchParams.get("cursor"), "c1");
+  assert.equal(url.searchParams.get("incarnation_id"), "inc-1");
+  assert.equal(page.events[0].reason, "host_not_allowed");
+  assert.equal(page.events[0].eventID, "ae-1");
+  assert.deepEqual(page.coverage, { answered: ["node-a"], missing: [], partial: false });
+  assert.equal(page.nextCursor, "c2");
+});
+
+test("internal client getAudit without options sends no query and tolerates null events", async () => {
+  let seenURL = "";
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenURL = new Request(input, init).url;
+      return jsonResponse({ events: null });
+    },
+  });
+  const page = await client.getAudit("sb-x");
+  assert.ok(seenURL.endsWith("/v1/sandboxes/sb-x/audit"));
+  assert.deepEqual(page, { events: [], coverage: { answered: [], missing: [], partial: false } });
+});
+
+test("sandbox.audit reads its own sandbox's log", async () => {
+  const urls: string[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      urls.push(req.url);
+      if (req.method === "POST") return jsonResponse(apiSandbox("sb-own"));
+      return jsonResponse({ events: [], coverage: { answered: [], missing: [], partial: false } });
+    },
+  });
+  const sandbox = await client.create({ image: "ubuntu:22.04" });
+  await sandbox.audit({ kind: "egress" });
+  assert.ok(urls[urls.length - 1].endsWith("/v1/sandboxes/sb-own/audit?kind=egress"));
+});
+
+test("get maps egress_status for gateway-mode sandboxes", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ ...apiSandbox("sb-eg"), egress_status: "held" }),
+  });
+  const sandbox = await client.get("sb-eg");
+  assert.equal(sandbox.egressStatus, "held");
+});
+
+test("checkNetworkPolicy posts the policy and maps the answer", async () => {
+  let seen: Request | undefined;
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen = new Request(input, init);
+      body = JSON.parse(String(init?.body));
+      return jsonResponse({ allowed: true, matched_rule: "*.github.com", default_verdict: "deny", outside_ceiling: "x.example" });
+    },
+  });
+  const res = await client.checkNetworkPolicy({ networkAllowOut: ["*.github.com"], destination: "api.github.com" });
+  assert.ok(seen && seen.url.endsWith("/v1/network/policy/check"));
+  assert.equal(seen?.method, "POST");
+  assert.deepEqual(body.network_allow_out, ["*.github.com"]);
+  assert.equal(body.destination, "api.github.com");
+  assert.deepEqual(res, { allowed: true, matchedRule: "*.github.com", defaultVerdict: "deny", outsideCeiling: "x.example" });
+});
+
+test("setNetworkPolicy PUTs the whole policy and maps the effective one", async () => {
+  let seen: Request | undefined;
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen = new Request(input, init);
+      body = JSON.parse(String(init?.body));
+      return jsonResponse({ network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: null, egress_profiles: ["python"], effective_hostname_count: 3, egress_status: "active" });
+    },
+  });
+  const res = await client.setNetworkPolicy("sb-pol", { networkAllowOut: ["pypi.org"], egressProfiles: ["python"] });
+  assert.ok(seen && seen.url.endsWith("/v1/sandboxes/sb-pol/network/policy"));
+  assert.equal(seen?.method, "PUT");
+  assert.deepEqual(body, { network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: [], egress_profiles: ["python"] });
+  assert.deepEqual(res, { networkBlockAll: false, networkAllowOut: ["pypi.org"], networkDenyOut: [], egressProfiles: ["python"], networkEgressMode: "enforce", networkEgressRules: [], effectiveHostnameCount: 3, egressStatus: "active" });
+});
+
+test("sandbox.setNetworkPolicy updates its own policy fields", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (req.method === "POST") return jsonResponse(apiSandbox("sb-own"));
+      assert.ok(req.url.endsWith("/v1/sandboxes/sb-own/network/policy"));
+      return jsonResponse({ network_block_all: true, network_allow_out: [], network_deny_out: [] });
+    },
+  });
+  const sandbox = await client.create({ image: "ubuntu:22.04" });
+  const res = await sandbox.setNetworkPolicy({ networkBlockAll: true });
+  assert.equal(res.networkBlockAll, true);
+  assert.equal(sandbox.networkBlockAll, true);
+  assert.equal(sandbox.egressStatus, undefined);
+});
+
+test("egress profile CRUD maps the wire shape", async () => {
+  const seen: { method: string; url: string; body?: unknown }[] = [];
+  const profile = { name: "python", allow_out: ["pypi.org"], description: "pip", generation: 2, created_at: "c", updated_at: "u" };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ method: req.method, url: req.url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (req.method === "DELETE") return new Response(null, { status: 204 });
+      if (req.url.includes("/egress-profiles?")) return jsonResponse({ profiles: [profile], next_cursor: "python" });
+      if (req.url.endsWith("/egress-profiles")) return jsonResponse({ profiles: null });
+      return jsonResponse(profile);
+    },
+  });
+  const put = await client.putEgressProfile("python", { allowOut: ["pypi.org"], description: "pip" });
+  assert.deepEqual(put, { name: "python", allowOut: ["pypi.org"], description: "pip", generation: 2, createdAt: "c", updatedAt: "u" });
+  assert.deepEqual(seen[0], { method: "PUT", url: "https://api.example.com/v1/egress-profiles/python", body: { allow_out: ["pypi.org"], description: "pip" } });
+  assert.equal((await client.getEgressProfile("python")).generation, 2);
+  const page = await client.listEgressProfiles({ cursor: "a", limit: 10 });
+  assert.equal(page.nextCursor, "python");
+  assert.ok(seen[2].url.endsWith("/v1/egress-profiles?cursor=a&limit=10"));
+  assert.deepEqual(await client.listEgressProfiles(), { profiles: [] });
+  await client.deleteEgressProfile("python");
+  assert.equal(seen[4].method, "DELETE");
+});
+
+test("sandboxes carry their egress profiles", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (_input, init) => {
+      if (init?.body) body = JSON.parse(String(init.body));
+      return jsonResponse({ ...apiSandbox("sb-p"), egress_profiles: ["python"], egress_profiles_applied: [{ name: "python", generation: 2 }] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", egressProfiles: ["python"] });
+  assert.deepEqual(body.egress_profiles, ["python"]);
+  assert.deepEqual(sandbox.egressProfiles, ["python"]);
+  assert.deepEqual(sandbox.egressProfilesApplied, [{ name: "python", generation: 2 }]);
+});
+
+test("learn mode: create, the policy answer and the learned read", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/learned")) {
+        return jsonResponse({
+          mode: "learn",
+          truncated: false,
+          entries: [{ host: "pypi.org", ports: [443], first_seen: "a", last_seen: "b", hits: 3 }],
+          cidrs: null,
+          suggested_allow_out: ["pypi.org"],
+          suggested_profile: { allow_out: ["x.example"], description: "d" },
+        });
+      }
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: [], network_deny_out: [], network_egress_mode: "learn" });
+      }
+      return jsonResponse({ ...apiSandbox("sb-learn"), network_egress_mode: "learn" });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkEgressMode: "learn" });
+  assert.equal(bodies[0].network_egress_mode, "learn");
+  assert.equal(sandbox.networkEgressMode, "learn");
+  const pol = await sandbox.setNetworkPolicy({ networkEgressMode: "learn" });
+  assert.equal(pol.networkEgressMode, "learn");
+  assert.equal(bodies[1].network_egress_mode, "learn");
+  const learned = await sandbox.learned();
+  assert.deepEqual(learned.entries[0], { host: "pypi.org", ports: [443], firstSeen: "a", lastSeen: "b", hits: 3 });
+  assert.deepEqual(learned.cidrs, []);
+  assert.deepEqual(learned.suggestedProfile, { allowOut: ["x.example"], description: "d" });
+});
+
+test("egress rules: create, the policy answer and the sandbox's own copy", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const rule = { host: "api.github.com", methods: ["GET"], paths: ["/repos/acme/**"], inspect: true };
+  let policyRules: unknown = [rule];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["api.github.com"], network_deny_out: [], network_egress_rules: policyRules });
+      }
+      return jsonResponse({ ...apiSandbox("sb-rules"), network_egress_rules: [{ ...rule, ports: [443] }] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkAllowOut: ["api.github.com"], networkEgressRules: [rule] });
+  assert.deepEqual(bodies[0].network_egress_rules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [{ ...rule, ports: [443] }]);
+
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"], networkEgressRules: [rule] });
+  assert.deepEqual(bodies[1].network_egress_rules, [rule]);
+  assert.deepEqual(pol.networkEgressRules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [rule]);
+
+  policyRules = null;
+  const cleared = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"] });
+  assert.equal("network_egress_rules" in bodies[2], false);
+  assert.deepEqual(cleared.networkEgressRules, []);
+  assert.equal(sandbox.networkEgressRules, undefined);
+});
+
+test("egress rules: inject goes out as secret_ref and comes back as secretRef", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const rule = { host: "api.github.com", inspect: true, paths: ["/repos/**"], inject: { header: "Authorization", secretRef: "env:GITHUB_TOKEN" } };
+  const wire = { host: "api.github.com", inspect: true, paths: ["/repos/**"], inject: { header: "Authorization", secret_ref: "env:GITHUB_TOKEN" } };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["api.github.com"], network_deny_out: [], network_egress_rules: [wire] });
+      }
+      return jsonResponse({ ...apiSandbox("sb-inject"), network_egress_rules: [{ ...wire, ports: [443] }] });
+    },
+  });
+  const sandbox = await client.create({
+    image: "alpine",
+    env: { GITHUB_TOKEN: "Bearer ghp_x" },
+    networkAllowOut: ["api.github.com"],
+    networkEgressRules: [rule],
+  });
+  assert.deepEqual(bodies[0].network_egress_rules, [wire]);
+  assert.deepEqual(sandbox.networkEgressRules, [{ ...rule, ports: [443] }]);
+
+  // A rule without inject goes out unchanged, with no inject key at all.
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"], networkEgressRules: [rule, { host: "api.github.com" }] });
+  assert.deepEqual(bodies[1].network_egress_rules, [wire, { host: "api.github.com" }]);
+  assert.deepEqual(pol.networkEgressRules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [rule]);
+});
+
+test("egress rules: binaries go out and come back as written", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const git = { host: "github.com", ports: [22], binaries: ["/usr/bin/git"] };
+  const pip = { host: "pypi.org", ports: [443], binaries: ["/usr/local/bin/pip"] };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["github.com:22", "pypi.org"], network_deny_out: [], network_egress_rules: [git, pip] });
+      }
+      return jsonResponse({ ...apiSandbox("sb-binaries"), network_egress_rules: [git, pip] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkAllowOut: ["github.com:22", "pypi.org"], networkEgressRules: [git, pip] });
+  assert.deepEqual(bodies[0].network_egress_rules, [git, pip]);
+  assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
+
+  // A rule without binaries goes out with no binaries key at all.
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["github.com:22", "pypi.org"], networkEgressRules: [git, { host: "pypi.org" }] });
+  assert.deepEqual(bodies[1].network_egress_rules, [git, { host: "pypi.org" }]);
+  assert.deepEqual(pol.networkEgressRules, [git, pip]);
+  assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
 });

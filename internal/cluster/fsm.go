@@ -200,6 +200,9 @@ type command struct {
 	MaxPerTenant      int                       `json:"max_per_tenant,omitempty"`
 	VolumeAttachments []models.VolumeAttachment `json:"volume_attachments,omitempty"`
 	VolumeSandboxID   string                    `json:"volume_sandbox_id,omitempty"`
+	// EgressProfile carries the profile for opPutEgressProfile, and its owner
+	// and name for opDeleteEgressProfile (fsm_egress_profiles.go).
+	EgressProfile *EgressProfileRecord `json:"egress_profile,omitempty"`
 }
 
 type reservationCommand struct {
@@ -522,6 +525,12 @@ type placementFSM struct {
 	volumeAttachments          map[string]models.VolumeAttachment
 	volumeAttachmentsByVolume  map[string]map[string]struct{}
 	volumeAttachmentsBySandbox map[string]map[string]struct{}
+	// egressProfiles are the replicated named egress profiles (snapshotted).
+	// egressProfileRefs is derived: which placements reference each profile,
+	// kept in step with f.placements by reindexEgressProfilesLocked and
+	// rebuilt on Restore from the rows.
+	egressProfiles    map[EgressProfileKey]*EgressProfileRecord
+	egressProfileRefs map[EgressProfileKey]map[string]struct{}
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -606,6 +615,8 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		volumeAttachments:            make(map[string]models.VolumeAttachment),
 		volumeAttachmentsByVolume:    make(map[string]map[string]struct{}),
 		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
+		egressProfiles:               make(map[EgressProfileKey]*EgressProfileRecord),
+		egressProfileRefs:            make(map[EgressProfileKey]map[string]struct{}),
 	}
 }
 
@@ -1085,6 +1096,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 		f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, expectedIncarnationID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
+		f.releaseEgressProfilesLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
@@ -1166,6 +1178,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		f.releaseVolumeAttachmentsForSandboxLocked(cmd.SandboxID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
+		f.releaseEgressProfilesLocked(cmd.SandboxID)
 		delete(f.placements, cmd.SandboxID)
 		delete(f.deletingIndex, cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
@@ -1279,6 +1292,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releasePendingReservationOwnerLocked(id, existing.OwnerNodeID)
 			f.releaseVolumeAttachmentsForIncarnationLocked(id, existing.IncarnationID)
 			f.deletePlacementRecoveryLocked(id)
+			f.releaseEgressProfilesLocked(id)
 			delete(f.placements, id)
 			delete(f.deletingIndex, id)
 			f.recordPlacementChangeLocked(id, true)
@@ -1740,6 +1754,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		state.Committed[nodeID] = pending
 		delete(state.Pending, nodeID)
+		return nil
+	case opPutEgressProfile:
+		result, err := f.applyPutEgressProfileLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteEgressProfile:
+		if err := f.applyDeleteEgressProfileLocked(cmd); err != nil {
+			return err
+		}
 		return nil
 	case opAllocateArtifactEpoch:
 		// Issue a publisher its fencing token. This is an ALLOCATION, not a
@@ -2737,6 +2762,11 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 	// because readers take the value from f.placements at serve time.
 	f.recordPlacementChangeLocked(id, false)
 	hot, rec := splitPlacement(p)
+	if old, ok := f.placements[id]; ok {
+		f.reindexEgressProfilesLocked(id, &old, &hot)
+	} else {
+		f.reindexEgressProfilesLocked(id, nil, &hot)
+	}
 	if rec.empty() {
 		if hot.RecoveryRef == "" {
 			delete(f.recovery, id)
@@ -2808,6 +2838,11 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 	// the hot row already carries rather than clearing it.
 	if p.Spec != nil {
 		p.PublicTraffic = p.Spec.AllowPublicTraffic != nil && *p.Spec.AllowPublicTraffic
+		// Egress profile references ride the hot row too: the FSM's
+		// reference index and apply-time cap check read them without
+		// hydrating the spec.
+		p.EgressProfiles = append([]string(nil), p.Spec.EgressProfiles...)
+		p.EgressInlineHostnames = egressInlineHostnames(p.Spec)
 	}
 	p.Spec = nil
 	p.SecretRef = ""
@@ -3439,6 +3474,9 @@ type fsmSnapshotPayload struct {
 	// snapshot decodes it as nil, which reads as "nobody has published", and
 	// the list path falls back to the fan-out.
 	ArtifactCatalog map[string]artifactCatalogSnapshotState
+	// EgressProfiles is the replicated named-profile set. Optional; an older
+	// snapshot decodes it as nil, which reads as "no profiles".
+	EgressProfiles []EgressProfileRecord
 }
 
 type placementSnapshotRow struct {
@@ -3511,6 +3549,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		auditACLs:          auditACLs,
 		volumes:            f.volumesSnapshotLocked(),
 		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
+		egressProfiles:     f.egressProfilesSnapshotLocked(),
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 	}, nil
@@ -3597,6 +3636,8 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.reservedIndex = make(map[string]struct{})
 	f.deletingIndex = make(map[string]struct{})
 	f.customHostnameIndex = make(map[string]string)
+	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
+	f.restoreEgressProfilesLocked(payload.EgressProfiles)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -3741,6 +3782,7 @@ type fsmSnapshot struct {
 	auditACLs          map[string]AuditACL
 	volumes            []models.Volume
 	volumeAttachments  []models.VolumeAttachment
+	egressProfiles     []EgressProfileRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 }
@@ -3763,6 +3805,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		AuditACLs:          s.auditACLs,
 		Volumes:            s.volumes,
 		VolumeAttachments:  s.volumeAttachments,
+		EgressProfiles:     s.egressProfiles,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)

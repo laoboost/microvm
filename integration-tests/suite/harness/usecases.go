@@ -28,6 +28,19 @@ const (
 	// hard-fail. Unlike CapWasm it needs no node-side module staging — the UCs
 	// upload JS bundles over POST /v1/js-bundles at runtime.
 	CapIsolate Capability = "isolate" // V8-isolate (workerd) runtime available
+	// CapEgressFQDN gates the hostname egress use cases (UC-180..182, UC-185,
+	// UC-190..205, UC-208..213, UC-215..216; plans/egress-domain-filtering.md
+	// P1-10, Phases 2-3). Advertisement-only: install.sh
+	// installs and starts the aerolvm-egress-gateway units on every node and
+	// SB_EGRESS_FQDN_ENABLED defaults on, so a scenario advertises it when its
+	// container nodes are not privileged (a privileged node refuses hostname
+	// policies with 501 by design).
+	CapEgressFQDN Capability = "egress-fqdn"
+	// CapPrivateCloud gates UC-186..189 (§5.10): the node carries an egress
+	// operator file plus node-local stand-ins for a bank network (a dnsmasq
+	// resolver with internal names, an internal HTTP service, a squid upstream
+	// proxy). Only single-node-private-cloud advertises it.
+	CapPrivateCloud Capability = "private-cloud"
 	// CapIsolateJail gates UC-109: the node runs isolate with
 	// SB_ISOLATE_USE_JAIL=true (the default) and the suite may SSH in to
 	// inspect the workerd process. Only single-node-isolate-jail advertises it;
@@ -199,7 +212,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
 	CapClusterMTLS: true, CapAuditExport: true, CapAuditWitness: true,
-	CapRemoteMCP: true,
+	CapRemoteMCP: true, CapEgressFQDN: true, CapPrivateCloud: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -582,6 +595,68 @@ var Registry = []UseCase{
 	{ID: "UC-176", Title: "aerolvm CLI: create, exec, cp, expose and destroy; on a cluster a non-owner node resolves the name", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-177", Title: "aerolvm mcp (stdio): the same flow through an MCP client; a pinned server creates lazily with the idle lifecycle", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-178", Title: "Remote /mcp: a pinned call creates through the API domain, then a node that doesn't own the sandbox serves it", Requires: []Capability{CapRemoteMCP, CapCluster, CapDomain}, Implemented: true},
+
+	// Egress domain filtering (plans/egress-domain-filtering.md P1-10, P1-20).
+	{ID: "UC-179", Title: "Allow-out CIDR: the listed range is reachable, everything else is dropped", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-180", Title: "Hostname allowlist: an allowed name is reachable over HTTPS; another name gets NXDOMAIN and a fast refusal; GET shows egress_status active", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-181", Title: "Explainable denials: a denied HTTP host gets a 403 naming host and rule, and the denial is in the sandbox's audit log", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-182", Title: "host:port and *. entries: the listed port opens, the web ports of a port-only entry stay shut, subdomains match a wildcard", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-183", Title: "Every container sandbox runs without CAP_NET_RAW, so it can't spoof a neighbour's source address", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-184", Title: "A block-all sandbox can't open connections to host services on its bridge gateway", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-185", Title: "Latency gate: gateway-mode creates report svc_egress_* stages and stay inside the join and attach budgets", Requires: []Capability{CapEgressFQDN, CapBenchmark}, Implemented: true},
+	{ID: "UC-186", Title: "Private cloud upstream proxy: an allowed outside name gets a synthetic answer and is fetched through the operator's proxy", Requires: []Capability{CapPrivateCloud}, Implemented: true},
+	{ID: "UC-187", Title: "Private cloud internal zone: an internal name reaches its internal port; a name outside the zone resolving into it is refused", Requires: []Capability{CapPrivateCloud}, Implemented: true},
+	{ID: "UC-188", Title: "Private cloud deny floor: an operator deny CIDR is dropped for a sandbox with no policy", Requires: []Capability{CapPrivateCloud}, Implemented: true},
+	{ID: "UC-189", Title: "Private cloud control-port guard: a sandbox can't reach the node's API port, while ingress 443 stays reachable", Requires: []Capability{CapPrivateCloud}, Implemented: true},
+	{ID: "UC-190", Title: "Live egress policy update: a running sandbox's newly allowed name opens and a dropped one is refused, without a restart", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-191", Title: "Named egress profile: its hosts are reachable, a change converges in egress_profiles_applied, and deleting it while referenced is 409", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-192", Title: "Learn then lock (EF-48): a learn-mode pip install records pypi's hosts, and the suggested list alone runs the same install", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-193", Title: "Built-in profile builtin:pypi alone runs pip install (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-194", Title: "Built-in profile builtin:npm alone runs npm install (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-195", Title: "Built-in profile builtin:github alone runs git clone over HTTPS (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-196", Title: "Built-in profile builtin:huggingface alone downloads a model file (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-197", Title: "Built-in profile builtin:golang-proxy alone runs go mod download (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-198", Title: "Built-in profile builtin:crates alone runs cargo fetch (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-199", Title: "Built-in profile builtin:apt-ubuntu alone runs apt-get update and a package download (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-200", Title: "Built-in profile builtin:docker-hub alone runs crane pull (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-201", Title: "Inspect rule on 443 (EF-52, EF-53): the ruled GET passes through TLS inspection trusting the node CA via SSL_CERT_FILE; a POST or an unruled path gets the gateway's 403", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-202", Title: "Credential injection (EF-54): the sandbox's env holds only aerolvm-placeholder:TEST_TOKEN, and postman-echo receives the real token the gateway put in the Authorization header", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-203", Title: "Per-binary rules (EF-55): binaries-only rules on 443 let /usr/local/bin/pip install requests from pypi.org and files.pythonhosted.org without inspection, while busybox wget to pypi.org is refused", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-204", Title: "Firecracker hostname allowlist (Phase 4): a guest reaches the egress gateway over its TAP, fetches the listed name, is refused another fast, and a live block-all shuts it", Requires: []Capability{CapFirecracker, CapEgressFQDN}, Implemented: true},
+	// Egress lifecycle (PR #622 reviews 3-6): enforcement across stop and
+	// start, live mode changes, destroy, a gateway restart or outage and a
+	// sandboxd restart, checked in the sandbox and, over SSH, on its node.
+	{ID: "UC-205", Title: "A hostname allowlist is enforced again after a stop and start, and egress_status is active", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-206", Title: "A CIDR allowlist across stop and start: the stop removes the sandbox's rules from the address it leaves, the start enforces the list at its new address and leaves nothing at the old one", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-207", Title: "A policy changed while the sandbox is stopped is what its start enforces; the replaced list's rules are gone", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-208", Title: "Live mode transitions CIDR -> hostname -> CIDR: each step enforces its list and removes the previous step's", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-209", Title: "Block-all shuts a hostname sandbox completely, DNS included; lifting it restores the list", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-210", Title: "A destroy leaves nothing on the node: no CIDR or hold rules at a CIDR sandbox's address, and a hostname sandbox out of the gateway's sets", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-211", Title: "Restarting the node's egress gateway rebuilds its sets: the sandbox reaches its listed name again and is still refused another", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-212", Title: "Restarting sandboxd on the sandbox's node leaves its filtering in place, and the restarted daemon applies a policy change", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-213", Title: "With the node's egress gateway down a hostname sandbox is shut, not open, and a policy change can't report active; once it's back the newest policy is enforced", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-214", Title: "The policy check endpoint answers allowed, matched rule and default verdict for hosts, ports, wildcards, CIDRs, deny lists and block-all", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-215", Title: "Two sandboxes on one node with different allowlists share its gateway and are filtered apart", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-216", Title: "Sandboxes on two different workers are each filtered by their node's gateway, and a policy change through the API reaches whichever node owns the sandbox", Requires: []Capability{CapEgressFQDN, CapCluster}, Implemented: true},
+
+	// The aerolvm CLI as a person uses it: a real terminal, a saved login, and
+	// every remaining verb (PRs #633/#634).
+	{ID: "UC-217", Title: "aerolvm shell in a real terminal: the remote gets a TERM it knows and the local size, a window resize reaches it, and its exit code passes through", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-218", Title: "aerolvm shell: Ctrl-] detaches and the shell keeps running; reopening lands in the same shell with its output replayed; after exit the next one is new", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-219", Title: "aerolvm shell: the client dying mid-shell leaves the shell running, and the next aerolvm shell is back in it", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-220", Title: "aerolvm shell --new starts a separate shell that --session reopens; the default shell can't see into it", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-221", Title: "aerolvm shell with no sandbox named offers a list and opens the one picked; without a terminal it refuses and opens no session", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-222", Title: "aerolvm shell and an SSH login to the sandbox land in the same default shell", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
+	{ID: "UC-223", Title: "aerolvm exec -it works like docker exec -it: TERM and size reach the command, a resize follows, Ctrl-C goes to it; -it after -- is the command's", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-224", Title: "aerolvm login --token-stdin verifies the token and saves it 0600; every command then runs with no SB_* variables; a wrong token is never saved", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-225", Title: "Interactive aerolvm login in a real terminal never shows the token; logout forgets it and a second logout is a no-op", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-226", Title: "The saved login's token is never sent to another server; aerolvm health rejects a wrong token though /health needs none; version and the help overview", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-227", Title: "aerolvm stop keeps files and start resumes; a command on a stopped sandbox starts it; get and list --tag / --limit follow", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-228", Title: "aerolvm snapshot, then create --image with the snapshot's name starts a sandbox with the files", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-229", Title: "aerolvm exec --background, logs and logs --follow to the exit code, ls --json, and expose of a background server", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-230", Title: "After aerolvm login, mcp config carries no credentials and the stdio MCP server runs on the login alone", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-231", Title: "aerolvm shell and exec -it get a real terminal (devpts, local size, resize, exit code) on every runtime the scenario runs: docker, gVisor, Firecracker", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-232", Title: "aerolvm shell says why it can't: the sandbox was stopped under it, the image has no shell (exec too, as a non-retryable invalid_argument), or the saved token was revoked", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

@@ -26,6 +26,8 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
+
+	"github.com/distribution/reference"
 )
 
 // managedLabelKey is the Docker label every sandbox container we create
@@ -323,26 +325,6 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-// baseHostConfig builds the HostConfig envelope shared by the cold create path
-// and the warm-pool park path: the privileged opt-in, the caller's binds, and
-// the no-new-privileges hardening. Building it in ONE place is what keeps the
-// two paths from drifting — a parked container is what most default creates
-// actually boot, so it must carry the same security envelope as a cold one.
-// Callers layer their own Runtime/NetworkMode/resources/GPU fields on top.
-func (c *Client) baseHostConfig(binds []string) map[string]any {
-	hostConfig := map[string]any{
-		"Privileged": c.privileged,
-		"Binds":      binds,
-	}
-	// no-new-privileges blocks setuid/setgid-based privilege escalation inside
-	// the container. Privileged (operator opt-in) is exempt — it deliberately
-	// restores full host capabilities and stays opt-in.
-	if !c.privileged {
-		hostConfig["SecurityOpt"] = []string{"no-new-privileges=true"}
-	}
-	return hostConfig
-}
-
 // bindEntry builds a HostConfig.Binds entry ("src:dst[:opts]") after asserting
 // each path component is plain. Bind entries are colon-joined and option lists
 // are comma-split, so a ':' or ',' in either segment would inject bind options
@@ -466,11 +448,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		workingDir = "/"
 	}
 
-	envValues := make([]string, 0, len(req.Env)+4)
+	envValues := make([]string, 0, len(req.Env)+5)
 	envValues = append(envValues,
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", c.toolboxPort),
 		"SB_TOOLBOX_TOKEN="+toolboxToken,
 		"SB_SANDBOX_ID="+sandboxID,
+		// A snapshot of a warm-pool container carries its parked flag in the
+		// image config; a sandbox created from it would boot parked and wait
+		// forever for an adopt. Docker lets the container's env win.
+		poolParkedEnv+"=",
 	)
 	for key, value := range req.Env {
 		envValues = append(envValues, key+"="+value)
@@ -539,7 +525,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		createRequest["Env"] = envValues
 	}
 
+	var tmpfs map[string]string
 	for _, m := range hostMounts {
+		if m.Tmpfs {
+			if tmpfs == nil {
+				tmpfs = map[string]string{}
+			}
+			tmpfs[m.ContainerPath] = strings.Join(m.TmpfsOptions(), ",")
+			continue
+		}
 		// Tenant mount paths are attacker-influenced; bindEntry asserts the
 		// components are plain before joining (see its comment).
 		var opts []string
@@ -583,7 +577,10 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}()
 
-	hostConfig := c.baseHostConfig(binds)
+	hostConfig := sandboxHostConfig(c.privileged, binds)
+	if tmpfs != nil {
+		hostConfig["Tmpfs"] = tmpfs
+	}
 	// Honor req.OSUser instead of running as whatever USER the image ships
 	// (often root = host uid 0). Empty leaves the image default in charge —
 	// the caller's lack of a request must not be confused with an explicit root.
@@ -787,6 +784,81 @@ func (c *Client) Start(ctx context.Context, containerRef string) (*SandboxRuntim
 	return c.waitForRuntime(ctx, containerRef)
 }
 
+// StartWithIdentity starts a stopped sandbox's container. One adopted from
+// the warm pool still carries the pool's env (SB_POOL_PARKED=1, its slot's
+// bootstrap token and park nonce, the bind to its slot's park socket), since
+// Docker keeps a container's env across stop and start. Its toolboxd boots
+// parked, holds the user's command back and answers nothing but /health, so
+// a plain Start would pass its health poll and hand out a sandbox whose every
+// call is 503 "sandbox not adopted". It is adopted again over its slot's
+// socket with the sandbox's own identity, exactly as at create.
+func (c *Client) StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*SandboxRuntime, error) {
+	inspect, err := c.inspectContainer(ctx, containerRef)
+	if err != nil {
+		return nil, fmt.Errorf("inspect container: %w", err)
+	}
+	pl, err := c.parkedResumeListener(inspect)
+	if err != nil {
+		return nil, err
+	}
+	if pl == nil {
+		return c.Start(ctx, containerRef)
+	}
+	defer func() { _ = pl.Close() }()
+	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerRef)+"/start", nil, nil, nil, nil); err != nil {
+		return nil, fmt.Errorf("start container: %w", err)
+	}
+	if err := c.readopt(ctx, pl, sandboxID, toolboxToken); err != nil {
+		// A container that can't be adopted serves nothing; don't leave it
+		// running parked behind a start that reported failure.
+		_ = c.Stop(ctx, containerRef)
+		return nil, fmt.Errorf("re-adopt warm-pool container: %w", err)
+	}
+	return c.waitForRuntime(ctx, containerRef)
+}
+
+func (c *Client) readopt(ctx context.Context, pl *ParkedListener, sandboxID, toolboxToken string) error {
+	waitCtx, cancel := context.WithTimeout(ctx, c.toolboxWaitTimeout)
+	defer cancel()
+	if err := pl.WaitParked(waitCtx); err != nil {
+		return err
+	}
+	nonce, err := mintReadyNonce()
+	if err != nil {
+		return err
+	}
+	return pl.Adopt(waitCtx, sandboxID, toolboxToken, nonce)
+}
+
+// parkedResumeListener returns a listener for the parked hello of a container
+// adopted from the warm pool, or nil for any other container. The hello must
+// carry the bootstrap token and park nonce in the container's env, and it
+// arrives on whatever host socket the container's ready-socket bind names,
+// which has to be one of ours.
+func (c *Client) parkedResumeListener(inspect containerInspect) (*ParkedListener, error) {
+	env := map[string]string{}
+	for _, kv := range inspect.Config.Env {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	if env[poolParkedEnv] != "1" {
+		return nil, nil
+	}
+	source := ""
+	for _, bind := range inspect.HostConfig.Binds {
+		if src, ok := readySocketSourceFromBind(bind); ok {
+			source = src
+			break
+		}
+	}
+	if source == "" || !c.readySocketPathOwnedByDir(source) {
+		return nil, fmt.Errorf("warm-pool container %s has no park socket under %s to be adopted over", inspect.ID, c.readyDir)
+	}
+	slotID := strings.TrimSuffix(filepath.Base(source), ".sock")
+	return NewParkedListener(filepath.Dir(source), slotID, env["SB_TOOLBOX_TOKEN"], env[readyNonceEnv])
+}
+
 func (c *Client) Stop(ctx context.Context, containerRef string) error {
 	return c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerRef)+"/stop", queryValues(map[string]string{"t": "10"}), nil, nil, nil)
 }
@@ -906,6 +978,10 @@ func (c *Client) CreateSnapshot(ctx context.Context, containerRef, imageRef stri
 	if tag != "" {
 		query.Set("tag", tag)
 	}
+	// The commit copies the container's env into the image. Drop the warm
+	// pool's parked flag so a sandbox made from the snapshot, on any node or
+	// engine, doesn't boot parked.
+	query.Add("changes", "ENV "+poolParkedEnv+"=")
 
 	var response struct {
 		ID string `json:"Id"`
@@ -1007,8 +1083,9 @@ func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, e
 		// Warm-pool parked containers carry aerolvm.managed=true (so the
 		// boot purge / events filter can find them) but they are not
 		// sandboxes — they have no DB row. Exclude them here so Reconcile's
-		// orphan pass does not destroy live park inventory.
-		if isParkedContainerLabels(summary.Labels) {
+		// orphan pass does not destroy live park inventory. Adopted ones keep
+		// the label but are sandboxes, so they stay (isParkedContainer).
+		if isParkedContainer(summary) {
 			continue
 		}
 		inspect, err := c.inspectContainer(ctx, summary.ID)
@@ -1044,7 +1121,22 @@ func (c *Client) ensureToolboxBinary() error {
 	return nil
 }
 
+// withDefaultTag adds ":latest" to a reference with neither a tag nor a
+// digest. Docker's POST /images/create pulls EVERY tag of the repository
+// when fromImage names none (the docker CLI adds :latest itself; the raw
+// API does not), so `--image gcr.io/distroless/static-debian12` pulled
+// hundreds of images one by one until the create timed out. A reference
+// the parser rejects is left for Docker to report.
+func withDefaultTag(imageRef string) string {
+	named, err := reference.ParseNormalizedNamed(imageRef)
+	if err != nil || !reference.IsNameOnly(named) {
+		return imageRef
+	}
+	return imageRef + ":latest"
+}
+
 func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.RegistryAuth) error {
+	imageRef = withDefaultTag(imageRef)
 	// Apply mirror rewrite first so the auth payload we build below can be
 	// keyed off the *upstream* host (the AOCR auth service wants the
 	// upstream's username/password wrapped inside an identity token, not the
@@ -1675,8 +1767,11 @@ type imageInspect struct {
 }
 
 type containerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
+	ID     string `json:"Id"`
+	Name   string `json:"Name"`
+	Config struct {
+		Env []string `json:"Env"`
+	} `json:"Config"`
 	State *struct {
 		Running bool   `json:"Running"`
 		Status  string `json:"Status"`

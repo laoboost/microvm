@@ -14,6 +14,12 @@ import type {
   ExecStreamHandle,
   ExecStreamOptions,
   HealthStatus,
+  EgressProfile,
+  EgressProfileList,
+  EgressProfileOptions,
+  ListEgressProfilesOptions,
+  NetworkPolicyCheckOptions,
+  NetworkPolicyCheckResult,
   IngressTarget,
   Lifecycle,
   GetOptions,
@@ -49,8 +55,10 @@ export interface MicroVMConfig {
   /**
    * Retry policy for transient transport errors (socket closed, connection
    * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). The SDK
-   * retries up to 3 times with exponential backoff by default. Pass
-   * `{ maxRetries: 0 }` to disable.
+   * retries up to 3 times with exponential backoff by default. `exec` retries
+   * only failures that prove the command never reached the server
+   * (connection refused, connect timeout, DNS) and HTTP 429/503, so a command
+   * never runs twice. Pass `{ maxRetries: 0 }` to disable.
    */
   retry?: RetryConfig;
 }
@@ -189,6 +197,37 @@ export class MicroVM {
 
   async health(): Promise<HealthStatus> {
     return this.client.health();
+  }
+
+  /**
+   * Asks whether a sandbox created with these egress fields would reach a
+   * destination, using the same matcher the filter enforces. No sandbox is
+   * needed.
+   */
+  async checkNetworkPolicy(options: NetworkPolicyCheckOptions): Promise<NetworkPolicyCheckResult> {
+    return this.client.checkNetworkPolicy(options);
+  }
+
+  /**
+   * Creates or replaces a named egress profile (a full replace: the same body
+   * twice is a no-op). Sandboxes reference it through `egressProfiles`, and a
+   * change reaches every one of them.
+   */
+  async putEgressProfile(name: string, options: EgressProfileOptions): Promise<EgressProfile> {
+    return this.client.putEgressProfile(name, options);
+  }
+
+  async getEgressProfile(name: string): Promise<EgressProfile> {
+    return this.client.getEgressProfile(name);
+  }
+
+  async listEgressProfiles(options?: ListEgressProfilesOptions): Promise<EgressProfileList> {
+    return this.client.listEgressProfiles(options);
+  }
+
+  /** Deletes a profile; one that sandboxes still reference is refused (409). */
+  async deleteEgressProfile(name: string): Promise<void> {
+    return this.client.deleteEgressProfile(name);
   }
 
   async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {

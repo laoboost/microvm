@@ -304,7 +304,7 @@ history):
 
 ```bash
 sudo install -m 0600 /dev/null /root/pat-token   # then paste the PAT into it
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --domain sandbox.example.com \
       --pat-token-file /root/pat-token \
@@ -863,7 +863,7 @@ SSH to each instance (the EIPs you allocated earlier are the SSH targets):
 ssh ubuntu@<node-a-EIP>
 # Stage the PAT in a root-only file (argv is visible in `ps` + shell history).
 sudo install -m 0600 /dev/null /root/pat-token   # then paste the PAT into it
-sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+sudo curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --domain sandbox.example.com \
       --pat-token-file /root/pat-token \

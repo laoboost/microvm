@@ -33,6 +33,7 @@ import type {
   ExposeProtocol,
   ExposeResult,
   Failover,
+  GPUOptions,
   HealthStatus,
   IngressTarget,
   Lifecycle,
@@ -41,6 +42,20 @@ import type {
   MountSpec,
   MountSpecRedacted,
   NetworkUsage,
+  AuditEvent,
+  AuditOptions,
+  AuditPage,
+  EgressProfile,
+  EgressProfileList,
+  EgressProfileOptions,
+  EgressProfileRef,
+  EgressRule,
+  ListEgressProfilesOptions,
+  NetworkLearned,
+  NetworkPolicy,
+  NetworkPolicyCheckOptions,
+  NetworkPolicyCheckResult,
+  NetworkPolicyOptions,
   PlatformVolumeMount,
   RegisterSnapshotOptions,
   SetNetworkLimitsOptions,
@@ -115,8 +130,10 @@ export interface APIClientConfig {
   apiVersion?: APIVersion;
   /**
    * Retry policy for transient transport errors (socket closed, connection
-   * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). Pass
-   * `{ maxRetries: 0 }` to disable retry entirely.
+   * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). `exec`
+   * is narrower: it retries only failures that prove the command never
+   * reached the server (connection refused, connect timeout, DNS) and HTTP
+   * 429/503. Pass `{ maxRetries: 0 }` to disable retry entirely.
    */
   retry?: RetryConfig;
 }
@@ -160,6 +177,40 @@ interface ApiFailover {
   policy?: string;
 }
 
+interface ApiEgressProfile {
+  name: string;
+  allow_out: string[] | null;
+  description?: string;
+  generation: number;
+  created_at: string;
+  updated_at: string;
+}
+
+function fromApiEgressProfile(p: ApiEgressProfile): EgressProfile {
+  const out: EgressProfile = {
+    name: p.name,
+    allowOut: p.allow_out ?? [],
+    generation: p.generation,
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+  };
+  if (p.description) out.description = p.description;
+  return out;
+}
+
+// Only inject's secretRef is spelled differently on the wire, so a rule
+// otherwise goes through as written and the server applies its own port
+// default.
+type ApiEgressRule = Omit<EgressRule, "inject"> & { inject?: { header: string; secret_ref: string } };
+
+function toApiEgressRule({ inject, ...rule }: EgressRule): ApiEgressRule {
+  return inject ? { ...rule, inject: { header: inject.header, secret_ref: inject.secretRef } } : rule;
+}
+
+function fromApiEgressRule({ inject, ...rule }: ApiEgressRule): EgressRule {
+  return inject ? { ...rule, inject: { header: inject.header, secretRef: inject.secret_ref } } : rule;
+}
+
 interface ApiSandbox {
   id: string;
   name?: string;
@@ -175,6 +226,11 @@ interface ApiSandbox {
   os_user: string;
   env?: Record<string, string>;
   network_block_all: boolean;
+  egress_status?: string;
+  egress_profiles?: string[];
+  egress_profiles_applied?: { name: string; generation: number }[];
+  network_egress_mode?: string;
+  network_egress_rules?: ApiEgressRule[] | null;
   toolbox_enabled: boolean;
   ssh_public_key?: string;
   exposed_ports?: ApiExposedPort[];
@@ -312,6 +368,26 @@ interface ApiPlatformVolumeMount {
   read_only?: boolean;
 }
 
+interface ApiAuditEvent {
+  time: string;
+  kind?: string;
+  result: string;
+  reason?: string;
+  destination?: string;
+  network?: string;
+  actor?: string;
+  ref?: string;
+  event_id?: string;
+  incarnation_id?: string;
+  dropped?: number;
+}
+
+interface ApiAuditPage {
+  events: ApiAuditEvent[] | null;
+  coverage?: { answered?: string[] | null; missing?: string[] | null; partial?: boolean };
+  next_cursor?: string;
+}
+
 interface ApiNetworkUsage {
   sandbox_id: string;
   bytes_in: number;
@@ -330,6 +406,24 @@ interface ApiNetworkUsage {
 // re-routes it (plans/ingress-proxy-routing.md, review 2A).
 const RETRYABLE_STATUS_CODES = new Set([421, 429, 502, 503, 504]);
 
+// The subset a non-idempotent request (exec) may retry: 429 and 503 are the
+// server turning the request away before doing any work. 421, 502 and 504 come
+// from forwarding/proxy hops, and the status alone can't prove that no hop
+// already handed the command to the sandbox, so exec surfaces them.
+const REFUSED_STATUS_CODES = new Set([429, 503]);
+
+/** Per-call options for {@link APIClient.request}. */
+interface RequestOptions {
+  /**
+   * `false` for a request the server must not receive twice: re-sending an
+   * exec runs the caller's command again. Only failures that prove the
+   * request never left the client, plus 429/503, are then retried. Defaults
+   * to `true` because the daemon designs every other endpoint for idempotent
+   * retry.
+   */
+  idempotent?: boolean;
+}
+
 /** Default retry settings when the caller doesn't supply a RetryConfig. */
 const DEFAULT_RETRY: Required<RetryConfig> = {
   maxRetries: 3,
@@ -341,7 +435,9 @@ const DEFAULT_RETRY: Required<RetryConfig> = {
  * Returns `true` when the thrown `error` looks like a transport-level failure
  * that vanishes on retry (connection reset, socket closed by peer, DNS
  * blip). `undici` and Node core use several `cause.code` values; we check
- * the full cause chain.
+ * the full cause chain. A reset, EPIPE, read/headers/body timeout or "other
+ * side closed" can fire after the server already received the request, so
+ * this classification is only safe for idempotent requests.
  */
 function isTransientTransportError(error: unknown): boolean {
   const codes = new Set([
@@ -367,6 +463,48 @@ function isTransientTransportError(error: unknown): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Returns `true` only for transport failures that prove the request never
+ * left the client: the connection was refused, did not open before the
+ * connect timeout, or the host name did not resolve (transiently; ENOTFOUND
+ * is not retried for any request). Any other code in the cause chain means
+ * bytes may have reached the server, so the answer is `false`.
+ */
+function isUnsentTransportError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth++) {
+    const err = current as NodeJS.ErrnoException;
+    switch (err.code) {
+      case undefined:
+        break;
+      case "ECONNREFUSED":
+      case "EAI_AGAIN":
+      case "UND_ERR_CONNECT_TIMEOUT":
+        return true;
+      case "ETIMEDOUT":
+        // Node uses ETIMEDOUT both for a connect that never completed and for
+        // an open socket that stopped answering; only the first is unsent.
+        return failedWhileConnecting(err);
+      default:
+        return false;
+    }
+    current = err.cause;
+  }
+  return false;
+}
+
+function failedWhileConnecting(err: NodeJS.ErrnoException): boolean {
+  if (err.syscall === "connect") return true;
+  // With autoSelectFamily (Node's default), a host with several addresses
+  // fails with an AggregateError holding one error per connect attempt and no
+  // syscall of its own.
+  return (
+    err instanceof AggregateError &&
+    err.errors.length > 0 &&
+    err.errors.every((inner) => (inner as NodeJS.ErrnoException | undefined)?.syscall === "connect")
+  );
 }
 
 /**
@@ -632,7 +770,13 @@ export class APIClient {
   }
 
   async exec(id: string, request: ExecRequest): Promise<ExecResult> {
-    const response = await this.doJSON<ApiExecResult>("POST", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/toolbox/process/execute`, toApiExecRequest(request));
+    // Not idempotent: a re-sent exec runs the caller's command a second time.
+    const response = await this.doJSON<ApiExecResult>(
+      "POST",
+      `${this.versionPrefix}/sandboxes/${resourcePath(id)}/toolbox/process/execute`,
+      toApiExecRequest(request),
+      { idempotent: false },
+    );
     return fromApiExecResult(response);
   }
 
@@ -792,6 +936,27 @@ export class APIClient {
     return fromApiHealthStatus(response);
   }
 
+  async checkNetworkPolicy(options: NetworkPolicyCheckOptions): Promise<NetworkPolicyCheckResult> {
+    const response = await this.doJSON<{
+      allowed: boolean;
+      matched_rule: string;
+      default_verdict: string;
+      outside_ceiling?: string;
+    }>("POST", this.versioned("/network/policy/check"), {
+      network_block_all: options.networkBlockAll,
+      network_allow_out: options.networkAllowOut,
+      network_deny_out: options.networkDenyOut,
+      destination: options.destination,
+    });
+    const result: NetworkPolicyCheckResult = {
+      allowed: response.allowed,
+      matchedRule: response.matched_rule ?? "",
+      defaultVerdict: response.default_verdict,
+    };
+    if (response.outside_ceiling) result.outsideCeiling = response.outside_ceiling;
+    return result;
+  }
+
   async mounts(id: string): Promise<MountSpecRedacted[]> {
     const response = await this.doJSON<ApiMountList>("GET", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/mounts`);
     return response.mounts.map(fromApiMountSpecRedacted);
@@ -810,6 +975,20 @@ export class APIClient {
     return fromApiNetworkUsage(response);
   }
 
+  async getAudit(id: string, options: AuditOptions = {}): Promise<AuditPage> {
+    const params = new URLSearchParams();
+    if (options.kind) params.set("kind", options.kind);
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.incarnationID) params.set("incarnation_id", options.incarnationID);
+    const query = params.toString();
+    const response = await this.doJSON<ApiAuditPage>(
+      "GET",
+      `${this.versionPrefix}/sandboxes/${resourcePath(id)}/audit${query ? `?${query}` : ""}`,
+    );
+    return fromApiAuditPage(response);
+  }
+
   async setNetworkLimits(id: string, options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
     const response = await this.doJSON<ApiNetworkUsage>(
       "PATCH",
@@ -817,6 +996,89 @@ export class APIClient {
       toApiSetNetworkLimitsOptions(options),
     );
     return fromApiNetworkUsage(response);
+  }
+
+  async setNetworkPolicy(id: string, options: NetworkPolicyOptions): Promise<NetworkPolicy> {
+    const response = await this.doJSON<{
+      network_block_all: boolean;
+      network_allow_out: string[] | null;
+      network_deny_out: string[] | null;
+      egress_profiles?: string[] | null;
+      network_egress_mode?: string;
+      network_egress_rules?: ApiEgressRule[] | null;
+      effective_hostname_count?: number;
+      egress_status?: string;
+    }>("PUT", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/network/policy`, {
+      network_block_all: options.networkBlockAll ?? false,
+      network_allow_out: options.networkAllowOut ?? [],
+      network_deny_out: options.networkDenyOut ?? [],
+      egress_profiles: options.egressProfiles ?? [],
+      network_egress_mode: options.networkEgressMode,
+      network_egress_rules: options.networkEgressRules?.map(toApiEgressRule),
+    });
+    const policy: NetworkPolicy = {
+      networkBlockAll: response.network_block_all,
+      networkAllowOut: response.network_allow_out ?? [],
+      networkDenyOut: response.network_deny_out ?? [],
+      egressProfiles: response.egress_profiles ?? [],
+      networkEgressMode: response.network_egress_mode ?? "enforce",
+      networkEgressRules: (response.network_egress_rules ?? []).map(fromApiEgressRule),
+      effectiveHostnameCount: response.effective_hostname_count ?? 0,
+    };
+    if (response.egress_status) policy.egressStatus = response.egress_status;
+    return policy;
+  }
+
+  async getNetworkLearned(id: string): Promise<NetworkLearned> {
+    const r = await this.doJSON<{
+      mode: string;
+      truncated: boolean;
+      entries: { host: string; ports: number[] | null; first_seen: string; last_seen: string; hits: number }[] | null;
+      cidrs: string[] | null;
+      suggested_allow_out: string[] | null;
+      suggested_profile?: { allow_out: string[] | null; description?: string } | null;
+    }>("GET", `${this.versionPrefix}/sandboxes/${resourcePath(id)}/network/learned`);
+    const learned: NetworkLearned = {
+      mode: r.mode,
+      truncated: r.truncated,
+      entries: (r.entries ?? []).map((e) => ({ host: e.host, ports: e.ports ?? [], firstSeen: e.first_seen, lastSeen: e.last_seen, hits: e.hits })),
+      cidrs: r.cidrs ?? [],
+      suggestedAllowOut: r.suggested_allow_out ?? [],
+    };
+    if (r.suggested_profile) {
+      learned.suggestedProfile = { allowOut: r.suggested_profile.allow_out ?? [], description: r.suggested_profile.description };
+    }
+    return learned;
+  }
+
+  async putEgressProfile(name: string, options: EgressProfileOptions): Promise<EgressProfile> {
+    const response = await this.doJSON<ApiEgressProfile>("PUT", this.versioned(`/egress-profiles/${resourcePath(name)}`), {
+      allow_out: options.allowOut,
+      description: options.description,
+    });
+    return fromApiEgressProfile(response);
+  }
+
+  async getEgressProfile(name: string): Promise<EgressProfile> {
+    return fromApiEgressProfile(await this.doJSON<ApiEgressProfile>("GET", this.versioned(`/egress-profiles/${resourcePath(name)}`)));
+  }
+
+  async listEgressProfiles(options: ListEgressProfilesOptions = {}): Promise<EgressProfileList> {
+    const params = new URLSearchParams();
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.limit) params.set("limit", String(options.limit));
+    const query = params.toString();
+    const response = await this.doJSON<{ profiles: ApiEgressProfile[] | null; next_cursor?: string }>(
+      "GET",
+      this.versioned(`/egress-profiles${query ? `?${query}` : ""}`),
+    );
+    const list: EgressProfileList = { profiles: (response.profiles ?? []).map(fromApiEgressProfile) };
+    if (response.next_cursor) list.nextCursor = response.next_cursor;
+    return list;
+  }
+
+  async deleteEgressProfile(name: string): Promise<void> {
+    await this.doJSON<void>("DELETE", this.versioned(`/egress-profiles/${resourcePath(name)}`));
   }
 
   async createTemplate(options: CreateTemplateOptions): Promise<Template> {
@@ -900,7 +1162,7 @@ export class APIClient {
     return new SandboxResource(this, fromApiSandbox(sandbox));
   }
 
-  private async doJSON<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async doJSON<T>(method: string, path: string, body?: unknown, options?: RequestOptions): Promise<T> {
     const init: RequestInit = {};
     if (body !== undefined) {
       init.body = JSON.stringify(body);
@@ -909,7 +1171,7 @@ export class APIClient {
       };
     }
 
-    const response = await this.request(method, path, init);
+    const response = await this.request(method, path, init, options);
     if (!response.ok) {
       throw await decodeError(response);
     }
@@ -930,15 +1192,19 @@ export class APIClient {
   /**
    * Low-level HTTP request with automatic retry for transient failures.
    *
-   * Transport-level errors (socket closed, connection reset, DNS blip) are
-   * always retried regardless of HTTP method — the request never reached the
-   * server so there is no idempotency concern.
+   * Transport-level errors (socket closed, connection reset, timeouts, DNS
+   * blip) and HTTP 421/429/502/503/504 are retried regardless of HTTP method.
+   * Several of those failures can happen after the server received the
+   * request, so a retry may deliver it twice; that is safe only because every
+   * mutating endpoint in the daemon is designed for idempotent retry (e.g.
+   * INSERT OR IGNORE + disambiguation).
    *
-   * HTTP-level retryable codes (421, 429, 502, 503, 504) are retried for ALL
-   * methods because every mutating endpoint in the daemon is already
-   * designed for idempotent retry (e.g. INSERT OR IGNORE + disambiguation).
+   * A request passed `{ idempotent: false }` (exec) retries only transport
+   * failures that prove the request never left the client and HTTP 429/503;
+   * everything else is surfaced to the caller rather than risk running the
+   * command twice.
    */
-  private async request(method: string, path: string, init: RequestInit = {}): Promise<Response> {
+  private async request(method: string, path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<Response> {
     const headers = new Headers(init.headers);
     if (this.#patToken !== "") {
       headers.set("Authorization", `Bearer ${this.#patToken}`);
@@ -947,6 +1213,9 @@ export class APIClient {
     const url = `${this.baseURL}${path}`;
     const requestInit: RequestInit = { ...init, method, headers };
     const { maxRetries, baseDelayMs, maxDelayMs } = this.retryConfig;
+    const idempotent = options.idempotent ?? true;
+    const retryableStatusCodes = idempotent ? RETRYABLE_STATUS_CODES : REFUSED_STATUS_CODES;
+    const isRetryableError = idempotent ? isTransientTransportError : isUnsentTransportError;
 
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -954,7 +1223,7 @@ export class APIClient {
         const response = await this.sendWithSafeRedirects(url, requestInit);
 
         // Retry on transient HTTP status codes.
-        if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxRetries) {
+        if (retryableStatusCodes.has(response.status) && attempt < maxRetries) {
           const delay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
           await jitteredDelay(delay);
           continue;
@@ -965,7 +1234,7 @@ export class APIClient {
         lastError = error;
 
         // Only retry transport-level failures; anything else propagates.
-        if (!isTransientTransportError(error) || attempt >= maxRetries) {
+        if (!isRetryableError(error) || attempt >= maxRetries) {
           throw error;
         }
 
@@ -1082,6 +1351,11 @@ export class SandboxResource implements Sandbox {
   declare osUser: string;
   declare env?: Record<string, string>;
   declare networkBlockAll: boolean;
+  declare egressStatus?: string;
+  declare egressProfiles?: string[];
+  declare egressProfilesApplied?: EgressProfileRef[];
+  declare networkEgressMode?: string;
+  declare networkEgressRules?: EgressRule[];
   declare toolboxEnabled: boolean;
   declare sshPublicKey?: string;
   declare sshPrivateKey?: string;
@@ -1245,6 +1519,39 @@ export class SandboxResource implements Sandbox {
     return this.client.setNetworkLimits(this.id, options);
   }
 
+  /**
+   * Replaces this sandbox's egress policy while it runs. The call returns
+   * once the new policy is enforced; sending the same policy again is a
+   * no-op, so it is safe to retry.
+   */
+  async setNetworkPolicy(options: NetworkPolicyOptions): Promise<NetworkPolicy> {
+    const policy = await this.client.setNetworkPolicy(this.id, options);
+    this.networkBlockAll = policy.networkBlockAll;
+    this.egressStatus = policy.egressStatus;
+    this.egressProfiles = policy.egressProfiles.length ? policy.egressProfiles : undefined;
+    this.networkEgressMode = policy.networkEgressMode === "learn" ? "learn" : undefined;
+    this.networkEgressRules = policy.networkEgressRules.length ? policy.networkEgressRules : undefined;
+    return policy;
+  }
+
+  /**
+   * Reads what this sandbox reached in learn mode and the allow list that
+   * would have allowed it. A recording stays readable after the sandbox
+   * switches to enforce, until it is destroyed.
+   */
+  async learned(): Promise<NetworkLearned> {
+    return this.client.getNetworkLearned(this.id);
+  }
+
+  /**
+   * Reads this sandbox's audit log: outbound connections and egress denials
+   * (`kind: "egress"`), and secret reads. Denials carry `result: "failure"`
+   * and the policy `reason`.
+   */
+  async audit(options?: AuditOptions): Promise<AuditPage> {
+    return this.client.getAudit(this.id, options);
+  }
+
   toJSON(options?: { includeSecrets?: boolean } | string): Sandbox {
     const includeSecrets = typeof options === "object" && options?.includeSecrets === true;
     const clone = cloneSandbox(this);
@@ -1276,6 +1583,9 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     network_block_all: options.networkBlockAll,
     network_allow_out: options.networkAllowOut,
     network_deny_out: options.networkDenyOut,
+    egress_profiles: options.egressProfiles,
+    network_egress_mode: options.networkEgressMode,
+    network_egress_rules: options.networkEgressRules?.map(toApiEgressRule),
     allow_public_traffic: options.allowPublicTraffic,
     mask_request_host: options.maskRequestHost,
     network_bytes_in_limit: options.networkBytesInLimit,
@@ -1291,6 +1601,16 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     module_ref: options.moduleRef,
     tenant_id: options.tenantId,
     custom_domains: options.customDomains,
+    gpus: options.gpus ? toApiGPUOptions(options.gpus) : undefined,
+    template_id: options.templateId,
+  };
+}
+
+function toApiGPUOptions(gpus: GPUOptions): Record<string, unknown> {
+  return {
+    vendor: gpus.vendor,
+    count: gpus.count,
+    device_ids: gpus.deviceIDs,
   };
 }
 
@@ -1371,6 +1691,11 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     osUser: sandbox.os_user,
     env: sandbox.env,
     networkBlockAll: sandbox.network_block_all,
+    egressStatus: sandbox.egress_status || undefined,
+    egressProfiles: sandbox.egress_profiles?.length ? sandbox.egress_profiles : undefined,
+    egressProfilesApplied: sandbox.egress_profiles_applied?.length ? sandbox.egress_profiles_applied : undefined,
+    networkEgressMode: sandbox.network_egress_mode || undefined,
+    networkEgressRules: sandbox.network_egress_rules?.length ? sandbox.network_egress_rules.map(fromApiEgressRule) : undefined,
     toolboxEnabled: sandbox.toolbox_enabled,
     sshPublicKey: sandbox.ssh_public_key,
     exposedPorts: sandbox.exposed_ports?.map(fromApiExposedPort),
@@ -1575,6 +1900,31 @@ function fromApiMountSpecRedacted(mount: ApiMountSpecRedacted): MountSpecRedacte
     readOnly: mount.read_only ?? false,
     hasCredentials: mount.has_credentials,
   };
+}
+
+function fromApiAuditPage(page: ApiAuditPage): AuditPage {
+  const out: AuditPage = {
+    events: (page.events ?? []).map((e): AuditEvent => ({
+      time: e.time,
+      kind: e.kind,
+      result: e.result,
+      reason: e.reason,
+      destination: e.destination,
+      network: e.network,
+      actor: e.actor,
+      ref: e.ref,
+      eventID: e.event_id,
+      incarnationID: e.incarnation_id,
+      dropped: e.dropped,
+    })),
+    coverage: {
+      answered: page.coverage?.answered ?? [],
+      missing: page.coverage?.missing ?? [],
+      partial: page.coverage?.partial ?? false,
+    },
+  };
+  if (page.next_cursor) out.nextCursor = page.next_cursor;
+  return out;
 }
 
 function fromApiNetworkUsage(usage: ApiNetworkUsage): NetworkUsage {
