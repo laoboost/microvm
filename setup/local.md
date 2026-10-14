@@ -31,10 +31,12 @@ No port-forwarding, DNS, or firewall changes are needed - the API binds to
 macOS (as yourself, **no** `sudo`):
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+# Stage the PAT in a file only you can read first — argv is visible in `ps` and shell history.
+install -m 0600 /dev/null "$HOME/pat-token"   # then paste the PAT into it
+curl -fsSL https://aerolvm.aerol.ai \
   | bash -s -- \
       --local \
-      --pat-token your-secret-pat
+      --pat-token-file "$HOME/pat-token"
 ```
 
 Linux:
@@ -42,7 +44,7 @@ Linux:
 ```bash
 # Stage the PAT in a root-only file first — argv is visible in `ps` and shell history.
 sudo install -m 0600 /dev/null /root/pat-token   # then paste the PAT into it
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --local \
       --pat-token-file /root/pat-token

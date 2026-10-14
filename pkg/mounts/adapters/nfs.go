@@ -20,7 +20,7 @@ type NFS struct{}
 // privileged or service-manager semantics.
 //
 // ro/rw/nosuid/nodev/noexec are the safe spellings callers legitimately write
-// (docs/external-storage.md shows opts:"ro,vers=4"). ro/rw are folded into the
+// (docs/src/content/docs/external-storage.mdx shows opts:"ro,vers=4"). ro/rw are folded into the
 // readOnly decision below; nosuid/nodev are re-forced at the end; noexec is
 // harmless hardening and is passed through.
 var nfsOptsAllowlist = map[string]struct{}{

@@ -1,7 +1,7 @@
 package service
 
 // Tests pinning the start-after-stop re-establish contract from
-// docs/external-storage.md ("On Start it's re-established"): after ANY stop —
+// docs/src/content/docs/external-storage.mdx ("On Start it's re-established"): after ANY stop —
 // the API/lifecycle path (stopSandboxInternal) or the involuntary
 // die/stop/oom event path — StartSandbox re-establishes ALL mounts fresh
 // (new mount processes, arguments re-read from the stored specs, ready-wait)

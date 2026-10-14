@@ -24,6 +24,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::blocking::{
@@ -44,13 +45,18 @@ pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
-    AddCustomDomainOptions, BuildImageOptions, BuildImagePushOptions, BuildImageResult,
+    AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
+    EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
+    ListEgressProfilesOptions, NetworkLearned, NetworkLearnedEntry,
+    NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
+    BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
     CreateWasmModuleOptions,
     CustomDomain,
     CustomDomainDnsRecords,
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
-    ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, IngressTarget, Lifecycle,
+    ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
+    IngressTarget, Lifecycle,
     MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlatformVolumeMount,
     RegisterSnapshotOptions, RegistryAuth,
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
@@ -192,6 +198,70 @@ fn is_cross_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
 }
 
 const MAX_REDIRECTS: usize = 5;
+
+/// Bounds only the TCP/TLS connect, which no legitimate call needs long for.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `HttpClient::new()` caps every request at 30 s in total, which fails any
+/// exec, build or upload that legitimately runs longer, so production passes
+/// `None` (no total cap) and leaves ending long calls to the server's own
+/// limits, such as exec `timeout_seconds`. The argument exists so a test can
+/// prove the value reaches reqwest rather than its 30 s default.
+///
+/// The transport never follows redirects itself
+/// ([`reqwest::redirect::Policy::none`]); [`Client::send_following_redirects`]
+/// walks them with per-hop credential hygiene.
+fn build_http_client(total_timeout: Option<Duration>) -> Result<HttpClient, Error> {
+    HttpClient::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(total_timeout)
+        .build()
+        .map_err(Error::Reqwest)
+}
+
+/// Which failures [`Client::send_json`] answers by sending the request again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryPolicy {
+    /// The daemon designs these endpoints for retry under duplicates, so any
+    /// transport error and the routing/overload statuses re-send.
+    Idempotent,
+    /// Re-sending repeats the work (exec runs the user's command again), so
+    /// only re-send what provably did none: a connection that never opened,
+    /// or a 429/503 the server refused up front. A timeout, reset or 502/504
+    /// can arrive after the command started, so it goes to the caller.
+    UnsentOnly,
+}
+
+impl RetryPolicy {
+    fn retries_status(self, status: reqwest::StatusCode) -> bool {
+        use reqwest::StatusCode as S;
+        match self {
+            // 421: misdirected (connection coalescing or a stale route); the
+            // server closed the connection, so the retry reconnects.
+            RetryPolicy::Idempotent => [
+                S::MISDIRECTED_REQUEST,
+                S::TOO_MANY_REQUESTS,
+                S::BAD_GATEWAY,
+                S::SERVICE_UNAVAILABLE,
+                S::GATEWAY_TIMEOUT,
+            ]
+            .contains(&status),
+            RetryPolicy::UnsentOnly => {
+                [S::TOO_MANY_REQUESTS, S::SERVICE_UNAVAILABLE].contains(&status)
+            }
+        }
+    }
+
+    fn retries_error(self, err: &reqwest::Error) -> bool {
+        match self {
+            RetryPolicy::Idempotent => err.is_request() || err.is_connect() || err.is_timeout(),
+            // is_connect covers refused, DNS failure and connect timeout, all
+            // of which fail before a byte of the request is written.
+            RetryPolicy::UnsentOnly => err.is_connect(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Client {
@@ -390,8 +460,10 @@ impl Sandbox {
         Ok(self)
     }
 
-    pub fn exec(&self, request: ExecRequest) -> Result<ExecResult, Error> {
-        self.client.exec(&self.data.id, request)
+    /// Runs a command and waits for it to exit. See [`Client::exec`] for why a
+    /// failure after the request was sent is returned instead of retried.
+    pub fn exec(&self, request: impl Into<ExecRequest>) -> Result<ExecResult, Error> {
+        self.client.exec(&self.data.id, request.into())
     }
 
     /// Read this sandbox's clone-generation token (changes on
@@ -540,6 +612,42 @@ impl Sandbox {
     pub fn set_network_limits(&self, opts: SetNetworkLimitsOptions) -> Result<NetworkUsage, Error> {
         self.client.set_network_limits(&self.data.id, opts)
     }
+
+    /// Replaces this sandbox's egress policy while it runs (see
+    /// [`Client::set_network_policy`]) and updates its policy fields.
+    pub fn set_network_policy(&mut self, opts: NetworkPolicyOptions) -> Result<NetworkPolicy, Error> {
+        let policy = self.client.set_network_policy(&self.data.id, opts)?;
+        self.data.network_block_all = policy.network_block_all;
+        self.data.egress_status = policy.egress_status.clone();
+        self.data.egress_profiles = if policy.egress_profiles.is_empty() {
+            None
+        } else {
+            Some(policy.egress_profiles.clone())
+        };
+        self.data.network_egress_mode = if policy.network_egress_mode == "learn" {
+            Some("learn".to_string())
+        } else {
+            None
+        };
+        self.data.network_egress_rules = if policy.network_egress_rules.is_empty() {
+            None
+        } else {
+            Some(policy.network_egress_rules.clone())
+        };
+        Ok(policy)
+    }
+
+    /// Reads what this sandbox reached in learn mode. A recording stays
+    /// readable after a switch to enforce, until the sandbox is destroyed.
+    pub fn learned(&self) -> Result<NetworkLearned, Error> {
+        self.client.get_network_learned(&self.data.id)
+    }
+
+    /// Reads one page of this sandbox's audit log: outbound connections and
+    /// egress denials (kind "egress") and secret reads.
+    pub fn audit(&self, opts: AuditOptions) -> Result<AuditPage, Error> {
+        self.client.get_audit(&self.data.id, opts)
+    }
 }
 
 impl Client {
@@ -590,9 +698,7 @@ impl Client {
             api_url,
             pat_token,
             api_version,
-            inner: HttpClient::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            inner: build_http_client(None)?,
             retry_config: config.retry.unwrap_or_default(),
         })
     }
@@ -1183,6 +1289,20 @@ impl Client {
         self.do_json::<(), HealthStatus>(Method::GET, "/health", None)
     }
 
+    /// Asks whether a sandbox created with these egress fields would reach a
+    /// destination, with the same matcher the filter enforces. No sandbox is
+    /// needed.
+    pub fn check_network_policy(
+        &self,
+        opts: NetworkPolicyCheckOptions,
+    ) -> Result<NetworkPolicyCheckResult, Error> {
+        self.do_json::<NetworkPolicyCheckOptions, NetworkPolicyCheckResult>(
+            Method::POST,
+            &format!("{}/network/policy/check", self.version_prefix()),
+            Some(&opts),
+        )
+    }
+
     pub fn mounts(&self, id: &str) -> Result<Vec<MountSpecRedacted>, Error> {
         #[derive(serde::Deserialize)]
         struct MountList {
@@ -1221,6 +1341,63 @@ impl Client {
         )
     }
 
+    /// Reads what a sandbox reached in learn mode and the allow list that
+    /// would have allowed it.
+    pub fn get_network_learned(&self, id: &str) -> Result<NetworkLearned, Error> {
+        self.do_json::<(), NetworkLearned>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/network/learned", self.version_prefix(), resource_path(id)),
+            None,
+        )
+    }
+
+    fn egress_profile_path(&self, name: &str) -> String {
+        format!("{}/egress-profiles/{}", self.version_prefix(), resource_path(name))
+    }
+
+    /// Creates or replaces a named egress profile (a full replace: the same
+    /// body twice is a no-op). A change reaches every sandbox using it.
+    pub fn put_egress_profile(&self, name: &str, opts: EgressProfileOptions) -> Result<EgressProfile, Error> {
+        self.do_json::<EgressProfileOptions, EgressProfile>(Method::PUT, &self.egress_profile_path(name), Some(&opts))
+    }
+
+    pub fn get_egress_profile(&self, name: &str) -> Result<EgressProfile, Error> {
+        self.do_json::<(), EgressProfile>(Method::GET, &self.egress_profile_path(name), None)
+    }
+
+    pub fn list_egress_profiles(&self, opts: ListEgressProfilesOptions) -> Result<EgressProfileList, Error> {
+        let mut path = format!("{}/egress-profiles", self.version_prefix());
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        self.do_json::<(), EgressProfileList>(Method::GET, &path, None)
+    }
+
+    /// Deletes a profile; one that sandboxes still reference is refused (409).
+    pub fn delete_egress_profile(&self, name: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.egress_profile_path(name), None)
+    }
+
+    pub fn get_audit(&self, id: &str, opts: AuditOptions) -> Result<AuditPage, Error> {
+        let mut path = format!("{}/sandboxes/{}/audit", self.version_prefix(), resource_path(id));
+        if let Some(kind) = &opts.kind {
+            path = append_query_param(&path, "kind", kind);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(inc) = &opts.incarnation_id {
+            path = append_query_param(&path, "incarnation_id", inc);
+        }
+        self.do_json::<(), AuditPage>(Method::GET, &path, None)
+    }
+
     pub fn set_network_limits(
         &self,
         id: &str,
@@ -1233,8 +1410,27 @@ impl Client {
         )
     }
 
+    /// Replaces a sandbox's egress policy while it runs and returns once the
+    /// new policy is enforced. Sending the same policy again is a no-op, so
+    /// it is safe to retry.
+    pub fn set_network_policy(
+        &self,
+        id: &str,
+        opts: NetworkPolicyOptions,
+    ) -> Result<NetworkPolicy, Error> {
+        self.do_json::<NetworkPolicyOptions, NetworkPolicy>(
+            Method::PUT,
+            &format!("{}/sandboxes/{}/network/policy", self.version_prefix(), resource_path(id)),
+            Some(&opts),
+        )
+    }
+
+    /// Runs a command and waits for it to exit. Unlike other calls, a failure
+    /// after the request may have reached the sandbox (timeout, reset, 502,
+    /// 504) is returned rather than retried, because a re-send would run the
+    /// command a second time; the command may or may not have run.
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
-        self.do_json::<ExecRequest, ExecResult>(
+        let (body, _) = self.send_json::<ExecRequest, ExecResult>(
             Method::POST,
             &format!(
                 "{}/sandboxes/{}/toolbox/process/execute",
@@ -1242,7 +1438,9 @@ impl Client {
                 resource_path(id)
             ),
             Some(&request),
-        )
+            RetryPolicy::UnsentOnly,
+        )?;
+        Ok(body)
     }
 
     pub fn create_session(&self, id: &str, opts: CreateSessionOptions) -> Result<Session, Error> {
@@ -1738,6 +1936,16 @@ impl Client {
         path: &str,
         payload: Option<&T>,
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        self.send_json(method, path, payload, RetryPolicy::Idempotent)
+    }
+
+    fn send_json<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+        policy: RetryPolicy,
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
         let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
         let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
@@ -1765,16 +1973,7 @@ impl Client {
 
             match send_result {
                 Ok(response) => {
-                    let status = response.status();
-                    // 421: misdirected (connection coalescing or a stale route);
-                    // the server closed the connection, so the retry reconnects.
-                    if (status == reqwest::StatusCode::MISDIRECTED_REQUEST
-                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status == reqwest::StatusCode::BAD_GATEWAY
-                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT)
-                        && attempt < max_retries
-                    {
+                    if attempt < max_retries && policy.retries_status(response.status()) {
                         // Fall through to retry logic
                     } else {
                         let response = self.handle_response(response)?;
@@ -1788,7 +1987,7 @@ impl Client {
                     }
                 }
                 Err(Error::Reqwest(err)) => {
-                    if attempt >= max_retries || !err.is_request() && !err.is_connect() && !err.is_timeout() {
+                    if attempt >= max_retries || !policy.retries_error(&err) {
                         return Err(Error::Reqwest(err));
                     }
                 }
@@ -2113,6 +2312,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::thread;
     use tokio_tungstenite::accept_async;
@@ -2150,6 +2350,83 @@ mod tests {
         });
 
         (format!("http://{}", addr), request_rx)
+    }
+
+    /// One scripted answer per accepted connection.
+    enum Reply {
+        /// Read the whole request, then close without answering, as a daemon
+        /// or proxy that dies mid-call does.
+        Hangup,
+        Json {
+            status: &'static str,
+            body: String,
+            delay: Duration,
+        },
+    }
+
+    impl Reply {
+        fn ok(body: String) -> Self {
+            Reply::Json { status: "200 OK", body, delay: Duration::ZERO }
+        }
+
+        fn status(status: &'static str) -> Self {
+            Reply::Json {
+                status,
+                body: r#"{"error":"scripted"}"#.to_string(),
+                delay: Duration::ZERO,
+            }
+        }
+    }
+
+    /// Serves `script` one connection at a time and counts the requests it
+    /// read. The last reply repeats for every further connection, so a client
+    /// that re-sends more than expected is counted rather than refused.
+    fn spawn_scripted_server(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = hits.clone();
+        thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = read_http_request(&mut stream);
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                if let Reply::Json { status, body, delay } = &script[i.min(script.len() - 1)] {
+                    thread::sleep(*delay);
+                    let head = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        body.len()
+                    );
+                    // The client may have given up already; that is the point
+                    // of some scripts, so a failed write is not an error.
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                }
+            }
+        });
+        (format!("http://{}", addr), hits)
+    }
+
+    /// Retries in milliseconds, so a test that counts re-sends stays fast.
+    fn fast_retry_client(url: &str) -> Client {
+        Client::with_config(
+            ClientConfig {
+                api_url: Some(url.to_string()),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig {
+                    max_retries: Some(3),
+                    base_delay_ms: Some(1),
+                    max_delay_ms: Some(5),
+                }),
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build")
+    }
+
+    fn exec_ok_json() -> String {
+        serde_json::json!({"stdout": "", "stderr": "", "exit_code": 0, "duration_ms": 1}).to_string()
     }
 
     fn spawn_create_with_image_server() -> (String, std::sync::mpsc::Receiver<String>) {
@@ -2323,6 +2600,9 @@ mod tests {
             network_block_all: None,
             network_allow_out: None,
             network_deny_out: None,
+            egress_profiles: None,
+            network_egress_mode: None,
+            network_egress_rules: None,
             allow_public_traffic: None,
             mask_request_host: None,
             network_bytes_in_limit: None,
@@ -2334,6 +2614,7 @@ mod tests {
             lifecycle: None,
             failover: None,
             runtime: None,
+            template_id: None,
             gpus: None,
             custom_domains: None,
             durability: None,
@@ -2497,6 +2778,117 @@ mod tests {
             .expect("421 should be retried to success");
         assert_eq!(sandbox.data.id, "sb-421");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // The proven failure: a 40 s exec ran four times because a transport
+    // error after the POST was sent re-sent it. Once the server has read the
+    // request, the failure must reach the caller with the command sent once.
+    #[test]
+    fn exec_does_not_resend_after_the_request_was_sent() {
+        let (url, hits) = spawn_scripted_server(vec![Reply::Hangup]);
+        let err = fast_retry_client(&url)
+            .exec("sb-1", ExecRequest::from("sleep 40"))
+            .expect_err("a hangup after the request was sent must surface");
+        assert!(matches!(err, Error::Reqwest(_)), "unexpected error: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    // 429 and 503 are refusals before any work, so exec re-sends them; 421,
+    // 502 and 504 can follow a command that already started, so they surface.
+    #[test]
+    fn exec_retries_only_up_front_refusal_statuses() {
+        for (status, retried) in [
+            ("429 Too Many Requests", true),
+            ("503 Service Unavailable", true),
+            ("421 Misdirected Request", false),
+            ("502 Bad Gateway", false),
+            ("504 Gateway Timeout", false),
+        ] {
+            let (url, hits) =
+                spawn_scripted_server(vec![Reply::status(status), Reply::ok(exec_ok_json())]);
+            let result = fast_retry_client(&url).exec("sb-1", ExecRequest::from("true"));
+            assert_eq!(result.is_ok(), retried, "{}: {:?}", status, result.as_ref().err());
+            assert_eq!(hits.load(Ordering::SeqCst), if retried { 2 } else { 1 }, "{}", status);
+        }
+    }
+
+    // Refused means the connection never opened, so nothing ran and exec may
+    // re-send. Nothing listens, so attempts are counted by time instead: each
+    // re-send first sleeps its backoff (at least 75% of 40 + 80 + 160 ms
+    // here), while an unretried refusal on loopback returns at once.
+    #[test]
+    fn exec_retries_connection_refused() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("listener should bind")
+            .local_addr()
+            .expect("listener address")
+            .port();
+        let client = Client::with_config(
+            ClientConfig {
+                api_url: Some(format!("http://127.0.0.1:{}", port)),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig {
+                    max_retries: Some(3),
+                    base_delay_ms: Some(40),
+                    max_delay_ms: Some(1000),
+                }),
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build");
+        let started = std::time::Instant::now();
+        let err = client
+            .exec("sb-1", ExecRequest::from("true"))
+            .expect_err("nothing listens on the port");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&err, Error::Reqwest(inner) if inner.is_connect()),
+            "unexpected error: {}",
+            err
+        );
+        assert!(elapsed >= Duration::from_millis(200), "refusal was not retried: {:?}", elapsed);
+    }
+
+    // Every other call is safe to repeat, so an ambiguous failure (the
+    // connection dying after the request was read) still re-sends.
+    #[test]
+    fn get_still_retries_a_hangup_after_the_request_was_sent() {
+        let body = named_sandbox_json("sb-1", "web").to_string();
+        let (url, hits) = spawn_scripted_server(vec![Reply::Hangup, Reply::ok(body)]);
+        let sandbox = fast_retry_client(&url)
+            .get("sb-1")
+            .expect("get should retry to success");
+        assert_eq!(sandbox.data.id, "sb-1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    // reqwest's 30 s default total timeout failed every exec longer than
+    // 30 s. Waiting that out is too slow for a unit test, so prove both
+    // halves: the value build_http_client takes reaches reqwest (a 50 ms cap
+    // trips on a reply 300 ms away), and the client Client::new builds waits
+    // for that same slow reply.
+    #[test]
+    fn http_client_has_no_total_request_timeout() {
+        let slow = |body: String| Reply::Json {
+            status: "200 OK",
+            body,
+            delay: Duration::from_millis(300),
+        };
+        let (url, _) = spawn_scripted_server(vec![slow("{}".to_string())]);
+        let err = build_http_client(Some(Duration::from_millis(50)))
+            .expect("client should build")
+            .get(&url)
+            .send()
+            .expect_err("a 50 ms cap must trip on a 300 ms reply");
+        assert!(err.is_timeout(), "unexpected error: {}", err);
+
+        let (url, hits) = spawn_scripted_server(vec![slow(exec_ok_json())]);
+        let result = Client::new(Some(&url), Some("pat-token"))
+            .expect("client should build")
+            .exec("sb-1", ExecRequest::from("sleep 1"))
+            .expect("a slow exec must not time out");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3165,6 +3557,82 @@ mod tests {
     }
 
     #[test]
+    fn check_network_policy_posts_and_maps() {
+        let body = serde_json::json!({"allowed": true, "matched_rule": "*.github.com", "default_verdict": "deny"}).to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let res = client
+            .check_network_policy(NetworkPolicyCheckOptions {
+                network_allow_out: vec!["*.github.com".to_string()],
+                destination: "api.github.com".to_string(),
+                ..Default::default()
+            })
+            .expect("check should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("POST /v1/network/policy/check HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(request.contains("\"network_allow_out\":[\"*.github.com\"]"), "body: {}", request);
+        assert!(!request.contains("network_block_all"), "unset fields are not sent: {}", request);
+        assert!(res.allowed);
+        assert_eq!(res.matched_rule, "*.github.com");
+        assert_eq!(res.outside_ceiling, None);
+    }
+
+    #[test]
+    fn get_audit_sends_filters_and_maps_page() {
+        let body = serde_json::json!({
+            "events": [{
+                "time": "2026-10-06T10:00:00Z",
+                "kind": "egress",
+                "result": "failure",
+                "reason": "host_not_allowed",
+                "destination": "evil.example:443",
+                "event_id": "ae-1"
+            }],
+            "coverage": {"answered": ["n1"], "missing": null, "partial": false},
+            "next_cursor": "c2"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .get_audit(
+                "sb-1",
+                AuditOptions {
+                    kind: Some("egress".to_string()),
+                    limit: Some(50),
+                    cursor: Some("c1".to_string()),
+                    incarnation_id: Some("inc-1".to_string()),
+                },
+            )
+            .expect("get_audit should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with(
+                "GET /v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1 HTTP/1.1\r\n"
+            ),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(page.events[0].reason.as_deref(), Some("host_not_allowed"));
+        assert_eq!(page.events[0].event_id.as_deref(), Some("ae-1"));
+        assert_eq!(page.coverage.answered, vec!["n1".to_string()]);
+        assert!(page.coverage.missing.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn get_audit_without_options_and_null_events() {
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"events": null}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .get_audit("sb-1", AuditOptions::default())
+            .expect("get_audit should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/audit HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(page.events.is_empty());
+    }
+
+    #[test]
     fn get_network_usage_maps_response_shape() {
         let body = serde_json::json!({
             "sandbox_id": "sb-1",
@@ -3212,6 +3680,292 @@ mod tests {
             .get_network_usage("sb-fresh")
             .expect("get_network_usage should succeed");
         assert_eq!(usage.last_sampled_at, None);
+    }
+
+    #[test]
+    fn set_network_policy_puts_whole_policy() {
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["pypi.org"],
+            "network_deny_out": [],
+            "egress_status": "active"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": true,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker"
+        }))
+        .expect("sandbox data should parse");
+        let mut sandbox = Sandbox::new(client, data);
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["pypi.org".to_string()],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("PUT /v1/sandboxes/sb-1/network/policy HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({"network_block_all": false, "network_allow_out": ["pypi.org"], "network_deny_out": [], "egress_profiles": []})
+        );
+        assert_eq!(policy.network_allow_out, vec!["pypi.org".to_string()]);
+        assert!(!sandbox.data.network_block_all);
+        assert_eq!(sandbox.data.egress_status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn set_network_policy_sends_and_syncs_egress_rules() {
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["api.github.com"],
+            "network_deny_out": [],
+            "network_egress_rules": [{"host": "api.github.com", "ports": [443], "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": true}]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [{"host": "old.example", "ports": null}]
+        }))
+        .expect("sandbox data should parse");
+        assert_eq!(data.network_egress_rules.as_ref().map(|r| r[0].ports.is_empty()), Some(true));
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "api.github.com".to_string(),
+            methods: vec!["GET".to_string()],
+            paths: vec!["/repos/acme/**".to_string()],
+            inspect: true,
+            ..Default::default()
+        };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["api.github.com".to_string()],
+                network_egress_rules: vec![rule],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([{"host": "api.github.com", "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": true}])
+        );
+        assert_eq!(policy.network_egress_rules[0].ports, vec![443]);
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[0].host, "api.github.com");
+        assert!(synced[0].inspect);
+    }
+
+    #[test]
+    fn egress_rule_inject_round_trips_as_secret_ref() {
+        let wire = serde_json::json!({
+            "host": "api.github.com", "ports": [443], "paths": ["/repos/**"], "inspect": true,
+            "inject": {"header": "Authorization", "secret_ref": "env:GITHUB_TOKEN"}
+        });
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["api.github.com"],
+            "network_deny_out": [],
+            "network_egress_rules": [wire.clone()]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [wire.clone(), {"host": "pypi.org", "inject": null}]
+        }))
+        .expect("sandbox data should parse");
+        let inject = EgressInject {
+            header: "Authorization".to_string(),
+            secret_ref: "env:GITHUB_TOKEN".to_string(),
+        };
+        let parsed = data.network_egress_rules.as_ref().expect("rules should parse");
+        assert_eq!(parsed[0].inject.as_ref(), Some(&inject));
+        assert_eq!(parsed[1].inject, None);
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "api.github.com".to_string(),
+            paths: vec!["/repos/**".to_string()],
+            inspect: true,
+            inject: Some(inject.clone()),
+            ..Default::default()
+        };
+        let plain = EgressRule { host: "api.github.com".to_string(), ..Default::default() };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["api.github.com".to_string()],
+                network_egress_rules: vec![rule, plain],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([
+                {"host": "api.github.com", "paths": ["/repos/**"], "inspect": true,
+                 "inject": {"header": "Authorization", "secret_ref": "env:GITHUB_TOKEN"}},
+                {"host": "api.github.com"}
+            ])
+        );
+        assert_eq!(policy.network_egress_rules[0].inject.as_ref(), Some(&inject));
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[0].inject.as_ref(), Some(&inject));
+    }
+
+    #[test]
+    fn egress_rule_binaries_round_trip() {
+        let git = serde_json::json!({"host": "github.com", "ports": [22], "binaries": ["/usr/bin/git"]});
+        let pip = serde_json::json!({"host": "pypi.org", "ports": [443], "binaries": ["/usr/local/bin/pip"]});
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["github.com:22", "pypi.org"],
+            "network_deny_out": [],
+            "network_egress_rules": [git.clone(), pip.clone()]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [git.clone(), {"host": "pypi.org", "binaries": null}]
+        }))
+        .expect("sandbox data should parse");
+        let parsed = data.network_egress_rules.as_ref().expect("rules should parse");
+        assert_eq!(parsed[0].binaries, vec!["/usr/bin/git".to_string()]);
+        assert!(parsed[1].binaries.is_empty());
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "github.com".to_string(),
+            ports: vec![22],
+            binaries: vec!["/usr/bin/git".to_string()],
+            ..Default::default()
+        };
+        let plain = EgressRule { host: "pypi.org".to_string(), ..Default::default() };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["github.com:22".to_string(), "pypi.org".to_string()],
+                network_egress_rules: vec![rule.clone(), plain],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([git, {"host": "pypi.org"}])
+        );
+        assert_eq!(policy.network_egress_rules[0], rule);
+        assert_eq!(policy.network_egress_rules[1].binaries, vec!["/usr/local/bin/pip".to_string()]);
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[1].binaries, vec!["/usr/local/bin/pip".to_string()]);
+    }
+
+    #[test]
+    fn exec_request_defaults_the_options() {
+        let req = ExecRequest { command: "true".to_string(), ..Default::default() };
+        assert!(req.work_dir.is_none() && req.env.is_none() && req.timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn exec_request_from_plain_command_string() {
+        for req in [ExecRequest::from("echo hello"), ExecRequest::from("echo hello".to_string())] {
+            assert_eq!(req.command, "echo hello");
+            assert!(req.work_dir.is_none() && req.env.is_none() && req.timeout_seconds.is_none());
+        }
+    }
+
+    #[test]
+    fn sandbox_exec_accepts_plain_command_string() {
+        let body = serde_json::json!({"stdout": "hello\n", "stderr": "", "exit_code": 0, "duration_ms": 3}).to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker"
+        }))
+        .expect("sandbox data should parse");
+        let sandbox = Sandbox::new(client, data);
+        let result = sandbox.exec("echo hello").expect("exec should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/toolbox/process/execute HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(request_json_body(&request), serde_json::json!({"command": "echo hello"}));
+        assert_eq!(result.stdout, "hello\n");
+    }
+
+    #[test]
+    fn get_network_learned_maps_nulls() {
+        let body = serde_json::json!({
+            "mode": "learn", "truncated": false,
+            "entries": [{"host": "pypi.org", "ports": null, "hits": 1}],
+            "cidrs": null, "suggested_allow_out": ["pypi.org"], "suggested_profile": null
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let learned = client.get_network_learned("sb-1").expect("learned should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/network/learned HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(learned.mode, "learn");
+        assert!(learned.entries[0].ports.is_empty());
+        assert!(learned.cidrs.is_empty());
+        assert_eq!(learned.suggested_allow_out, vec!["pypi.org".to_string()]);
+        assert!(learned.suggested_profile.is_none());
+    }
+
+    #[test]
+    fn egress_profile_crud_maps_wire_shape() {
+        let body = serde_json::json!({
+            "name": "python", "allow_out": ["pypi.org"], "description": "pip",
+            "generation": 2, "created_at": "c", "updated_at": "u"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let profile = client
+            .put_egress_profile(
+                "python",
+                EgressProfileOptions { allow_out: vec!["pypi.org".to_string()], description: "pip".to_string() },
+            )
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("PUT /v1/egress-profiles/python HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(request_json_body(&request), serde_json::json!({"allow_out": ["pypi.org"], "description": "pip"}));
+        assert_eq!(profile.generation, 2);
+        assert_eq!(profile.description, "pip");
+
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"profiles": null, "next_cursor": "z"}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_egress_profiles(ListEgressProfilesOptions { cursor: Some("a".to_string()), limit: Some(5) })
+            .expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/egress-profiles?cursor=a&limit=5 HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(page.profiles.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("z"));
     }
 
     #[test]
@@ -3610,6 +4364,41 @@ mod tests {
         let value = serde_json::to_value(&opts).expect("serialize create options");
         assert_eq!(value["name"], "agent");
         assert_eq!(value["tags"]["a"], "b");
+    }
+
+    #[test]
+    fn create_sends_template_id_and_gpus() {
+        let (url, request_rx) = spawn_json_server(named_sandbox_json("sb-fc", "fc").to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client
+            .create(CreateOptions {
+                runtime: Some("firecracker".to_string()),
+                template_id: Some("tpl-1".to_string()),
+                gpus: Some(GPUOptions {
+                    vendor: GPUVendor::Nvidia,
+                    count: Some(2),
+                    device_ids: Some(vec!["0".to_string(), "GPU-abc".to_string()]),
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let body = request_json_body(&request_rx.recv().expect("request should be captured"));
+        assert_eq!(body["template_id"], "tpl-1");
+        assert_eq!(
+            body["gpus"],
+            serde_json::json!({"vendor": "nvidia", "count": 2, "device_ids": ["0", "GPU-abc"]})
+        );
+
+        let plain = serde_json::to_value(minimal_create_options()).expect("serialize");
+        assert!(plain.get("template_id").is_none());
+        assert!(plain.get("gpus").is_none());
+        let amd = serde_json::to_value(GPUOptions {
+            vendor: GPUVendor::Amd,
+            count: None,
+            device_ids: None,
+        })
+        .expect("serialize gpus");
+        assert_eq!(amd, serde_json::json!({"vendor": "amd"}));
     }
 
     #[test]

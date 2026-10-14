@@ -325,7 +325,7 @@ jobs:
           cache: true
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: dist-*
           path: dist/
@@ -361,7 +361,7 @@ jobs:
 
       - name: Attest release artifacts
         id: attest
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: dist/*
 
@@ -418,7 +418,7 @@ jobs:
           node-version: 22
 
       - name: Download the aerolvm binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: dist-aerolvm
           path: dist/

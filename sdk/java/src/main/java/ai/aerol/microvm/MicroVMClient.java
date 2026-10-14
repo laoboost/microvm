@@ -9,6 +9,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -26,6 +27,19 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
+import ai.aerol.microvm.model.AuditCoverage;
+import ai.aerol.microvm.model.EgressProfile;
+import ai.aerol.microvm.model.EgressProfileList;
+import ai.aerol.microvm.model.EgressProfileOptions;
+import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.NetworkLearned;
+import ai.aerol.microvm.model.NetworkLearnedEntry;
+import ai.aerol.microvm.model.NetworkPolicy;
+import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
+import ai.aerol.microvm.model.NetworkPolicyCheckResult;
+import ai.aerol.microvm.model.NetworkPolicyOptions;
+import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.BuildImageOptions;
 import ai.aerol.microvm.model.BuildImagePushOptions;
 import ai.aerol.microvm.model.BuildImageResult;
@@ -559,6 +573,117 @@ public class MicroVMClient {
     }
 
     /**
+     * Reads one page of a sandbox's audit log: outbound connections and
+     * egress denials (kind {@code "egress"}) and secret reads.
+     */
+    public AuditPage getAudit(String sandboxId, AuditOptions options) {
+        StringBuilder query = new StringBuilder();
+        if (options != null) {
+            appendQuery(query, "kind", options.getKind());
+            appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
+            appendQuery(query, "cursor", options.getCursor());
+            appendQuery(query, "incarnation_id", options.getIncarnationId());
+        }
+        AuditPage page = doJson("GET", sandboxPath(sandboxId) + "/audit" + query, null, AuditPage.class);
+        if (page == null) {
+            page = new AuditPage();
+        }
+        if (page.events == null) {
+            page.events = new ArrayList<>();
+        }
+        if (page.coverage == null) {
+            page.coverage = new AuditCoverage();
+        }
+        return page;
+    }
+
+    /**
+     * Reads what a sandbox reached in learn mode and the allow list that would
+     * have allowed it.
+     */
+    public NetworkLearned getNetworkLearned(String sandboxId) {
+        NetworkLearned learned = doJson("GET", sandboxPath(sandboxId) + "/network/learned", null, NetworkLearned.class);
+        if (learned == null) {
+            learned = new NetworkLearned();
+        }
+        if (learned.entries == null) {
+            learned.entries = new ArrayList<>();
+        }
+        for (NetworkLearnedEntry e : learned.entries) {
+            if (e.ports == null) {
+                e.ports = new ArrayList<>();
+            }
+        }
+        if (learned.cidrs == null) {
+            learned.cidrs = new ArrayList<>();
+        }
+        if (learned.suggestedAllowOut == null) {
+            learned.suggestedAllowOut = new ArrayList<>();
+        }
+        return learned;
+    }
+
+    /**
+     * Creates or replaces a named egress profile (a full replace: the same body
+     * twice is a no-op). A change reaches every sandbox that references it.
+     */
+    public EgressProfile putEgressProfile(String name, EgressProfileOptions options) {
+        EgressProfileOptions body = options == null ? new EgressProfileOptions() : options;
+        return withProfileDefaults(doJson("PUT", egressProfilePath(name), body, EgressProfile.class));
+    }
+
+    public EgressProfile getEgressProfile(String name) {
+        return withProfileDefaults(doJson("GET", egressProfilePath(name), null, EgressProfile.class));
+    }
+
+    public EgressProfileList listEgressProfiles(ListEgressProfilesOptions options) {
+        StringBuilder query = new StringBuilder();
+        if (options != null) {
+            appendQuery(query, "cursor", options.getCursor());
+            appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
+        }
+        EgressProfileList page = doJson("GET", versioned("/egress-profiles") + query, null, EgressProfileList.class);
+        if (page == null) {
+            page = new EgressProfileList();
+        }
+        if (page.profiles == null) {
+            page.profiles = new ArrayList<>();
+        }
+        return page;
+    }
+
+    public EgressProfileList listEgressProfiles() {
+        return listEgressProfiles(null);
+    }
+
+    /** Deletes a profile; one that sandboxes still reference is refused (409). */
+    public void deleteEgressProfile(String name) {
+        doNoContent("DELETE", egressProfilePath(name), null);
+    }
+
+    private String egressProfilePath(String name) {
+        return versioned("/egress-profiles/" + resourcePath(name));
+    }
+
+    private static EgressProfile withProfileDefaults(EgressProfile profile) {
+        if (profile != null && profile.allowOut == null) {
+            profile.allowOut = new ArrayList<>();
+        }
+        return profile;
+    }
+
+    public AuditPage getAudit(String sandboxId) {
+        return getAudit(sandboxId, null);
+    }
+
+    private static void appendQuery(StringBuilder query, String key, String value) {
+        if (value == null || value.isBlank()) {
+            return;
+        }
+        query.append(query.length() == 0 ? '?' : '&').append(key).append('=').append(encodeQueryValue(value));
+    }
+
+    /**
      * Reads a sandbox's clone-generation token. The token changes whenever the
      * sandbox is resumed from a snapshot, so a change signals "this is a clone."
      * Read-only — the SDK cannot reseed a process inside the guest; see the
@@ -572,8 +697,26 @@ public class MicroVMClient {
         return doJson("PATCH", sandboxPath(sandboxId) + "/network/limits", options, NetworkUsage.class);
     }
 
+    /**
+     * Replaces a sandbox's egress policy while it runs and returns once the new
+     * policy is enforced. Sending the same policy again is a no-op, so it is
+     * safe to retry.
+     */
+    public NetworkPolicy setNetworkPolicy(String sandboxId, NetworkPolicyOptions options) {
+        NetworkPolicyOptions body = options == null ? new NetworkPolicyOptions() : options;
+        return doJson("PUT", sandboxPath(sandboxId) + "/network/policy", body, NetworkPolicy.class);
+    }
+
+    /**
+     * Runs a command and waits for it to finish. Unlike every other call, a
+     * transport failure is retried only when the request provably never left
+     * the client (refused or timed-out connect, failed name lookup), or on
+     * HTTP 429/503: re-sending after the server may have received it would
+     * run the command a second time. Any other failure is thrown to the
+     * caller, who knows whether the command is safe to repeat.
+     */
     public ExecResult exec(String sandboxId, ExecRequest request) {
-        return doJson("POST", sandboxPath(sandboxId) + "/toolbox/process/execute", request, ExecResult.class);
+        return doJson("POST", sandboxPath(sandboxId) + "/toolbox/process/execute", request, ExecResult.class, RetryMode.UNSENT_ONLY);
     }
 
     public void uploadFile(String sandboxId, String targetPath, byte[] data) {
@@ -780,6 +923,15 @@ public class MicroVMClient {
         return doJson("GET", "/health", null, HealthStatus.class);
     }
 
+    /**
+     * Asks whether a sandbox created with these egress fields would reach a
+     * destination, with the same matcher the filter enforces. No sandbox is
+     * needed.
+     */
+    public NetworkPolicyCheckResult checkNetworkPolicy(NetworkPolicyCheckOptions options) {
+        return doJson("POST", versioned("/network/policy/check"), options, NetworkPolicyCheckResult.class);
+    }
+
     public ExecStreamHandle execStream(String sandboxId, ExecStreamOptions options) {
         ExecStreamOptions effective = options == null ? new ExecStreamOptions() : options;
         if (trimToNull(effective.command) == null) {
@@ -978,6 +1130,8 @@ public class MicroVMClient {
             return copy;
         }
         copy.image = source.image;
+        copy.name = source.name;
+        copy.tags = source.tags;
         copy.cpu = source.cpu;
         copy.memoryMb = source.memoryMb;
         copy.diskGb = source.diskGb;
@@ -986,6 +1140,9 @@ public class MicroVMClient {
         copy.networkBlockAll = source.networkBlockAll;
         copy.networkAllowOut = source.networkAllowOut;
         copy.networkDenyOut = source.networkDenyOut;
+        copy.egressProfiles = source.egressProfiles;
+        copy.networkEgressMode = source.networkEgressMode;
+        copy.networkEgressRules = source.networkEgressRules;
         copy.allowPublicTraffic = source.allowPublicTraffic;
         copy.maskRequestHost = source.maskRequestHost;
         copy.networkBytesInLimit = source.networkBytesInLimit;
@@ -993,6 +1150,7 @@ public class MicroVMClient {
         copy.registry = source.registry;
         copy.containerCommand = source.containerCommand;
         copy.mounts = source.mounts;
+        copy.platformVolumes = source.platformVolumes;
         copy.lifecycle = source.lifecycle;
         copy.failover = source.failover;
         copy.runtime = source.runtime;
@@ -1001,6 +1159,7 @@ public class MicroVMClient {
         copy.tenantId = source.tenantId;
         copy.gpus = source.gpus;
         copy.customDomains = source.customDomains;
+        copy.templateId = source.templateId;
         return copy;
     }
 
@@ -1023,7 +1182,11 @@ public class MicroVMClient {
     }
 
     private <T> T doJson(String method, String path, Object payload, Class<T> responseType) {
-        HttpResponse<byte[]> response = sendJsonRequest(method, path, payload);
+        return doJson(method, path, payload, responseType, RetryMode.IDEMPOTENT);
+    }
+
+    private <T> T doJson(String method, String path, Object payload, Class<T> responseType, RetryMode retryMode) {
+        HttpResponse<byte[]> response = sendJsonRequest(method, path, payload, retryMode);
         ensureSuccess(response);
         if (responseType == null || response.statusCode() == 204 || response.body().length == 0) {
             return null;
@@ -1037,11 +1200,15 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendJsonRequest(String method, String path, Object payload) {
+        return sendJsonRequest(method, path, payload, RetryMode.IDEMPOTENT);
+    }
+
+    private HttpResponse<byte[]> sendJsonRequest(String method, String path, Object payload, RetryMode retryMode) {
         if (payload == null) {
-            return sendRequest(method, path, HttpRequest.BodyPublishers.noBody(), null);
+            return sendRequest(method, path, HttpRequest.BodyPublishers.noBody(), null, null, retryMode);
         }
         byte[] body = JsonSupport.writeBytes(payload);
-        return sendRequest(method, path, HttpRequest.BodyPublishers.ofByteArray(body), "application/json");
+        return sendRequest(method, path, HttpRequest.BodyPublishers.ofByteArray(body), "application/json", null, retryMode);
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType) {
@@ -1049,6 +1216,10 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders) {
+        return sendRequest(method, path, bodyPublisher, contentType, extraHeaders, RetryMode.IDEMPOTENT);
+    }
+
+    private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders, RetryMode retryMode) {
         int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
         int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
         int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
@@ -1058,18 +1229,17 @@ public class MicroVMClient {
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             try {
                 HttpResponse<byte[]> response = sendFollowingRedirects(method, resolve(path), bodyPublisher, contentType, extraHeaders);
-                int status = response.statusCode();
-                // 421: misdirected (connection coalescing or a stale route); the
-                // server closed the connection, so the retry reconnects.
-                if ((status == 421 || status == 429 || status == 502 || status == 503 || status == 504) && attempt < maxRetries) {
+                if (attempt < maxRetries && retryMode.retriesStatus(response.statusCode())) {
                     // Fall through to retry logic
                 } else {
                     return response;
                 }
-            } catch (IOException | InterruptedException ex) {
-                if (ex instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                    throw new MicroVMException("request interrupted", ex);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new MicroVMException("request interrupted", ex);
+            } catch (IOException ex) {
+                if (!retryMode.retriesTransportFailure(ex)) {
+                    throw new MicroVMException("request failed and was not retried because the server may already have received it", ex);
                 }
                 lastException = ex;
                 if (attempt >= maxRetries) {
@@ -1370,6 +1540,65 @@ public class MicroVMClient {
         output.write("\r\n".getBytes(StandardCharsets.UTF_8));
         output.write(data);
         output.write("\r\n".getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * What {@code sendRequest} may re-send after a failure. A transport error
+     * does not mean the request never reached the server: a read timeout,
+     * reset or EOF can arrive after the server received the body and started
+     * the work.
+     */
+    enum RetryMode {
+        /**
+         * The default. The daemon designs these endpoints so a re-sent request
+         * is harmless, so any transport failure is retried, as are 421
+         * (misdirected: connection coalescing or a stale route; the server
+         * closed the connection, so the retry reconnects), 429, 502, 503 and
+         * 504.
+         */
+        IDEMPOTENT {
+            @Override
+            boolean retriesStatus(int status) {
+                return status == 421 || status == 429 || status == 502 || status == 503 || status == 504;
+            }
+
+            @Override
+            boolean retriesTransportFailure(IOException error) {
+                return true;
+            }
+        },
+        /**
+         * For requests whose re-send repeats a side effect (exec runs the
+         * command again). 429 and 503 are the daemon refusing before it starts
+         * the work. 502 and 504 come from a proxy that may have handed the
+         * request upstream before failing, and 421 does not prove the work did
+         * not start either, so they surface. Of transport failures, only
+         * connect-phase ones are retried.
+         */
+        UNSENT_ONLY {
+            @Override
+            boolean retriesStatus(int status) {
+                return status == 429 || status == 503;
+            }
+
+            @Override
+            boolean retriesTransportFailure(IOException error) {
+                // java.net.http reports every connect-phase failure (refused,
+                // unresolvable host, no route) as ConnectException and a connect
+                // timeout as HttpConnectTimeoutException; neither is ever thrown
+                // once the request is on the wire. The other two cover a
+                // caller-supplied HttpClient that surfaces the raw cause. A plain
+                // HttpTimeoutException is the response timeout, so it is not here.
+                return error instanceof java.net.ConnectException
+                    || error instanceof java.net.http.HttpConnectTimeoutException
+                    || error instanceof java.net.UnknownHostException
+                    || error instanceof java.net.NoRouteToHostException;
+            }
+        };
+
+        abstract boolean retriesStatus(int status);
+
+        abstract boolean retriesTransportFailure(IOException error);
     }
 
     private static final class MountListResponse {

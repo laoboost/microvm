@@ -10,9 +10,32 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
+func TestAsToolboxAddresserAbsent(t *testing.T) {
+	if _, ok := runtime.AsToolboxAddresser(nil); ok {
+		t.Fatal("nil runtime has no toolbox address")
+	}
+}
+
 func TestDockerClientSatisfiesContainerRuntime(t *testing.T) {
 	var _ runtime.Runtime = (*docker.Client)(nil)
 	var _ runtime.ContainerRuntime = (*docker.Client)(nil)
+}
+
+// Docker's start must re-adopt a warm-pool container with the sandbox's
+// identity, so the service has to find StartWithIdentity on the client it
+// was given; the other drivers start without it.
+func TestOnlyDockerStartsWithIdentity(t *testing.T) {
+	var _ runtime.IdentityStarter = (*docker.Client)(nil)
+	if _, ok := runtime.AsIdentityStarter((*docker.Client)(nil)); !ok {
+		t.Fatal("the Docker client must start with the sandbox's identity")
+	}
+	for name, rt := range map[string]runtime.Runtime{
+		"containerd": (*containerdruntime.Driver)(nil), "firecracker": (*firecracker.Driver)(nil), "wasm": (*wasmruntime.Driver)(nil),
+	} {
+		if _, ok := runtime.AsIdentityStarter(rt); ok {
+			t.Errorf("%s unexpectedly starts with an identity", name)
+		}
+	}
 }
 
 func TestContainerdDriverSatisfiesContainerRuntime(t *testing.T) {

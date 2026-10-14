@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -64,6 +65,15 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8
 	}
+	// A recreate of a hostname-filtered sandbox needs a gateway as much as
+	// its first create did: failover must not land it on a node that can
+	// only answer 501.
+	out.NeedsEgressGateway = models.RuntimeUsesEgressGateway(runtimeName) &&
+		egresspolicy.NeedsGatewayWith(spec.NetworkAllowOut, spec.NetworkDenyOut, spec.NetworkBlockAll,
+			spec.NetworkEgressMode == models.NetworkEgressModeLearn, len(spec.EgressProfiles))
+	// WASM and isolate filter in their own mediators, which an older peer
+	// lacks: it would store the policy and ignore it (review finding 10).
+	out.NeedsMediatedEgress = models.RuntimeMediatesEgress(runtimeName) && models.CreateHasEgress(spec)
 	if spec.GPUs != nil {
 		want := spec.GPUs.Count
 		if want <= 0 {
@@ -158,6 +168,16 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 			rejects["drained"]++
 			continue
 		}
+		// A hard capability rule like drain, kept out of nodeFits so the
+		// empty-set error can name it: "no gateway" is not "cluster full".
+		if req.NeedsEgressGateway && !m.Capacity.EgressGatewayReady {
+			rejects["egress_gateway"]++
+			continue
+		}
+		if req.NeedsMediatedEgress && !m.Capacity.MediatedEgress {
+			rejects["mediated_egress"]++
+			continue
+		}
 		if !nodeFits(m, req, pending[m.NodeID]) {
 			rejects["capacity"]++
 			continue
@@ -168,7 +188,7 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
 		recordSchedulerDecision("no_target", 0, rejects)
-		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable)
+		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable, rejects["egress_gateway"] > 0)
 	}
 
 	// Power-of-two-choices.
@@ -300,6 +320,13 @@ func secretRecipientScore(sandboxID, nodeID string) uint64 {
 // because that's what the remote admitter will check. extraReserved is the sum
 // of in-flight reservations the cluster has against this node but the
 // heartbeat doesn't yet reflect (zero value when none).
+//
+// Parked warm-pool slots are left out of the reserved side: the worker's
+// admitter reclaims them for a real sandbox, so counting them made a node the
+// pool had filled look full to every create it could have served. A peer that
+// does not report Parked* reads as zero, which is the old accounting.
+// headroomScore still counts them, so a node with genuinely free room wins
+// before warm slots are given up.
 func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bool {
 	cap := m.Capacity
 	if m.CapacityStale || !hasCapacitySnapshot(cap) {
@@ -308,13 +335,16 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 	if !cap.CanAdmit && len(cap.Reasons) > 0 {
 		return false
 	}
-	if cap.CPUBudget > 0 && cap.ReservedCPU+extraReserved.CPU+req.CPU > cap.CPUBudget {
+	reservedCPU := max(cap.ReservedCPU-cap.ParkedCPU, 0)
+	reservedMemMB := max(cap.ReservedMemoryMB-cap.ParkedMemoryMB, 0)
+	reservedDiskGB := max(cap.ReservedDiskGB-cap.ParkedDiskGB, 0)
+	if cap.CPUBudget > 0 && reservedCPU+extraReserved.CPU+req.CPU > cap.CPUBudget {
 		return false
 	}
-	if cap.MemoryBudgetMB > 0 && cap.ReservedMemoryMB+extraReserved.MemoryMB+req.MemoryMB > cap.MemoryBudgetMB {
+	if cap.MemoryBudgetMB > 0 && reservedMemMB+extraReserved.MemoryMB+req.MemoryMB > cap.MemoryBudgetMB {
 		return false
 	}
-	if cap.DiskBudgetGB > 0 && cap.ReservedDiskGB+extraReserved.DiskGB+req.DiskGB > cap.DiskBudgetGB {
+	if cap.DiskBudgetGB > 0 && reservedDiskGB+extraReserved.DiskGB+req.DiskGB > cap.DiskBudgetGB {
 		return false
 	}
 	// GPU and runtime are physical attributes — a peer that lacks them can
@@ -650,9 +680,16 @@ var _ = func() error {
 // request bound to one node by an artifact fails as ErrArtifactNodeUnavailable
 // when that node was not a live capacity-reporting member — the artifact is
 // gone with it, and waiting will not bring it back.
-func noPlacementTargetError(req capacity.Request, requiredReachable bool) error {
+//
+// A gateway-mode create that lost at least one peer only to the gateway rule
+// fails as ErrNoEgressGatewayTarget so the client is told why: some node may
+// have had room, none could filter hostnames.
+func noPlacementTargetError(req capacity.Request, requiredReachable, gatewayRejected bool) error {
 	if req.RequiredNodeID != "" && !requiredReachable {
 		return fmt.Errorf("%w (node %q)", ErrArtifactNodeUnavailable, req.RequiredNodeID)
+	}
+	if req.NeedsEgressGateway && gatewayRejected {
+		return ErrNoEgressGatewayTarget
 	}
 	return ErrNoPlacementTarget
 }
