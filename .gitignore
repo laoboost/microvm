@@ -109,3 +109,6 @@ integration-tests/fixtures/wasm/*.wasm
 
 # Local build/debug binary; never commit
 /report
+
+# Local git worktrees for isolated sync/feature work
+.worktrees/
