@@ -50,6 +50,26 @@ sync branch each carried the same patch set, so many patches appear twice in his
 - The only drops (7, 17, 18) remove code the upstream already carries in a form the
   merged tree uses; none removes a security fix.
 
+## SDK / wire-surface parity (drives task 006)
+
+- **`go.mod` build inputs: identical to upstream tip `80518cf8`.** Daytona SDK is
+  `v0.177.0` and `runtime-spec` is `v1.3.0` in both; no fork pin survives (see
+  verdicts 17–18). Task 006 needs **no pin** — the fork's build inputs are
+  upstream's, and pids-resize code is already adapted to runtime-spec v1.3.
+- **`pkg/models`: identical non-test code.** Fork-only delta is two test files
+  (`mounts_sshfs_source_test.go`, `mounts_test.go`).
+- **`sdk/go`: diverged.** The fork keeps its deep-review changes where upstream
+  evolved differently: token/secret redaction (`sdk/go/pkg/types/redact.go`,
+  `RedactToken`, redacted `String()`), registry push credentials moved from the
+  `X-Registry-Auth` header into the build request body, and the apiclient
+  client/session changes conflict-resolution kept from the fork side in merge
+  `20e75009`. A consumer should treat the fork's SDK as the source of truth when
+  talking to a fork server; upstream SDK and fork SDK are not interchangeable.
+- **go1.27 consumer build: verified.** A scratch module on go 1.27.0 with
+  `replace github.com/aerol-ai/microvm => <fork>` compiles and runs an import of
+  `sdk/go/pkg/microvm` + `sdk/go/pkg/types` (`NewClientWithConfig`,
+  `RedactToken`). The v0.5.5-speshu.1 go1.27 pins are not needed.
+
 ## Release
 
 - Tag: `v0.6.5-speshu.1`
