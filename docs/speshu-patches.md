@@ -1,6 +1,8 @@
 # SpeShu fork patch parity audit — v0.6.5-speshu.1
 
-Release commit: recorded after tagging (see bottom). Base: upstream `aerol-ai/microvm`
+Release commit: `76021631ceccaa8452c34ca0aa2f2b5cede052e6` (this file's first revision is
+in that commit; the SHA/verification block below was corrected one commit later on main —
+the tagged copy's Release section still names the pre-audit `8ffc4196`). Base: upstream `aerol-ai/microvm`
 tip `80518cf8` (v0.6.5 tag `b32d3575` plus 103 post-v0.6.5 upstream commits merged in
 `20e75009`), i.e. this release carries upstream v0.6.5 **and** everything upstream main
 had merged through 2026-10-15.
@@ -51,7 +53,7 @@ sync branch each carried the same patch set, so many patches appear twice in his
 ## Release
 
 - Tag: `v0.6.5-speshu.1`
-- Release commit: `8ffc4196db05b2cdfea0469e7984bf90e6c4e840`
+- Release commit: `76021631ceccaa8452c34ca0aa2f2b5cede052e6` (tag `v0.6.5-speshu.1`)
 - Suite state at release commit: `go build ./...` + `go test ./... -parallel 8` green
   (run recorded in the task log; the release workflow re-runs the suite before build).
 - Asset URLs (laoboost/microvm, tag-scoped copies also attached as
@@ -63,5 +65,13 @@ sync branch each carried the same patch set, so many patches appear twice in his
   - https://github.com/laoboost/microvm/releases/download/v0.6.5-speshu.1/checksums.txt
   - https://github.com/laoboost/microvm/releases/download/v0.6.5-speshu.1/v0.6.5-speshu.1.intoto.jsonl
   (checksums verified locally against the attached binaries per
-  RELEASE-VERIFICATION.md; provenance issuer is
-  `laoboost/microvm/.github/workflows/release.yml`.)
+  RELEASE-VERIFICATION.md — `sha256sum -c checksums.txt --ignore-missing` passed for
+  install.sh, sandboxd/toolboxd/caddy linux_amd64; provenance bundle
+  `v0.6.5-speshu.1.intoto.jsonl` inspected directly: builder
+  `https://github.com/laoboost/microvm/.github/workflows/release.yml@refs/tags/v0.6.5-speshu.1`,
+  source gitCommit `76021631…`, and the sandboxd/install.sh subject digests match the
+  downloaded assets. The DSSE signature itself was not verified locally — this
+  machine's `gh` (2.46.0) has no `attestation` command and no cosign; use
+  `gh attestation verify … --repo laoboost/microvm --signer-workflow
+  laoboost/microvm/.github/workflows/release.yml` from a newer gh. The release
+  workflow run: https://github.com/laoboost/microvm/actions/runs/38694053569)
