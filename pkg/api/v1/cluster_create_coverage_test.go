@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -780,5 +781,79 @@ func TestCreateSandboxOnSelectedNode_SelfWinsPromoteRollbackErrors(t *testing.T)
 	}
 	if len(stub.deleteCalls) != 0 {
 		t.Fatalf("DeletePlacement calls = %+v, want none while runtime destruction failed", stub.deleteCalls)
+	}
+}
+
+// The reserved path resolves platform volumes before promote (B3); when
+// resolution fails (here: volumes disabled) it cancels the reservation and
+// surfaces the error instead of promoting a spec with bare volume names.
+func TestCreateSandboxOnSelectedNode_PlatformVolumeResolveFails(t *testing.T) {
+	rt := &apiRecordingRuntime{}
+	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	h, _ := newClusterCreateHarness(t, rt, stub)
+
+	req := models.CreateSandboxRequest{
+		Image:           "alpine:3.20",
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/data"}},
+	}
+	rr := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
+	h.createSandboxOnSelectedNode(rr, httpReq, req, "sb-vol-fail")
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d, want 412 (platform volumes disabled); body=%s", rr.Code, rr.Body.String())
+	}
+	if rt.createCalls != 0 {
+		t.Fatal("sandbox was created although volume resolution failed before promote")
+	}
+}
+
+// UC-81 regression at the native surface: a cluster-mode POST /v1/sandboxes
+// naming a platform volume for the first time answered 404 "sandbox not found"
+// in ~10ms, because the reserved path looked the volume up before the local
+// create that makes it. It must create the sandbox and promote a spec whose
+// mount is concrete.
+func TestCreateSandboxOnSelectedNode_FirstUsePlatformVolume(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"mount", "umount"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	rt := &apiRecordingRuntime{}
+	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	h, _ := newClusterCreateHarnessWithConfig(t, rt, stub, func(cfg *config.Config) {
+		cfg.PATToken = "operator-pat"
+		cfg.PlatformVolumes = config.PlatformVolumesConfig{
+			Enabled:   true,
+			Backend:   config.PlatformVolumesBackendNFS,
+			NFSServer: "nfs.internal",
+			NFSExport: "/exports/volumes",
+		}
+	})
+
+	req := models.CreateSandboxRequest{
+		Image:           "alpine:3.20",
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "it-first-use", Path: "/vol"}},
+	}
+	rr := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
+	h.createSandboxOnSelectedNode(rr, httpReq, req, "sb-vol-first")
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
+	}
+	vol, err := h.deps.Service.GetPlatformVolumeByName(context.Background(), "it-first-use")
+	if err != nil {
+		t.Fatalf("volume row after first-use create: %v", err)
+	}
+	if len(stub.recordSpecs) != 1 || stub.recordSpecs[0] == nil {
+		t.Fatalf("promoted specs = %+v, want one", stub.recordSpecs)
+	}
+	spec := stub.recordSpecs[0]
+	if len(spec.PlatformVolumes) != 0 || len(spec.Mounts) != 1 || spec.Mounts[0].Source != vol.Source {
+		t.Fatalf("promoted spec volumes=%+v mounts=%+v, want one concrete mount of %q", spec.PlatformVolumes, spec.Mounts, vol.Source)
 	}
 }

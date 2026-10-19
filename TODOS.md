@@ -109,9 +109,10 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   that legitimately destroys evidence has no live coverage at all.
 - **Now:** the case skips on enterprise with that reason (it is not a pass).
 - **Unblock:** a test-only way to make records prunable under enterprise,
-  e.g. an `itestretention` build tag (same pattern as `itestwitness`,
-  `cmd/sandboxd/provider_itest.go`) that lets retention be expressed in
-  minutes. Do not relax the enterprise validator for it.
+  e.g. an `itestretention` build tag that lets retention be expressed in
+  minutes (the `itestwitness` tag that set that precedent is gone: the
+  enterprise scenarios now use the S3 witness and the shipped daemon). Do not
+  relax the enterprise validator for it.
 
 ## A resealed secret whose replacement holder is dead never re-seals (cluster secrets)
 
@@ -219,6 +220,11 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   close with zero bytes: the old http server's graceful shutdown closing
   connections that have not sent a request yet. The T19 notes are in
   `plans/integration-test-security.md` §7.12.
+- **Established WebSockets too (#712):** each reload also closed every
+  WebSocket a `reverse_proxy` carried (exec streams, `aerolvm shell`, session
+  attach) with code 1001 (UC-68 on `cluster-hetero-lite-secrets`,
+  2026-10-16). The #712 fix sets `stream_close_delay 10m` on every proxy. The
+  flag still matters: each stream that outlives a reload pins the old config.
 
 ## First boot Caddy config lacks S3 certificate storage
 
@@ -554,6 +560,28 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 - **Start:** `Terraform/templates/obs-bootstrap.sh.tftpl:15-35` already
   mounts an extra data volume for Prometheus and is a usable template. Add
   one optional NVMe bench scenario for the stretch gate (≤25ms).
+
+## Per-node witness write scoping (v2 layout) (security, audit witness)
+
+- **What:** let IAM confine each node's witness writes to its own path by
+  putting the writer's AWS identity (`${aws:userid}`) in the witness key.
+- **Why:** the open audit witness shares one node role across a cluster, so
+  a compromised node can write into another node's witness history. The
+  victim refuses its next restart, the offline verifier blames the victim,
+  and attribution needs CloudTrail S3 data events. Accepted as a documented
+  v1 limit at eng review 2026-10-11 (`plans/open-audit-witness.md`, R7/D8).
+- **Pros:** closes the cross-node DoS structurally and gives attribution
+  without CloudTrail.
+- **Cons:** a v2 key layout with a dual-read migration, one more boot call
+  (`sts:GetCallerIdentity`), a data volume moved to a new instance fails
+  closed, and S3-compatible stores need a static writer segment.
+- **Start:** the cluster-join rendezvous already scopes writes with
+  `${aws:userid}` (`Terraform/iam.tf:97-112`). `witnessNodeIDCandidates`
+  (`internal/service/secret_audit_witness.go:522-549`) is the precedent for
+  reading an old and a new key during the migration.
+- **Effort / priority:** M, P3.
+- **Depends on:** open audit witness v1 (Phases 1–5 of
+  `plans/open-audit-witness.md`) shipped.
 
 ---
 

@@ -31,8 +31,8 @@ import (
 	"github.com/aerol-ai/microvm/internal/version"
 	api "github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
-	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
+	"github.com/aerol-ai/microvm/pkg/auditwitness"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -351,6 +351,19 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("start audit ingest: %w", err)
 	}
 	defer svc.StopAuditIngestServer()
+	// The open-source build's own witness (plans/open-audit-witness.md):
+	// SB_AUDIT_WITNESS_BACKEND fills the witness only when the provider
+	// brought none, the same precedence as the audit exporter below. It
+	// opens before the gate, so enterprise mode can be satisfied by the free
+	// download; with the setting unset nothing here talks to S3, and Open's
+	// boot checks refuse a bucket that would not really protect a head.
+	if !cp.HasExternalWitness() && cfg.AuditWitnessBackend != "" {
+		w, err := auditwitness.Open(ctx, cfg.AuditWitnessConfig())
+		if err != nil {
+			return fmt.Errorf("open audit witness: %w", err)
+		}
+		cp.Witness = w
+	}
 	if cfg.SecretAuditExternalWitness && !cp.HasExternalWitness() {
 		return errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS=true requires a non-noop controlplane.Witness (tamper-evidence cannot be claimed from local JSONL alone)")
 	}
@@ -1004,7 +1017,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// cp.Validator is the second-token (non-PAT) validation path. Under
 	// controlplane.Noop() it rejects every non-PAT token, so the server
 	// behaves exactly as the PAT-only build did before this seam existed.
-	var builder apiv1.ImageBuilder
+	var builder service.ImageBuilder
 	if apiBuilder != nil {
 		builder = apiBuilder
 	}
@@ -1027,6 +1040,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// keep-alive connections sitting between requests, so it can't
 		// kill an in-flight stream but does bound idle-connection buildup.
 		IdleTimeout: 2 * time.Minute,
+		Protocols:   apiListenerProtocols(),
 	}
 
 	go func() {
