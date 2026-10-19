@@ -1245,6 +1245,32 @@ SB_CONTAINERD_CNI_PLUGIN_DIR=/opt/cni/bin
 SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true
 EOF
 	fi
+	# The S3 audit witness (plans/open-audit-witness.md) is documented here and
+	# never configured. It needs an Object Lock bucket, and the lock mode,
+	# retention and IAM are the operator's decisions; in compliance mode nobody
+	# can delete what the bucket holds until the lock ends, so an installer
+	# that created one would leave an undeletable bucket nobody chose. The
+	# lines are comments, so the daemon behaves exactly as before.
+	cat >> /etc/sandboxd/sandboxd.env <<'EOF'
+
+# S3 Object Lock audit witness: off while these lines stay commented out.
+# Keeps each audit hash-chain head in a locked bucket off this server, so a
+# later compromise cannot rewrite the audit history unnoticed. The bucket
+# needs Object Lock, versioning, a default retention of at least
+# SB_SECRET_AUDIT_RETENTION_DAYS (30), and a role that includes s3:ListBucket.
+# sandboxd checks all of this at boot and refuses to start if one is missing.
+# Recipe: setup/runbooks/secrets-and-audit.md, "S3 audit witness".
+# SB_NODE_ID is required with a witness and must be unique among servers
+# sharing the bucket; the default id, "standalone", is refused.
+# Re-running install.sh rewrites this file, so keep a copy of these settings.
+#SB_NODE_ID=
+#SB_AUDIT_WITNESS_BACKEND=s3
+#SB_AUDIT_WITNESS_S3_BUCKET=
+#SB_AUDIT_WITNESS_S3_PREFIX=witness/
+#SB_AUDIT_WITNESS_S3_REGION=
+#SB_AUDIT_WITNESS_S3_ENDPOINT=
+#SB_AUDIT_WITNESS_S3_PATH_STYLE=false
+EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 )
 
@@ -1353,9 +1379,17 @@ EOF
 https://$DOMAIN:8443 {
 	bind 127.0.0.1
 ${tls_block}
-	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /mcp
+	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp
 	handle @api {
-		reverse_proxy 127.0.0.1:21212
+		# stream_close_delay: every admin-API change reloads Caddy, and a
+		# reload closes each WebSocket this proxy carries (exec streams,
+		# aerolvm shell, session attach) with code 1001 unless a delay is set
+		# (#712). A stream that outlives a reload keeps the old config in
+		# memory until it closes or the delay ends. pkg/caddy sets the same
+		# value on the routes sandboxd writes.
+		reverse_proxy 127.0.0.1:21212 {
+			stream_close_delay 10m
+		}
 	}
 	handle {
 		respond "Sandbox API not found" 404
