@@ -116,3 +116,16 @@ The merge conflicted in four files; each resolution kept both sides' intent:
   - https://github.com/laoboost/microvm/releases/download/v0.6.7-speshu.1/v0.6.7-speshu.1.intoto.jsonl
 - Verification block: filled after the release workflow attaches the assets
   (checksums + provenance subject digests, per RELEASE-VERIFICATION.md).
+
+## Verification (post-tag)
+
+- Tagged commit: `ad95911e0dbbc013a9639fdfaece2b2a35f85f9b` (tag `v0.6.7-speshu.1`)
+- Release workflow: `release.yml` run `39220668822` — success (suite re-run + full asset build)
+- Checksums verified out-of-band against the attached `checksums.txt`:
+  `sha256sum -c checksums.txt --ignore-missing` passed for `install.sh`,
+  `sandboxd_linux_amd64`, `toolboxd_linux_amd64`, `caddy_linux_amd64`
+- Provenance: `v0.6.7-speshu.1.intoto.jsonl` attached (sigstore bundle). As for
+  v0.6.5-speshu.1 the DSSE signature was not verified locally (this machine's
+  `gh` 2.46.0 has no `attestation` subcommand and no cosign); verify with
+  `gh attestation verify … --repo laoboost/microvm --signer-workflow
+  laoboost/microvm/.github/workflows/release.yml` from a newer gh.
