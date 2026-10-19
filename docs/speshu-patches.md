@@ -21,9 +21,9 @@ set). Verdicts below are per patch-group against upstream v0.6.6 + v0.6.7.
 | 1 | Mount lifecycle: teardown on die/stop/oom; skip re-mount during stop | `11dafc27` | **keep** — upstream `80518cf8..v0.6.7` touches nothing under `pkg/mounts`; no v0.6.6/v0.6.7 changelog item is a mount change. Contract test `internal/service/mount_teardown_test.go` green. |
 | 2 | Mount reliability: sweep-vs-start race, parallel establishment, pinned throughput, `allow_delete` | `98017426` | **keep** — fork-only. |
 | 3 | Restart sandbox on mount crash | `bfe0f2da` | **keep** — fork-only (`internal/service/mount_crash_restart_test.go`). |
-| 4 | Mount credential-failure detection: scan live mount-process output; structured warn + expvar counter | `c3b5da08`, `6f27b2ad`, `13fa40ef` | **keep** — fork-only observability (`pkg/mounts/metrics.go`, `cred_failure_test.go`). |
+| 4 | Mount credential-failure detection: scan live mount-process output; structured warn + expvar counter | `c3b5da08`, `6f27b2ad`, `13fa40ef`, `e70ab278`, `765b46fc`, `7519c11a`, `c85b982e` | **keep** — fork-only observability (`pkg/mounts/metrics.go`, `cred_failure_test.go`); the later test pairs pin the failure/crash-hook split and the per-process one-shot dedup latch. |
 | 5 | Cred-file unlink after supervised restart; probe wait outside manager lock | `9fc36a92` | **keep** — fork-only (`pkg/mounts/manager.go`). |
-| 6 | S3 adapter structured options, `extra_args` denylist, source guard | `23971a2c` | **keep (extends upstream)** — upstream v0.6.3 `2f42813a` source-injection guard is retained; the fork adds `s3_options.go` on top. Upstream v0.6.6 `b3a43ef8` (registry-only build bases) touches the build path, not mounts. |
+| 6 | S3 adapter structured options, `extra_args` denylist, source guard, absolute-endpoint scheme validation | `23971a2c`, `92bbf8e2`, `2fd520c0` | **keep (extends upstream)** — upstream v0.6.3 `2f42813a` source-injection guard is retained; the fork adds `s3_options.go` plus the absolute http/https endpoint-scheme check on top. Upstream v0.6.6 `b3a43ef8` (registry-only build bases) touches the build path, not mounts. |
 | 7 | Reject dash-prefixed mount sources across adapters + spec validation | `0765164d` | **drop (subsumed by v0.6.3)** — unchanged from the v0.6.5-speshu.1 audit. |
 | 8 | Tenant image-ref validator (vendored `distribution/reference`) + wiring | `4a3750e8`, `e3d3771a` | **keep** — lives at `internal/service/imageref.go`; upstream v0.6.6's registry-only base policy (`b3a43ef8`, `pkg/docker/build.go`) is a different layer and is also present. |
 | 9 | Per-sandbox pids limit (default 1024, parked containers included) | `fb074fc6` | **keep** — no upstream equivalent. |
@@ -58,9 +58,15 @@ The merge conflicted in four files; each resolution kept both sides' intent:
   `SB_E2B_ALLOW_UNAUTHENTICATED_RUNTIME` for a `meta.Secure=false` sandbox)
   instead of upstream's `meta.Secure`-gated check; upstream's inline
   constant-time compare is subsumed by the fork's `accessTokenValid`.
-- `pkg/docker/build.go` — kept both imports and both behaviours: the fork's
-  singleflight build dedup and upstream's `distribution/reference`-based
-  registry-only base validation.
+- `pkg/docker/build.go` — a pure import-order conflict: both sides already
+  carried both `golang.org/x/sync/singleflight` and
+  `github.com/distribution/reference`; resolved in gofmt order with behaviour
+  unchanged. To be precise about what backs what: `reference` serves the
+  owned-tag helpers (`IsBuiltImageRef` / `BuiltImageOwnerNamespace`), while
+  upstream v0.6.6's registry-only base policy is enforced by `ForcePull` (docker
+  `pull=1`) plus `Service.BuildImage` / `authorizeTenantImageRef` in
+  `internal/service/image_build.go` — upstream code, byte-identical in the
+  merged tree.
 
 ## Security non-reversion check
 
