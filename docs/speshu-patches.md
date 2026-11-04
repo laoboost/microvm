@@ -238,7 +238,7 @@ proxy-clean environment.
 - Tag: `v0.6.11-speshu.1` at `f1b474ae26f89021018422d5f839166249432ceb`
   (published 2026-11-04 on github.com/laoboost/microvm, marked Latest —
   `releases/latest` resolves to this tag)
-- Release commit: the commit carrying this file (`f1b474ae`, see the header)
+- Release commit: `f1b474ae` (the commit carrying this file)
 - Suite state at release commit: `go build ./...` + `go test ./... -parallel 8`
   green at the merge commit (Task 1, proxy-clean environment); re-verified for
   this audit's edits: `go build ./...` and
