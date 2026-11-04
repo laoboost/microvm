@@ -192,6 +192,7 @@ func TestManagerSuperviseRestartsAfterFirstCrash(t *testing.T) {
 		hostPath:   hostPath,
 		plan:       adapters.Plan{Argv: []string{"sleep", "0.5"}}, // restarted process stays up
 		cmd:        cmd,
+		exit:       watchExit(cmd),
 		startedAt:  time.Now().UTC(),
 		supervised: true,
 	}
@@ -201,7 +202,7 @@ func TestManagerSuperviseRestartsAfterFirstCrash(t *testing.T) {
 
 	// The restart path now waits for mount readiness; stub the probe so the
 	// fake mount counts as ready immediately.
-	stubProbe(t, func(string, time.Duration) error { return nil })
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error { return nil })
 
 	// Drive the supervisor synchronously; it'll Wait() on the cmd, observe
 	// the exit, and restart once.

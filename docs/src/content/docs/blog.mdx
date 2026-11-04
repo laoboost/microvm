@@ -27,6 +27,7 @@ These posts go deeper than the docs. They explain how AerolVM works inside, why 
 | [How AerolVM fences a sandbox's network](/engineering-network-defenses/) | What a sandbox can reach by default, and the DNS tricks the filter stops. |
 | [Keeping API keys out of the sandbox](/engineering-secret-handling/) | How variables are sealed, how inject rules keep keys out, and what the audit trail records. |
 | [Catching a rewritten audit log](/engineering-audit-witness/) | How a locked S3 bucket catches an audit log that someone rebuilt after taking over a server, and why each check is there. |
+| [SSO with no login server](/engineering-identity-and-access/) | How people sign in with their company account, how roles and team rules work, and how every audit record names a person, with no login service. |
 | [Correct snapshot clones](/engineering-snapshot-correctness/) | Five ways a cloned Firecracker snapshot can go wrong, and the rule that keeps each clone safe and unique. |
 | [The frozen-kernel problem](/engineering-frozen-kernel-problem/) | Why clones of one snapshot start out as the same machine, and how each one is made unique before your code runs. |
 | [Randomness in clones](/randomness-in-cloned-sandboxes/) | How Firecracker sandboxes cloned from one template avoid handing out the same random numbers. |
@@ -38,3 +39,7 @@ These posts go deeper than the docs. They explain how AerolVM works inside, why 
 | [Firecracker architecture](/firecracker-architecture/) | How a create request becomes a Firecracker microVM, from its parts to each step of the boot. |
 | [Firecracker snapshot restore](/firecracker-hydration/) | How VMs are prepared, restored and shared so a create is just attach and resume. |
 | [WASM architecture](/wasm-architecture/) | How WebAssembly sandboxes run, with one worker process each and saved checkpoints. |
+| [Staying up under overload](/overload-protection-architecture/) | What broke when a cluster got 4 times more list calls than it could serve, how we fixed it, and how this compares with Kubernetes. |
+| [Keeping sandboxes away from the node's cloud credentials](/sandbox-metadata-isolation/) | Why the cloud metadata service is a target, the four layers that keep every sandbox away from it, and how this compares with Kubernetes. |
+| [How the in-sandbox agent knows who is calling](/toolbox-agent-authentication/) | How the agent in each sandbox checks every caller, why a cloned VM gets its token only after restore, and how this compares with the kubelet. |
+| [The life of an API key](/secret-env-architecture/) | One `OPENAI_API_KEY`, followed from the create call to the OpenAI SDK in the sandbox: sealing, each runtime, the key tree, the cluster, inject rules, and how this compares with Kubernetes Secrets. |

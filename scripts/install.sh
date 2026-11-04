@@ -39,6 +39,11 @@ WITH_ISOLATE="false"
 # route responder via systemd-resolved.
 INGRESS_PROXY_ROUTING="false"
 ROUTE_DNS_ADDR="127.0.0.1:53053"
+# The aerolvm-rt link's own address. systemd-resolved sends *.rt.internal
+# here, not to ROUTE_DNS_ADDR (write_route_dns_resolver says why), and
+# sandboxd listens here too (SB_ROUTE_DNS_LINK_ADDR).
+ROUTE_DNS_LINK_IP="169.254.53.53"
+ROUTE_DNS_LINK_ADDR="${ROUTE_DNS_LINK_IP}:53053"
 WORKERD_PATH=""
 # Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
 # Phase 1). Upstream ships gzipped standalone binaries with no checksum
@@ -47,6 +52,38 @@ WORKERD_PATH=""
 WORKERD_VERSION="v1.20260717.1"
 WORKERD_SHA256_LINUX_64="7ff61e052347ab3122c43b1e2419ccd68bd91e3c766f9770320591798e0e89a0"
 WORKERD_SHA256_LINUX_ARM64="3ef71b4a692d2705fa4db0636724409be833402f1c9b99094294a5901989680d"
+WITH_FIRECRACKER="false"
+# Version-pinned Firecracker for --with-firecracker: the release and guest
+# kernel Terraform (Terraform/variables.tf) and Ansible
+# (Ansible/inventory/group_vars/all/defaults.yml) pin, so a node set up by
+# hand boots what the cluster tooling is tested on. The kernel bucket
+# publishes no checksums, and the release's .sha256.txt comes from the same
+# place as the tarball, so it cannot catch a replaced release. Every file is
+# checked against a SHA-256 pinned here instead, as for workerd. Bump the
+# versions and all six hashes together.
+FIRECRACKER_VERSION="v1.15.1"
+FIRECRACKER_KERNEL_CI_VERSION="v1.15"
+FIRECRACKER_KERNEL_VERSION="5.10.245"
+FIRECRACKER_SHA256_X86_64="d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
+FIRECRACKER_SHA256_AARCH64="00654ac1e702a22744121ea9f10a4f792ebd7c3a744cba587dfac9fcb79b41a5"
+FIRECRACKER_KERNEL_SHA256_X86_64="c453f36520d2f2792ab8e4532a814e4a647a4a41a4c94d4e9083a502800159b1"
+FIRECRACKER_KERNEL_SHA256_AARCH64="f88e4f934b8d9c3f3a58a4df24c3cef4e6d94976d34a9360525c008e7e5df0a7"
+FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64="bccb4a2403d902e1e184e6281270b2b755c6ad6eff1a830c5b8bc788c7b205f8"
+FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64="ecd245d7a011920456813472f5182db730884a3088dbe79aad4c1e7e23401656"
+# The daemon's own defaults (SB_FIRECRACKER_BINARY, SB_JAILER_BINARY,
+# SB_FIRECRACKER_KERNEL, SB_FIRECRACKER_TEMPLATES_DIR, SB_JAILER_CHROOT_BASE),
+# so sandboxd.env carries no path settings for them.
+FIRECRACKER_BIN="/usr/local/bin/firecracker"
+JAILER_BIN="/usr/local/bin/jailer"
+FIRECRACKER_KERNEL_PATH="/var/lib/sandboxd/firecracker/vmlinux"
+FIRECRACKER_TEMPLATES_DIR="/var/lib/sandboxd/firecracker/templates"
+JAILER_CHROOT_BASE="/srv/jailer"
+# The jailer drops every firecracker process to this user. The daemon's
+# default (uid/gid 1000) is the first login user on most images — on AWS
+# Ubuntu that is `ubuntu`, with sudo — so the VMs get an identity that owns
+# nothing and can log in nowhere, like the isolate jail's.
+JAILER_USER="sandboxd-jailer"
+KVM_DEVICE="/dev/kvm"
 WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
 WITH_CONTAINERD_ENGINE="false"
@@ -88,6 +125,38 @@ CADDY_STORAGE_S3_PREFIX="caddy"
 CADDY_STORAGE_S3_ACCESS_KEY=""
 CADDY_STORAGE_S3_SECRET_KEY=""
 CADDY_STORAGE_S3_ENCRYPTION_KEY=""
+
+# Operator-token confinement and the real client address through Caddy
+# (plans/identity-and-access.md §5.11). Both default off, so a default
+# install writes exactly what it always did.
+#   --pat-scope host     SB_PAT_SCOPE=host; Caddy proxies to the public
+#                        Unix socket, where every request is public.
+#   --l4-proxy-protocol  caddy-l4's fallback sends PROXY v2 to the 8443
+#                        site, which gets the proxy_protocol listener
+#                        wrapper; Caddy forwards the client address to
+#                        sandboxd in X-AerolVM-Client-IP. Both halves are
+#                        written in this one step: the flag without the
+#                        wrapper breaks every HTTPS handshake.
+PAT_SCOPE="any"
+KEY_CUSTODY="file"
+SECRET_PROVIDER_ENV=""
+NO_START="false"
+PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
+L4_PROXY_PROTOCOL="false"
+# --lb-health-port: a plain-HTTP /health listener for a load balancer's
+# health check (Terraform api_load_balancer = "nlb"). Empty writes none, so
+# a default install opens no new port.
+LB_HEALTH_PORT=""
+
+# A re-run restarts a running sandboxd when it changed the daemon's settings
+# file or unit (see restart_sandboxd_if_reconfigured). record_sandboxd_state
+# fills the two state variables before anything is written.
+SANDBOXD_ENV_FILE="/etc/sandboxd/sandboxd.env"
+SANDBOXD_UNIT_FILE="/etc/systemd/system/sandboxd.service"
+SANDBOXD_HEALTH_URL="http://127.0.0.1:21212/health"
+SANDBOXD_READY_TRIES=60
+SANDBOXD_WAS_ACTIVE="false"
+SANDBOXD_CONFIG_BEFORE=""
 
 usage() {
 	cat <<'EOF'
@@ -188,6 +257,19 @@ Options:
                                binary. Skips the download and points
                                SB_ISOLATE_WORKERD_PATH at it. Only consulted
                                with --with-isolate.
+  --with-firecracker           Set this node up for the Firecracker runtime
+                               (runtime: "firecracker" on create): each
+                               sandbox runs in its own microVM. Needs
+                               /dev/kvm, so a bare-metal server or a VM with
+                               nested virtualization, on x86_64 or aarch64.
+                               Installs firecracker and jailer to
+                               /usr/local/bin, a guest kernel to
+                               /var/lib/sandboxd/firecracker/vmlinux (one
+                               already there is kept), and skopeo, umoci and
+                               e2fsprogs. Each download is checked against a
+                               SHA-256 pinned in this script. VMs run as the
+                               sandboxd-jailer system user. Writes
+                               SB_ENABLE_FIRECRACKER=true. Not with --local.
   --with-nvidia-gpu            Install nvidia-container-toolkit and register
                                the nvidia OCI runtime in daemon.json. Requires
                                NVIDIA drivers already installed on the host
@@ -259,6 +341,44 @@ Options:
   --caddy-storage-s3-encryption-key-file <path>
                                Read the encryption key from a root-only
                                file instead of argv (preferred).
+  --pat-scope <any|host>       Where the operator token (PAT) works. "any"
+                               (default) keeps today's behavior. "host"
+                               accepts it only from this host
+                               (127.0.0.1:21212) and from cluster peers, so
+                               remote people must use SSO or a named token;
+                               Caddy then proxies to the public socket
+                               /run/sandboxd-public/api.sock. Enterprise
+                               mode requires "host". Turn it on only after
+                               every node runs a release that has it.
+  --no-start                   Install and enable everything but leave sandboxd
+                               stopped, for a node cluster-join.sh will start
+                               once it has the cluster's config and server key.
+                               Booting it before that, as a lone node, would
+                               make a server key of its own. Not with --local.
+  --key-custody <file|wrapped> "wrapped" keeps the server key only wrapped by
+                               the customer's key store (AWS KMS, Vault or an
+                               HSM): the first boot generates it and writes no
+                               plaintext copy; a re-run over a plaintext key
+                               wraps it. Needs --secret-provider-env.
+                               (plans/customer-key-custody.md)
+  --secret-provider-env <file> SB_SECRET_* lines naming the key store
+                               (SB_SECRET_PROVIDER=awskms|vault|pkcs11 and its
+                               settings), appended to sandboxd.env.
+  --l4-proxy-protocol          Domain mode: send the real client address
+                               from caddy-l4 to the HTTPS site (PROXY
+                               protocol v2) and on to sandboxd, so audit
+                               records and the "operator token used from
+                               outside" alert see it instead of 127.0.0.1.
+                               Writes the Caddy listener wrapper and
+                               SB_L4_FALLBACK_PROXY_PROTOCOL=true together.
+  --lb-health-port <port>      Domain mode: serve GET /health in plain HTTP
+                               on <port> for a load balancer's health check.
+                               It answers 200 only when the whole path a
+                               client takes works (caddy-l4 on :443, the
+                               HTTPS site and sandboxd), and 502 otherwise,
+                               so the balancer drops this node while its
+                               daemon is down. Open the port to the load
+                               balancer only.
   --local                      Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
                                on both macOS and Linux. No domain name required.
@@ -601,6 +721,10 @@ while [[ $# -gt 0 ]]; do
 			WITH_ISOLATE="true"
 			shift
 			;;
+		--with-firecracker)
+			WITH_FIRECRACKER="true"
+			shift
+			;;
 		--ingress-proxy-routing)
 			INGRESS_PROXY_ROUTING="true"
 			shift
@@ -680,6 +804,30 @@ while [[ $# -gt 0 ]]; do
 			CADDY_STORAGE_S3_ENCRYPTION_KEY="$(cat "$2")"
 			shift 2
 			;;
+		--pat-scope)
+			PAT_SCOPE="$2"
+			shift 2
+			;;
+		--l4-proxy-protocol)
+			L4_PROXY_PROTOCOL="true"
+			shift
+			;;
+		--lb-health-port)
+			LB_HEALTH_PORT="$2"
+			shift 2
+			;;
+		--key-custody)
+			KEY_CUSTODY="$2"
+			shift 2
+			;;
+		--no-start)
+			NO_START="true"
+			shift
+			;;
+		--secret-provider-env)
+			SECRET_PROVIDER_ENV="$2"
+			shift 2
+			;;
 		--help)
 			usage
 			exit 0
@@ -701,10 +849,45 @@ if [[ -z "$DNS_API_TOKEN" && -n "${SB_DNS_API_TOKEN:-}" ]]; then
 	DNS_API_TOKEN="$SB_DNS_API_TOKEN"
 fi
 
+# Firecracker is a runtime for a server node: --cli-only installs no daemon,
+# and --local is the Docker-only developer install (macOS has no KVM at all).
+# Refused before either branch runs, so neither half-installs it.
+if [[ "$WITH_FIRECRACKER" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true") ]]; then
+	echo "--with-firecracker sets up a server node; it does not work with --cli-only or --local" >&2
+	exit 1
+fi
+
 if [[ "$CLI_ONLY" == "true" ]]; then
 	install_cli
 	exit 0
 fi
+
+if [[ "$NO_START" == "true" && "$LOCAL_MODE" == "true" ]]; then
+	echo "--no-start is for a node cluster-join.sh will start; --local never joins a cluster" >&2
+	exit 1
+fi
+
+case "$KEY_CUSTODY" in
+	file) ;;
+	wrapped)
+		if [[ "$LOCAL_MODE" == "true" ]]; then
+			echo "--key-custody wrapped is not supported with --local" >&2
+			exit 1
+		fi
+		if [[ -z "$SECRET_PROVIDER_ENV" || ! -f "$SECRET_PROVIDER_ENV" ]]; then
+			echo "--key-custody wrapped needs --secret-provider-env <file> with SB_SECRET_PROVIDER and its settings" >&2
+			exit 1
+		fi
+		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' "$SECRET_PROVIDER_ENV"; then
+			echo "$SECRET_PROVIDER_ENV must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
+			exit 1
+		fi
+		;;
+	*)
+		echo "--key-custody must be file or wrapped (got $KEY_CUSTODY)" >&2
+		exit 1
+		;;
+esac
 
 if [[ -z "$PAT_TOKEN" ]]; then
 	if command -v openssl >/dev/null 2>&1; then
@@ -801,6 +984,43 @@ if [[ -n "$DNS_PROVIDER" || (-n "$DOMAIN" && "$TLS_ISSUER" == "internal") ]]; th
 	L4_TLS_LISTEN_DEFAULT=":443"
 else
 	L4_TLS_LISTEN_DEFAULT=""
+fi
+
+case "$PAT_SCOPE" in
+any | host) ;;
+*)
+	echo "--pat-scope must be any or host, got '$PAT_SCOPE'." >&2
+	exit 1
+	;;
+esac
+# PROXY protocol rides caddy-l4's SNI fallback to the 8443 site, which only
+# exists in domain mode.
+if [[ "$L4_PROXY_PROTOCOL" == "true" && -z "$L4_TLS_LISTEN_DEFAULT" ]]; then
+	echo "--l4-proxy-protocol requires domain mode (--domain with --dns-provider, or --tls-issuer internal)." >&2
+	exit 1
+fi
+# The load-balancer health listener probes through caddy-l4 on :443, which
+# only exists in domain mode. Its port must not be one this node already
+# listens on, or Caddy fails to start and takes the API down with it.
+if [[ -n "$LB_HEALTH_PORT" ]]; then
+	if [[ -z "$L4_TLS_LISTEN_DEFAULT" ]]; then
+		echo "--lb-health-port requires domain mode (--domain with --dns-provider, or --tls-issuer internal)." >&2
+		exit 1
+	fi
+	if ! [[ "$LB_HEALTH_PORT" =~ ^[1-9][0-9]{3,4}$ ]] || ((LB_HEALTH_PORT > 65535)); then
+		echo "--lb-health-port must be a port from 1024 to 65535, got '$LB_HEALTH_PORT'." >&2
+		exit 1
+	fi
+	case "$LB_HEALTH_PORT" in
+	2019 | 2220 | 7000 | 7001 | 7002 | 8443 | 21212 | 21215 | 53053)
+		echo "--lb-health-port $LB_HEALTH_PORT is already used on this node (Caddy admin, SSH gateway, cluster, HTTPS site, API, host-port redirect or route DNS)." >&2
+		exit 1
+		;;
+	esac
+	if ((LB_HEALTH_PORT >= 22000 && LB_HEALTH_PORT <= 23000)); then
+		echo "--lb-health-port $LB_HEALTH_PORT is inside the raw-TCP port pool (22000-23000)." >&2
+		exit 1
+	fi
 fi
 
 # Shared cert storage validation. The feature only makes sense alongside
@@ -923,35 +1143,96 @@ install_caddy_package() {
 	rm -rf "$tmp_dir"
 }
 
+# APT_UPDATED is "true" once this run has refreshed the apt package index,
+# so install_mount_tools refreshes it only on the --local path, where
+# install_packages (and its apt-get update) does not run.
+APT_UPDATED="false"
+
+# rpcbind_on_host is true when the rpcbind package is installed, or a unit
+# of an rpcbind installed some other way is enabled.
+rpcbind_on_host() {
+	if [[ "$(dpkg-query -W -f='${Status}' rpcbind 2>/dev/null || true)" == "install ok installed" ]]; then
+		return 0
+	fi
+	command -v systemctl >/dev/null 2>&1 || return 1
+	systemctl is-enabled --quiet rpcbind.socket 2>/dev/null || systemctl is-enabled --quiet rpcbind.service 2>/dev/null
+}
+
+# install_mount_tools installs the programs that mount external storage and
+# platform volumes. The mount runs on the host, not in the sandbox, so
+# sandboxd needs them on its own PATH. Both Linux install paths call it:
+# --local skips install_packages, and a local server used to fail every
+# volume create with `exec: "mount-s3": executable file not found`. A tool
+# that will not install costs only its own mount type, so nothing here fails
+# the install.
+install_mount_tools() {
+	if [[ "$(uname -s)" != "Linux" ]]; then
+		echo "Skipping the mount tools (fuse3, sshfs, nfs-common, rclone, mount-s3): Linux only" >&2
+		return 0
+	fi
+	if ! command -v apt-get >/dev/null 2>&1; then
+		echo "Warning: only apt-based distributions get the mount tools from this installer; install fuse3, sshfs, nfs-common, rclone and mount-s3 by hand for external storage and platform volumes" >&2
+		return 0
+	fi
+	if [[ "${APT_UPDATED:-false}" != "true" ]]; then
+		if apt-get update; then
+			APT_UPDATED="true"
+		else
+			echo "Warning: apt-get update failed; installing the mount tools from the existing package index" >&2
+		fi
+	fi
+	# nfs-common depends on rpcbind (the RPC portmapper), whose package
+	# enables and starts it on port 111 on every address: a finding in any
+	# port scan. The NFS client needs it only for an NFSv3 mount that locks,
+	# and then mount.nfs starts rpc-statd.service, which Requires=
+	# rpcbind.socket and so starts it on demand. So it is disabled, not
+	# masked: a mask fails that start, and with it every such mount. A host
+	# that had rpcbind before this run keeps it as it was; it may be in use.
+	local rpcbind_before="false"
+	if rpcbind_on_host; then
+		rpcbind_before="true"
+	fi
+	# fuse3 is required by mountpoint-s3, sshfs, and rclone mount.
+	# nfs-common provides mount.nfs. mountpoint-s3 ships as a .deb from AWS;
+	# we attempt an apt install first and fall back to the AWS download.
+	apt-get install -y fuse3 sshfs nfs-common rclone || true
+	if [[ "$rpcbind_before" == "true" ]]; then
+		echo "rpcbind was on this host before this run; leaving it as it is" >&2
+	elif ! command -v systemctl >/dev/null 2>&1; then
+		echo "Skipping the rpcbind disable: no systemctl on this host" >&2
+	elif rpcbind_on_host; then
+		systemctl disable --now rpcbind.socket rpcbind.service || \
+			echo "Warning: could not disable rpcbind, so it may listen on port 111; run: systemctl disable --now rpcbind.socket rpcbind.service" >&2
+	fi
+	if ! command -v mount-s3 >/dev/null 2>&1; then
+		local arch_suffix
+		case "$(uname -m)" in
+			x86_64|amd64) arch_suffix="x86_64" ;;
+			aarch64|arm64) arch_suffix="arm64" ;;
+			*) arch_suffix="" ;;
+		esac
+		if [[ -n "$arch_suffix" ]]; then
+			local tmp_deb
+			tmp_deb="$(mktemp --suffix=.deb)"
+			if curl_download "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch_suffix}/mount-s3.deb" -o "$tmp_deb"; then
+				apt-get install -y "$tmp_deb" || \
+					echo "Warning: mountpoint-s3 install failed; s3 mounts will be unavailable until installed manually" >&2
+			else
+				echo "Warning: failed to download mountpoint-s3; s3 mounts will be unavailable until installed manually" >&2
+			fi
+			rm -f "$tmp_deb"
+		fi
+	fi
+}
+
 install_packages() {
 	if command -v apt-get >/dev/null 2>&1; then
 		drop_caddy_apt_source
 		apt-get update
+		APT_UPDATED="true"
 		apt-get install -y build-essential ca-certificates curl gnupg lsb-release software-properties-common
 		# Mount tooling for the host-managed external storage feature.
-		# fuse3 is required by mountpoint-s3, sshfs, and rclone mount.
-		# nfs-common provides mount.nfs. mountpoint-s3 ships as a .deb from AWS;
-		# we attempt an apt install first and fall back to the AWS download.
-		apt-get install -y fuse3 sshfs nfs-common rclone || true
-		if ! command -v mount-s3 >/dev/null 2>&1; then
-			local arch_suffix
-			case "$(uname -m)" in
-				x86_64|amd64) arch_suffix="x86_64" ;;
-				aarch64|arm64) arch_suffix="arm64" ;;
-				*) arch_suffix="" ;;
-			esac
-			if [[ -n "$arch_suffix" ]]; then
-				local tmp_deb
-				tmp_deb="$(mktemp --suffix=.deb)"
-				if curl_download "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch_suffix}/mount-s3.deb" -o "$tmp_deb"; then
-					apt-get install -y "$tmp_deb" || \
-						echo "Warning: mountpoint-s3 install failed; s3 mounts will be unavailable until installed manually" >&2
-				else
-					echo "Warning: failed to download mountpoint-s3; s3 mounts will be unavailable until installed manually" >&2
-				fi
-				rm -f "$tmp_deb"
-			fi
-		fi
+		install_mount_tools
 		ensure_docker
 		if ! command -v caddy >/dev/null 2>&1; then
 			install_caddy_package
@@ -1147,6 +1428,10 @@ write_environment() (
 	umask 077
 	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
+	local route_dns_link_addr=""
+	if [[ "$INGRESS_PROXY_ROUTING" == "true" ]]; then
+		route_dns_link_addr="$ROUTE_DNS_LINK_ADDR"
+	fi
 	cat > /etc/sandboxd/sandboxd.env <<EOF
 SB_PAT_TOKEN=$PAT_TOKEN
 SB_NODE_NAME=$NODE_NAME
@@ -1183,6 +1468,7 @@ SB_L4_PORT_RANGE_END=23000
 SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
 SB_INGRESS_PROXY_ROUTING=$INGRESS_PROXY_ROUTING
 SB_ROUTE_DNS_ADDR=$ROUTE_DNS_ADDR
+SB_ROUTE_DNS_LINK_ADDR=$route_dns_link_addr
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	# The custom-domain certificate policy sandboxd installs follows the
@@ -1196,6 +1482,17 @@ EOF
 	if [[ "$TLS_ISSUER" != "acme" ]]; then
 		echo "SB_TLS_ISSUER=$TLS_ISSUER" >> /etc/sandboxd/sandboxd.env
 	fi
+	# Written only when asked for, so a default install's env is unchanged.
+	# write_caddyfile writes the matching Caddy half in the same run.
+	if [[ "$PAT_SCOPE" == "host" ]]; then
+		{
+			echo "SB_PAT_SCOPE=host"
+			echo "SB_PUBLIC_API_SOCKET=$PUBLIC_API_SOCKET"
+		} >> /etc/sandboxd/sandboxd.env
+	fi
+	if [[ "$L4_PROXY_PROTOCOL" == "true" ]]; then
+		echo "SB_L4_FALLBACK_PROXY_PROTOCOL=true" >> /etc/sandboxd/sandboxd.env
+	fi
 	# gVisor has no SB_ENABLE_* flag of its own: registering runsc in
 	# /etc/docker/daemon.json lets a sandbox opt into runtime:"runsc", but
 	# the daemon still defaults SB_HOST_RUNTIMES to {"docker"} and only
@@ -1206,6 +1503,9 @@ EOF
 	# binary landed on also tells the cluster it can place gVisor sandboxes.
 	if [[ "$WITH_GVISOR" == "true" ]]; then
 		echo "SB_HOST_RUNTIMES=docker,gvisor" >> /etc/sandboxd/sandboxd.env
+	fi
+	if [[ "$WITH_FIRECRACKER" == "true" ]]; then
+		firecracker_environment >> /etc/sandboxd/sandboxd.env
 	fi
 	# Isolate runtime (plans/isolate-runtime.md). SB_ENABLE_ISOLATE is enough
 	# for advertisement — the daemon appends "isolate" to SupportedRuntimes
@@ -1271,8 +1571,38 @@ EOF
 #SB_AUDIT_WITNESS_S3_ENDPOINT=
 #SB_AUDIT_WITNESS_S3_PATH_STYLE=false
 EOF
+	if [[ "$KEY_CUSTODY" == "wrapped" ]]; then
+		{
+			echo "# Key custody (plans/customer-key-custody.md): the server key exists"
+			echo "# only wrapped by the key store below; see sandboxd key status."
+			# AWS_REGION too: the AWS KMS client needs it, and the SDK's
+			# IMDS fallback turns a missing region into an opaque timeout.
+			grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV"
+			echo "SB_CREDENTIAL_KEY_CUSTODY=wrapped"
+		} >> /etc/sandboxd/sandboxd.env
+	fi
 	chmod 0600 /etc/sandboxd/sandboxd.env
 )
+
+# prepare_key_custody wraps a plaintext server key left by an earlier
+# install, so the daemon (which refuses wrapped custody while a plaintext
+# key file exists) starts. A fresh install has no key: the first boot
+# generates it and writes only the wrapped file.
+prepare_key_custody() {
+	[[ "$KEY_CUSTODY" == "wrapped" ]] || return 0
+	local plain=/var/lib/sandboxd/credential_encryption.key
+	local wrapped=/var/lib/sandboxd/credential_encryption.key.wrapped
+	if [[ -f "$plain" && ! -f "$wrapped" ]]; then
+		echo "Wrapping the existing server key at $plain"
+		"$INSTALL_PREFIX/sandboxd" key wrap --env-file /etc/sandboxd/sandboxd.env
+		# Not a secure delete; `sandboxd key status` reports the migration
+		# until `sandboxd key ack-migration`.
+		rm -f "$plain"
+	elif [[ -f "$plain" && -f "$wrapped" ]]; then
+		"$INSTALL_PREFIX/sandboxd" key verify --env-file /etc/sandboxd/sandboxd.env
+		rm -f "$plain"
+	fi
+}
 
 write_caddyfile() {
 	# Force /etc/caddy to 0755 root:root. The bootstrap runs install.sh under
@@ -1367,19 +1697,37 @@ EOF
 		storage_block+=$'\n\t\tencryption_key {env.SB_CADDY_S3_ENCRYPTION_KEY}'
 		storage_block+=$'\n\t}'
 	fi
+	# --pat-scope host: Caddy reaches sandboxd on the public socket, where
+	# every request is public, instead of on 127.0.0.1:21212, where a
+	# loopback peer may present the operator token.
+	local api_upstream="127.0.0.1:21212"
+	if [[ "$PAT_SCOPE" == "host" ]]; then
+		api_upstream="unix/${PUBLIC_API_SOCKET}"
+	fi
+	# --l4-proxy-protocol: the 8443 server accepts the PROXY v2 header
+	# caddy-l4's fallback sends (only from 127.0.0.1; a connection with no
+	# header is still accepted, so this half can land first), and the API
+	# proxy stamps the client address it learned. {remote_host} replaces
+	# whatever the client sent in that header, so it cannot be forged.
+	local servers_block=""
+	local client_ip_line=""
+	if [[ "$L4_PROXY_PROTOCOL" == "true" ]]; then
+		servers_block=$'\n\tservers 127.0.0.1:8443 {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol {\n\t\t\t\tallow 127.0.0.1/32\n\t\t\t}\n\t\t\ttls\n\t\t}\n\t}'
+		client_ip_line=$'\n\t\t\theader_up X-AerolVM-Client-IP {remote_host}'
+	fi
 	cat > /etc/caddy/Caddyfile <<EOF
 {
 	admin unix//run/caddy/caddy-admin.sock${email_line}
 	# caddy-l4 owns :443; the HTTPS sites below run on 127.0.0.1:8443 and
 	# only receive traffic forwarded from caddy-l4's SNI fallback route.
 	# Disable Caddy's auto-managed :80 -> :443 redirect since :443 isn't ours.
-	auto_https disable_redirects${storage_block}
+	auto_https disable_redirects${storage_block}${servers_block}
 }
 
 https://$DOMAIN:8443 {
 	bind 127.0.0.1
 ${tls_block}
-	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp
+	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp /ui /ui/* /.well-known/aerolvm-auth /.well-known/oauth-protected-resource*
 	handle @api {
 		# stream_close_delay: every admin-API change reloads Caddy, and a
 		# reload closes each WebSocket this proxy carries (exec streams,
@@ -1387,8 +1735,8 @@ ${tls_block}
 		# (#712). A stream that outlives a reload keeps the old config in
 		# memory until it closes or the delay ends. pkg/caddy sets the same
 		# value on the routes sandboxd writes.
-		reverse_proxy 127.0.0.1:21212 {
-			stream_close_delay 10m
+		reverse_proxy ${api_upstream} {
+			stream_close_delay 10m${client_ip_line}
 		}
 	}
 	handle {
@@ -1408,6 +1756,40 @@ ${tls_block}
 	}
 }
 EOF
+	if [[ -n "$LB_HEALTH_PORT" ]]; then
+		cat >> /etc/caddy/Caddyfile <<EOF
+
+# Load-balancer health listener (--lb-health-port). Plain HTTP, so keep the
+# port closed to everything but the balancer (Terraform opens it to the
+# balancer's security group only). GET /health walks the path a client
+# takes: caddy-l4 on :443, its SNI fallback, the HTTPS API site and
+# sandboxd. Any of them down answers 502, and the balancer stops sending
+# this node new connections. Bound to every address: Caddy numbers its
+# servers by sorted listen address, so ":${LB_HEALTH_PORT}" sorts after
+# "127.0.0.1:8443" and the API site stays srv0, where sandboxd writes routes.
+http://:${LB_HEALTH_PORT} {
+	handle /health {
+		reverse_proxy https://127.0.0.1:443 {
+			# The balancer's probe carries its own address as Host and no
+			# SNI. Send the API site's name in both, or the probe matches
+			# no site and Caddy answers an empty 200 with sandboxd down.
+			header_up Host ${DOMAIN}
+			# Required on every reverse_proxy here; the probe holds no stream.
+			stream_close_delay 10m
+			transport http {
+				tls_server_name ${DOMAIN}
+				# A loopback hop to this same Caddy: the probe checks that
+				# the handshake works (certificate loaded), not who answers.
+				tls_insecure_skip_verify
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+}
+EOF
+	fi
 	# The caddy user must be able to read its own config; the bootstrap umask
 	# (077) would otherwise create this 0600 and Caddy would fail to start.
 	chmod 0644 /etc/caddy/Caddyfile
@@ -1478,6 +1860,35 @@ write_caddy_env() (
 # The link needs an address and no IPv6 autoconf, or networkd leaves it in
 # "configuring" and resolved ignores its DNS settings. Requires
 # systemd-networkd and systemd >= 249 (ActivationPolicy, DNS=ip:port).
+#
+# WHY the DNS server is the link's own address, not the loopback responder:
+# resolved pins its socket for a link's DNS server to that link
+# (IP_UNICAST_IF), so a UDP query to 127.0.0.1 leaves through the dummy link
+# and is dropped. resolved then stalls every lookup for about 20s while it
+# falls back to TCP, and it re-probes UDP every few minutes and stalls again.
+# Each stall failed new connections through the ingress with EOF
+# (cluster-bank-flagship UC-171, 2026-11-01). A query to the link's own
+# address is delivered locally, and sandboxd answers there.
+route_dns_network_unit() {
+	cat <<EOF
+[Match]
+Name=aerolvm-rt
+
+[Link]
+RequiredForOnline=no
+ActivationPolicy=always-up
+
+[Network]
+ConfigureWithoutCarrier=yes
+DNS=$ROUTE_DNS_LINK_ADDR
+Domains=~rt.internal
+DNSDefaultRoute=false
+Address=$ROUTE_DNS_LINK_IP/32
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+EOF
+}
+
 write_route_dns_resolver() {
 	if [[ "$INGRESS_PROXY_ROUTING" != "true" ]]; then
 		return
@@ -1497,23 +1908,7 @@ write_route_dns_resolver() {
 Name=aerolvm-rt
 Kind=dummy
 EOF
-	cat > /etc/systemd/network/10-aerolvm-rt.network <<EOF
-[Match]
-Name=aerolvm-rt
-
-[Link]
-RequiredForOnline=no
-ActivationPolicy=always-up
-
-[Network]
-ConfigureWithoutCarrier=yes
-DNS=$ROUTE_DNS_ADDR
-Domains=~rt.internal
-DNSDefaultRoute=false
-Address=169.254.53.53/32
-LinkLocalAddressing=no
-IPv6AcceptRA=no
-EOF
+	route_dns_network_unit > /etc/systemd/network/10-aerolvm-rt.network
 	systemctl restart systemd-networkd
 	systemctl restart systemd-resolved
 	local i
@@ -1642,31 +2037,202 @@ WantedBy=multi-user.target
 EOF
 }
 
+# sandboxd_config_fingerprint identifies the two files a running sandboxd
+# read when it started and install.sh rewrites: its settings file and its
+# unit. cksum, not sha256sum, because it is POSIX; it only has to notice a
+# change. On a fresh install neither file exists yet, and under pipefail a
+# failing cat would abort the install, hence the `|| true`.
+sandboxd_config_fingerprint() {
+	{ cat "$SANDBOXD_ENV_FILE" "$SANDBOXD_UNIT_FILE" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
+}
+
+# record_sandboxd_state notes, before any file is written, whether sandboxd
+# is running and what its settings were.
+record_sandboxd_state() {
+	SANDBOXD_WAS_ACTIVE="false"
+	if systemctl is-active --quiet sandboxd 2>/dev/null; then
+		SANDBOXD_WAS_ACTIVE="true"
+	fi
+	SANDBOXD_CONFIG_BEFORE="$(sandboxd_config_fingerprint)"
+}
+
+# wait_for_sandboxd_ready waits until sandboxd answers /health and, under
+# --pat-scope host, has made the public socket Caddy proxies to.
+wait_for_sandboxd_ready() {
+	local try
+	for ((try = 0; try < SANDBOXD_READY_TRIES; try++)); do
+		if curl -fsS --max-time 2 -o /dev/null "$SANDBOXD_HEALTH_URL" 2>/dev/null &&
+			{ [[ "$PAT_SCOPE" != "host" ]] || [[ -S "$PUBLIC_API_SOCKET" ]]; }; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+# restart_sandboxd_if_reconfigured restarts sandboxd when it was running
+# before this run and the run changed its settings file or unit.
+# `systemctl enable --now` only starts a stopped unit, so before this a
+# re-run left the old process on its old settings. Under --pat-scope host
+# that was an outage: Caddy, restarted onto the public socket, proxied to a
+# socket the old process never made. It runs before Caddy starts, and waits
+# for the restarted sandboxd (and its socket) so Caddy never points at a
+# socket that is not there yet. A fresh install, a stopped unit or a run
+# that changed nothing is left to `enable --now`, as before.
+restart_sandboxd_if_reconfigured() {
+	if [[ "$SANDBOXD_WAS_ACTIVE" != "true" ]]; then
+		return 0
+	fi
+	if [[ "$(sandboxd_config_fingerprint)" == "$SANDBOXD_CONFIG_BEFORE" ]]; then
+		return 0
+	fi
+	echo "sandboxd settings changed; restarting sandboxd before Caddy"
+	systemctl restart sandboxd
+	if ! wait_for_sandboxd_ready; then
+		echo "warning: sandboxd is not answering ${SANDBOXD_HEALTH_URL} (or has not made ${PUBLIC_API_SOCKET}) ${SANDBOXD_READY_TRIES}s after its restart; starting Caddy anyway. Check: journalctl -u sandboxd" >&2
+	fi
+}
+
 write_healthcheck_script() {
 	cat > "$INSTALL_PREFIX/sandboxd-healthcheck" <<'EOF'
 #!/usr/bin/env bash
+# sandboxd-healthcheck: run by sandboxd-healthcheck.timer every 30 s.
+#
+# It restarts sandboxd only when the process has stopped answering, never
+# because it is busy. A restart kills every request in flight on the node,
+# so on the bank flagship (2026-11-01) restarting an overloaded node after
+# one slow /health turned overload into an outage. Hence:
+#   - it probes the liveness socket, which the daemon answers from its own
+#     listener with no I/O and no lock (pkg/daemon/liveness.go), not
+#     /health, which reads the store and pings the engines;
+#   - it restarts only after FAILS_TO_RESTART failed probes in a row of one
+#     run of the daemon (its InvocationID), the first and the last at least
+#     FAIL_WINDOW_SECONDS apart; the streak is kept between timer runs;
+#   - it never restarts a daemon younger than BOOT_GRACE_SECONDS, nor while
+#     a start, stop or restart of the unit is already under way, and it
+#     asks systemd for the restart without waiting for it, so its next run
+#     sees the restart in progress instead of probing a half-booted daemon.
 
 set -euo pipefail
 
 ENV_FILE="/etc/sandboxd/sandboxd.env"
 if [[ -f "$ENV_FILE" ]]; then
-	# shellcheck disable=SC1091
+	# shellcheck source=/dev/null
 	source "$ENV_FILE"
 fi
 
-if ! systemctl is-active --quiet sandboxd.service; then
+UNIT="sandboxd.service"
+STATE_DIR="${SANDBOXD_HEALTHCHECK_STATE_DIR:-/run/sandboxd-healthcheck}"
+STATE_FILE="$STATE_DIR/streak"
+LIVENESS_SOCKET="${SB_LIVENESS_SOCKET:-/run/sandboxd/live.sock}"
+FAILS_TO_RESTART=3
+FAIL_WINDOW_SECONDS=90
+BOOT_GRACE_SECONDS=120
+PROBE_TIMEOUT_SECONDS=10
+
+log() {
+	logger -t sandboxd-healthcheck "$*"
+}
+
+clear_streak() {
+	rm -f "$STATE_FILE"
+}
+
+unit_prop() {
+	systemctl show -p "$1" --value "$UNIT" 2>/dev/null || true
+}
+
+mkdir -p "$STATE_DIR"
+chmod 0700 "$STATE_DIR"
+# One watchdog at a time: a manual run beside the timer's must not ask for
+# a second restart.
+if command -v flock >/dev/null 2>&1; then
+	exec 9>"$STATE_DIR/lock"
+	flock -n 9 || exit 0
+fi
+
+# systemd stops restarting a unit that failed StartLimitBurst times within
+# StartLimitIntervalSec. A node whose key store was unreachable at boot
+# (wrapped server-key custody) fails that way and would stay down after the
+# key store came back, so a failed unit is reset and started again here,
+# every run of this timer. A unit an operator stopped is inactive, not
+# failed, and is left alone.
+if systemctl is-failed --quiet "$UNIT"; then
+	log "sandboxd.service is failed; resetting it and starting it again"
+	clear_streak
+	systemctl reset-failed "$UNIT"
+	systemctl start "$UNIT" || true
 	exit 0
 fi
 
-HEALTH_HOST="127.0.0.1"
-HEALTH_PORT="${SB_API_PORT:-21212}"
-HEALTH_URL="http://${HEALTH_HOST}:${HEALTH_PORT}/health"
-
-if ! curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
-	logger -t sandboxd-healthcheck "health check failed for ${HEALTH_URL}; restarting sandboxd.service"
-	systemctl restart sandboxd.service
-	logger -t sandboxd-healthcheck "sandboxd.service restart requested"
+# inactive: stopped by an operator. activating, deactivating, reloading: a
+# start, stop or restart is already under way. Neither is ours to touch.
+if [[ "$(unit_prop ActiveState)" != "active" ]]; then
+	clear_streak
+	exit 0
 fi
+# A job queued on the unit (a restart someone already asked for) is under
+# way too: never stack a second restart on it.
+if [[ -n "$(systemctl list-jobs --no-legend "$UNIT" 2>/dev/null || true)" ]]; then
+	exit 0
+fi
+invocation="$(unit_prop InvocationID)"
+main_pid="$(unit_prop MainPID)"
+
+probe() {
+	if [[ -S "$LIVENESS_SOCKET" ]]; then
+		curl -fsS --max-time "$PROBE_TIMEOUT_SECONDS" --unix-socket "$LIVENESS_SOCKET" "http://localhost/livez" >/dev/null
+		return
+	fi
+	# A daemon older than the liveness socket, or one run with
+	# SB_LIVENESS_SOCKET=off: /health is the only signal it has.
+	curl -fsS --max-time "$PROBE_TIMEOUT_SECONDS" "http://127.0.0.1:${SB_API_PORT:-21212}/health" >/dev/null
+}
+
+if probe; then
+	clear_streak
+	exit 0
+fi
+
+now="$(date +%s)"
+streak_invocation=""
+fails=0
+first=0
+if [[ -f "$STATE_FILE" ]]; then
+	read -r streak_invocation fails first <"$STATE_FILE" || true
+fi
+# Failures of an earlier run of the daemon say nothing about this one.
+if [[ "$streak_invocation" != "$invocation" || ! "$fails" =~ ^[0-9]+$ || ! "$first" =~ ^[0-9]+$ ]]; then
+	fails=0
+	first="$now"
+fi
+fails=$((fails + 1))
+printf '%s %s %s\n' "$invocation" "$fails" "$first" >"$STATE_FILE.tmp"
+mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+span=$((now - first))
+
+age="$(ps -o etimes= -p "$main_pid" 2>/dev/null | tr -d ' ' || true)"
+if [[ ! "$age" =~ ^[0-9]+$ ]]; then
+	age=0
+fi
+if ((age < BOOT_GRACE_SECONDS)); then
+	log "liveness probe failed ($fails in a row over ${span}s) for a daemon ${age}s old; a daemon in its first ${BOOT_GRACE_SECONDS}s is never restarted"
+	exit 0
+fi
+if ((fails < FAILS_TO_RESTART || span < FAIL_WINDOW_SECONDS)); then
+	log "liveness probe failed ($fails in a row over ${span}s); restarting only after $FAILS_TO_RESTART in a row over ${FAIL_WINDOW_SECONDS}s"
+	exit 0
+fi
+# Last look before acting: a restart that began while we probed is not ours
+# to repeat.
+if [[ "$(unit_prop InvocationID)" != "$invocation" || "$(unit_prop ActiveState)" != "active" ]]; then
+	clear_streak
+	exit 0
+fi
+log "liveness probe failed $fails times in a row over ${span}s; restarting sandboxd.service"
+clear_streak
+systemctl --no-block restart "$UNIT"
+log "sandboxd.service restart requested"
 EOF
 	chmod 0755 "$INSTALL_PREFIX/sandboxd-healthcheck"
 }
@@ -1974,6 +2540,180 @@ register_isolate_runtime() {
 	fi
 }
 
+# firecracker_preflight refuses a host Firecracker cannot run on. It runs
+# before anything is installed: without it a non-KVM host gets Docker, Caddy
+# and sandboxd, and only the first runtime:"firecracker" create fails.
+firecracker_preflight() {
+	if [[ "$(uname -s)" != "Linux" ]]; then
+		echo "--with-firecracker: Firecracker runs on Linux only" >&2
+		exit 1
+	fi
+	case "$(uname -m)" in
+		x86_64 | amd64 | aarch64 | arm64) ;;
+		*)
+			echo "--with-firecracker: unsupported architecture $(uname -m); Firecracker runs on x86_64 and aarch64" >&2
+			exit 1
+			;;
+	esac
+	if [[ ! -e "$KVM_DEVICE" ]]; then
+		{
+			echo "--with-firecracker: $KVM_DEVICE is missing, so this host cannot run Firecracker VMs."
+			echo "Firecracker needs hardware virtualization (KVM):"
+			echo "  * AWS: use a bare-metal instance type (c5.metal, m5zn.metal, c7g.metal ...)."
+			echo "    Other instance types are VMs themselves and have no /dev/kvm."
+			echo "  * GCP or Azure: use a machine type with nested virtualization turned on."
+			echo "  * Your own server: turn on Intel VT-x or AMD-V in the BIOS, then run"
+			echo "    'sudo modprobe kvm_intel' (or kvm_amd)."
+			echo "Or re-run without --with-firecracker."
+		} >&2
+		exit 1
+	fi
+}
+
+# firecracker_binary_version prints the first line of `<bin> --version`
+# ("Firecracker v1.15.1", "Jailer v1.15.1"), or nothing when bin is missing
+# or does not run.
+firecracker_binary_version() {
+	local out
+	[[ -x "$1" ]] || return 0
+	out="$("$1" --version 2>/dev/null)" || return 0
+	printf '%s\n' "${out%%$'\n'*}"
+}
+
+# firecracker_verify stops the install unless file $1 has SHA-256 $2.
+firecracker_verify() {
+	if ! echo "$2  $1" | sha256sum -c - >/dev/null; then
+		echo "--with-firecracker: checksum verification failed for ${1##*/} (pinned $2)" >&2
+		exit 1
+	fi
+}
+
+# install_firecracker_release installs firecracker and jailer from the pinned
+# release, unless both already report the pinned version. A different version
+# is replaced, as the Ansible install does.
+install_firecracker_release() {
+	local arch="$1" sha="$2" tmp_dir="$3"
+	if [[ "$(firecracker_binary_version "$FIRECRACKER_BIN")" == "Firecracker $FIRECRACKER_VERSION" &&
+		"$(firecracker_binary_version "$JAILER_BIN")" == "Jailer $FIRECRACKER_VERSION" ]]; then
+		echo "firecracker and jailer $FIRECRACKER_VERSION already installed"
+		return 0
+	fi
+	local tarball="firecracker-${FIRECRACKER_VERSION}-${arch}.tgz"
+	local url="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/${tarball}"
+	echo "Downloading Firecracker ${FIRECRACKER_VERSION} for ${arch} from ${url}"
+	if ! curl_download "$url" -o "${tmp_dir}/${tarball}"; then
+		echo "--with-firecracker: failed to download ${url}" >&2
+		exit 1
+	fi
+	firecracker_verify "${tmp_dir}/${tarball}" "$sha"
+	tar -xzf "${tmp_dir}/${tarball}" -C "$tmp_dir"
+	local release="${tmp_dir}/release-${FIRECRACKER_VERSION}-${arch}"
+	install -m 0755 "${release}/firecracker-${FIRECRACKER_VERSION}-${arch}" "$FIRECRACKER_BIN"
+	install -m 0755 "${release}/jailer-${FIRECRACKER_VERSION}-${arch}" "$JAILER_BIN"
+	echo "Installed firecracker and jailer ${FIRECRACKER_VERSION} to ${FIRECRACKER_BIN%/*}"
+}
+
+# install_firecracker_kernel installs the pinned guest kernel and its build
+# config, unless a kernel is already there: an operator's own kernel stays,
+# and so does the one the templates and stopped sandboxes on this node were
+# made with. Either way the config must set CONFIG_VMGENID=y. Without it,
+# VMs restored from one snapshot can start with the same random-number state,
+# and sandboxd's /health reports Firecracker degraded.
+install_firecracker_kernel() {
+	local arch="$1" kernel_sha="$2" config_sha="$3" tmp_dir="$4"
+	local config="${FIRECRACKER_KERNEL_PATH}.config" downloaded="false"
+	if [[ -f "$FIRECRACKER_KERNEL_PATH" ]]; then
+		echo "Keeping the guest kernel already at $FIRECRACKER_KERNEL_PATH"
+		if [[ ! -f "$config" ]]; then
+			echo "--with-firecracker: the kernel at $FIRECRACKER_KERNEL_PATH has no build config at $config." >&2
+			echo "Put the kernel's .config there, or remove the kernel to install the pinned one." >&2
+			exit 1
+		fi
+	else
+		local base="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FIRECRACKER_KERNEL_CI_VERSION}/${arch}"
+		local name="vmlinux-${FIRECRACKER_KERNEL_VERSION}"
+		echo "Downloading guest kernel ${FIRECRACKER_KERNEL_VERSION} for ${arch} from ${base}/${name}"
+		if ! curl_download "${base}/${name}" -o "${tmp_dir}/vmlinux" ||
+			! curl_download "${base}/${name}.config" -o "${tmp_dir}/vmlinux.config"; then
+			echo "--with-firecracker: failed to download the guest kernel from ${base}" >&2
+			exit 1
+		fi
+		firecracker_verify "${tmp_dir}/vmlinux" "$kernel_sha"
+		firecracker_verify "${tmp_dir}/vmlinux.config" "$config_sha"
+		config="${tmp_dir}/vmlinux.config"
+		downloaded="true"
+	fi
+	if ! grep -qx 'CONFIG_VMGENID=y' "$config"; then
+		echo "--with-firecracker: the guest kernel's config ($config) does not set CONFIG_VMGENID=y" >&2
+		exit 1
+	fi
+	if [[ "$downloaded" == "true" ]]; then
+		# Config first: a run cut off between the two leaves no kernel, so the
+		# next run downloads both again instead of keeping a kernel without one.
+		install -d -m 0755 "${FIRECRACKER_KERNEL_PATH%/*}"
+		install -m 0644 "${tmp_dir}/vmlinux.config" "${FIRECRACKER_KERNEL_PATH}.config"
+		install -m 0644 "${tmp_dir}/vmlinux" "$FIRECRACKER_KERNEL_PATH"
+		echo "Installed guest kernel ${FIRECRACKER_KERNEL_VERSION} to $FIRECRACKER_KERNEL_PATH"
+	fi
+}
+
+# install_firecracker sets up what the Firecracker driver needs on this host:
+# firecracker and jailer, the guest kernel and its config, the tools that turn
+# an image into a VM disk, the template and jailer directories, and the
+# jailer's user. Every download is checked before anything is installed from
+# it. Same artifacts as the Terraform bootstrap and Ansible configure-ops.yml.
+install_firecracker() {
+	local arch release_sha kernel_sha config_sha
+	case "$(uname -m)" in
+		x86_64 | amd64)
+			arch="x86_64"
+			release_sha="$FIRECRACKER_SHA256_X86_64"
+			kernel_sha="$FIRECRACKER_KERNEL_SHA256_X86_64"
+			config_sha="$FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64"
+			;;
+		aarch64 | arm64)
+			arch="aarch64"
+			release_sha="$FIRECRACKER_SHA256_AARCH64"
+			kernel_sha="$FIRECRACKER_KERNEL_SHA256_AARCH64"
+			config_sha="$FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64"
+			;;
+		*)
+			echo "--with-firecracker: unsupported architecture $(uname -m); Firecracker runs on x86_64 and aarch64" >&2
+			exit 1
+			;;
+	esac
+
+	# skopeo and umoci unpack an image, mkfs.ext4 (e2fsprogs) makes the VM's
+	# disk from it, and ip (iproute2) makes each VM's TAP device.
+	apt-get install -y skopeo umoci e2fsprogs iproute2
+
+	local tmp_dir
+	tmp_dir="$(mktemp -d)"
+	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
+	trap "rm -rf '$tmp_dir'" RETURN
+
+	install_firecracker_release "$arch" "$release_sha" "$tmp_dir"
+	install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
+	install -d -m 0755 "$FIRECRACKER_TEMPLATES_DIR" "$JAILER_CHROOT_BASE"
+	if ! getent passwd "$JAILER_USER" >/dev/null 2>&1; then
+		useradd --system --no-create-home --shell /usr/sbin/nologin --user-group "$JAILER_USER"
+	fi
+}
+
+# firecracker_environment prints the sandboxd.env lines for
+# --with-firecracker. SB_ENABLE_FIRECRACKER also advertises "firecracker" to
+# cluster placement, even next to the SB_HOST_RUNTIMES --with-gvisor writes
+# (pkg/daemon supportedRuntimesForConfig appends it). Every path is the
+# daemon's default; only the jailer's identity has to be written.
+firecracker_environment() {
+	local uid gid
+	uid="$(id -u "$JAILER_USER")"
+	gid="$(id -g "$JAILER_USER")"
+	echo "SB_ENABLE_FIRECRACKER=true"
+	echo "SB_JAILER_UID=$uid"
+	echo "SB_JAILER_GID=$gid"
+}
+
 install_cni_plugins() {
 	# CNI bridge + host-local are required for containerd native netns
 	# (plans/containerd-engine.md §4 / Phase 5). Install under /opt/cni/bin.
@@ -2097,6 +2837,11 @@ SB_TOOLBOX_MOUNT_PATH=/usr/local/bin/toolboxd
 SB_TOOLBOX_PORT=2280
 SB_IDLE_TIMEOUT_MIN=$IDLE_TIMEOUT_MIN
 SB_ENABLE_CADDY=false
+# No per-sandbox firewall in local mode: a create or update that asks for
+# network policy (block-all, address lists, hostname rules, byte caps) is
+# refused with 501 network_policy_unenforced instead of being accepted and not
+# enforced. SB_ALLOW_UNENFORCED_NETWORK_POLICY=true accepts it unenforced
+# (development only); SB_ENABLE_NETWORK_RULES=true enforces it.
 SB_ENABLE_NETWORK_RULES=false
 SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts
 SB_MOUNTS_CRED_DIR=/run/sandboxd
@@ -2407,7 +3152,12 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		exit 1
 	fi
 	install_binaries
+	record_sandboxd_state
 	write_local_environment
+	# This branch skips install_packages, so it installs the two parts of it
+	# a local server still needs, in the same order: the mount tools (platform
+	# volumes and external storage are mounted on the host), then Docker.
+	install_mount_tools
 	# The local unit hard-Requires docker.service; on Linux we must install
 	# the engine here since this branch skips install_packages.
 	ensure_docker
@@ -2417,6 +3167,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	write_healthcheck_units
 	systemctl daemon-reload
 	systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
+	restart_sandboxd_if_reconfigured
 	systemctl enable --now sandboxd sandboxd-healthcheck.timer
 	echo "AerolVM installed (local mode)"
 	echo "PAT token: stored in /etc/sandboxd/sandboxd.env — view with: sudo cat /etc/sandboxd/sandboxd.env"
@@ -2424,7 +3175,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	echo "API URL: http://127.0.0.1:21212"
 	echo "Health URL: http://127.0.0.1:21212/health"
 	echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
-	echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
+	echo "Health watchdog: sandboxd-healthcheck.timer probes the liveness socket every 30 seconds and restarts sandboxd only after 3 failed probes in a row over 90 seconds"
 	exit 0
 fi
 
@@ -2433,12 +3184,20 @@ if [[ $EUID -ne 0 ]]; then
 	exit 1
 fi
 
+if [[ "$WITH_FIRECRACKER" == "true" ]]; then
+	# Before install_packages, so a host without KVM fails before Docker and
+	# Caddy are installed on it.
+	firecracker_preflight
+fi
 install_packages
 if [[ "$WITH_GVISOR" == "true" ]]; then
 	register_gvisor_runtime
 fi
 if [[ "$WITH_ISOLATE" == "true" ]]; then
 	register_isolate_runtime
+fi
+if [[ "$WITH_FIRECRACKER" == "true" ]]; then
+	install_firecracker
 fi
 if [[ "$WITH_CONTAINERD_ENGINE" == "true" ]]; then
 	install_cni_plugins
@@ -2455,7 +3214,9 @@ fi
 # trip to the Caddy build server.
 install_custom_caddy "$DNS_PROVIDER"
 install_binaries
+record_sandboxd_state
 write_environment
+prepare_key_custody
 write_caddy_env
 write_caddy_systemd_dropin
 write_route_dns_resolver
@@ -2467,9 +3228,25 @@ write_healthcheck_units
 
 systemctl daemon-reload
 systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
-systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
+if [[ "$NO_START" == "true" ]]; then
+	# A joiner: cluster-join.sh starts sandboxd once cluster.env and the
+	# cluster's server key are in place (see --no-start).
+	systemctl enable caddy sandboxd sandboxd-healthcheck.timer
+	systemctl start caddy sandboxd-healthcheck.timer
+else
+	# Before Caddy: a re-run that changed sandboxd's settings restarts it and
+	# waits for it, so Caddy starts in front of a sandboxd (and, under
+	# --pat-scope host, a public socket) that is already there.
+	restart_sandboxd_if_reconfigured
+	systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
+fi
 
 echo "AerolVM installed"
+if [[ "$NO_START" == "true" ]]; then
+	echo "sandboxd: enabled, not started (--no-start); cluster-join.sh starts it"
+fi
+# The token is not echoed: it lives in the root-only sandboxd.env (the fork's
+# argv/`ps` hardening) and is never printed to the terminal or install logs.
 echo "PAT token: stored in /etc/sandboxd/sandboxd.env — view with: sudo cat /etc/sandboxd/sandboxd.env"
 echo "Use header: Authorization: Bearer <value of the token in sandboxd.env>"
 if [[ -n "$DOMAIN" ]]; then
@@ -2480,6 +3257,9 @@ if [[ -n "$DOMAIN" ]]; then
 	echo "TLS-SNI multiplexing: ENABLED on :443 (caddy-l4 routes by SNI)"
 	echo "  Regular HTTPS sites moved to 127.0.0.1:8443; caddy-l4 forwards"
 	echo "  unmatched SNI to that listener. exposeTLSPort() works out of the box."
+	if [[ -n "$LB_HEALTH_PORT" ]]; then
+		echo "Load-balancer health check: http://<this node>:${LB_HEALTH_PORT}/health (open it to the balancer only)"
+	fi
 else
 	echo "API URL: http://$PUBLIC_HOST:21212"
 	echo "Health URL: http://$PUBLIC_HOST:21212/health"
@@ -2490,4 +3270,4 @@ echo "  This range sits below the Linux ephemeral range (32768-60999) on purpose
 echo "  kernel never hands these out as outbound source ports — eliminates random EADDRINUSE"
 echo "  failures on ExposeTCPPort. 1000 slots = max concurrent TCP exposures per host."
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
-echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
+echo "Health watchdog: sandboxd-healthcheck.timer probes the liveness socket every 30 seconds and restarts sandboxd only after 3 failed probes in a row over 90 seconds"

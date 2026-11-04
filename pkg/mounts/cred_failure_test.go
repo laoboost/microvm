@@ -84,7 +84,7 @@ func TestCredFailureIncrementsMetricOnMatch(t *testing.T) {
 		models.MountTypeS3: shCredFailAdapter{},
 	})
 	m.logger = logger
-	stubProbe(t, func(string, time.Duration) error { return nil })
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error { return nil })
 
 	before := expvarSnapshot(t, "aerolvm_mount_cred_failure_total")
 
@@ -125,7 +125,7 @@ func TestCredFailureLogsStructuredWarningOnMatch(t *testing.T) {
 			models.MountTypeS3: shCredFailAdapter{},
 		})
 		m.logger = logger
-		stubProbe(t, func(string, time.Duration) error { return nil })
+		stubProbe(t, func(string, time.Duration, <-chan struct{}) error { return nil })
 
 		if _, err := m.MountAll(context.Background(), "sb-log-init", []models.MountSpec{
 			{Type: models.MountTypeS3, Source: "s3://bucket", Target: "/data"},
@@ -148,7 +148,7 @@ func TestCredFailureLogsStructuredWarningOnMatch(t *testing.T) {
 		}
 		m, state, _ := restartTestManager(t, plan)
 		m.logger = logger
-		stubProbe(t, func(string, time.Duration) error { return nil })
+		stubProbe(t, func(string, time.Duration, <-chan struct{}) error { return nil })
 
 		m.superviseExit(state)
 
@@ -184,7 +184,7 @@ func TestCredFailureDoesNotTriggerMountCrashHook(t *testing.T) {
 		models.MountTypeS3: shCredFailAdapter{},
 	})
 	m.logger = logger
-	stubProbe(t, func(string, time.Duration) error { return nil })
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error { return nil })
 
 	var crashes int
 	m.SetOnMountCrash(func(string, int) { crashes++ })

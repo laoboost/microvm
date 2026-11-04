@@ -36,9 +36,20 @@ func WrapSnapshot(svc *service.Service, name func(*http.Request) string, write E
 			local.ServeHTTP(w, r)
 			return
 		}
-		node, ok, err := c.SnapshotHomeNode(r.Context(), snapshotName)
+		// Route by the OWNER-qualified home key: a snapshot name is unique per
+		// owner, and keying the lookup by the caller's owner stops one tenant's
+		// registration from redirecting another tenant's same-named snapshot
+		// (#11). Operator/unscoped callers use the bare name (owner "").
+		homeKey := cluster.SnapshotHomeKey(service.OwnerRefForCreate(r.Context()), snapshotName)
+		node, ok, err := c.SnapshotHomeNode(r.Context(), homeKey)
 		if err != nil {
 			write(w, http.StatusServiceUnavailable, "cluster: snapshot home lookup: "+err.Error())
+			return
+		}
+		if !ok && !cluster.CaughtUp(c) {
+			// No entry in a view still catching up after a restart is not
+			// "no such snapshot": its registration may not be applied yet.
+			WriteNotCaughtUp(w, write)
 			return
 		}
 		if !ok || node == c.SelfNodeID() {

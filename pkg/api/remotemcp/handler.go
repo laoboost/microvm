@@ -5,8 +5,11 @@
 //
 // The endpoint is stateless (no Mcp-Session-Id), so any node can serve any
 // request behind any load balancer and nothing touches cluster state. Each
-// request builds an agentmcp server whose tools reach the API in-process
-// with the caller's own token (see inProcessTransport).
+// request builds an agentmcp server whose tools reach the API in-process as
+// the caller: the Access /mcp authenticated is handed to every inner call
+// (handoff.go), and the caller's own token rides along for forwards (see
+// inProcessTransport). With identity on, connectors can sign in through the
+// company's identity provider with OAuth (metadata.go, §5.14).
 package remotemcp
 
 import (
@@ -17,7 +20,6 @@ import (
 	"net"
 	"net/http"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +29,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/agentmcp"
 	"github.com/aerol-ai/microvm/internal/agenttools"
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -112,7 +115,7 @@ func (h *Handler) Wrap(auth func(http.Handler) http.Handler) http.Handler {
 }
 
 func (h *Handler) serveAuthed(w http.ResponseWriter, r *http.Request) {
-	token := bearerToken(r)
+	token := apihttp.BearerToken(r)
 	if !h.limiter.allow(token) {
 		recordRequest("rate_limited")
 		w.Header().Set("Retry-After", "1")
@@ -138,11 +141,37 @@ func (h *Handler) serverFor(r *http.Request) *mcp.Server {
 	if !ok {
 		return nil // the SDK answers 400
 	}
+	// The tools MUST act as exactly the caller that authenticated this
+	// request, and only as them (eng review E4). Two things carry that:
+	//
+	//   - the Access /mcp resolved, handed to every inner call (handoff.go),
+	//     which the API edge uses instead of checking a bearer again;
+	//   - the caller's own bearer, which a forward to the owning node
+	//     carries so the owner can verify it offline. apihttp.BearerToken is
+	//     the one extraction the API's authenticate also uses (eng review
+	//     D5), so a caller who authenticated via the subprotocol, or with a
+	//     lowercase scheme, forwards their own token too.
+	//
+	// An empty token must never reach agenttools: the SDK client falls back
+	// to SB_PAT_TOKEN (the daemon's operator PAT) on an empty token, and a
+	// forwarded inner call would then run as the operator on the owner. Auth
+	// has already passed by this point, so a non-empty token is guaranteed;
+	// refuse rather than escalate if that ever changes. agenttools gets
+	// APIURL and Token explicitly, so no inner call reads sandboxd's own
+	// environment.
+	token := apihttp.BearerToken(r)
+	if token == "" {
+		return nil // the SDK answers 400; never fall through to the operator PAT
+	}
+	access, hasAccess := controlplane.AccessFromContext(r.Context())
 	tools, err := agenttools.New(agenttools.Config{
-		APIURL:     inProcessBaseURL,
-		Token:      bearerToken(r),
-		Source:     agenttools.SourceMCP,
-		HTTPClient: &http.Client{Transport: &inProcessTransport{handler: h.api(), remoteAddr: r.RemoteAddr}},
+		APIURL: inProcessBaseURL,
+		Token:  token,
+		Source: agenttools.SourceMCP,
+		HTTPClient: &http.Client{Transport: &inProcessTransport{
+			handler: h.api(), remoteAddr: r.RemoteAddr, access: access, hasAccess: hasAccess,
+			patOrigin: cluster.PATOriginFromContext(r.Context()),
+		}},
 	})
 	if err != nil {
 		return nil
@@ -160,7 +189,7 @@ func (h *Handler) serverFor(r *http.Request) *mcp.Server {
 // they can hold file contents and secrets.
 func (h *Handler) instrument(reqCtx context.Context) agentmcp.Instrument {
 	ownerRef := ""
-	if access, ok := controlplane.AccessFromContext(reqCtx); ok && !access.Operator {
+	if access, ok := controlplane.AccessFromContext(reqCtx); ok && !access.Fleet {
 		ownerRef = access.Identity.OwnerRef
 	}
 	return func(ctx context.Context, tool string) (context.Context, func(string, error)) {
@@ -212,14 +241,6 @@ func spanError(outcome string, err error) error {
 		return err
 	}
 	return nil
-}
-
-func bearerToken(r *http.Request) string {
-	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	if len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") {
-		return strings.TrimSpace(auth[7:])
-	}
-	return ""
 }
 
 func hostOnly(host string) string {

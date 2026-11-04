@@ -75,9 +75,8 @@ variable "availability_zone" {
 }
 
 variable "admin_allowed_cidrs" {
-  description = "CIDRs allowed to reach SSH (22) and the operator/SDK API (21212). Must be set explicitly — the old 0.0.0.0/0 default left SSH+API+Grafana internet-open. An empty list fails plan, and documentation/reserved ranges are rejected so a copied placeholder cannot silently produce an unreachable cluster."
+  description = "CIDRs allowed to reach SSH (22) and the operator/SDK API (21212). Required, no default — the old 0.0.0.0/0 default left SSH+API+Grafana internet-open. An empty list fails plan, and documentation/reserved ranges are rejected so a copied placeholder cannot silently produce an unreachable cluster. 0.0.0.0/0 is gated on allow_admin_from_anywhere in network.tf's admin_ssh precondition."
   type        = list(string)
-  default     = []
 
   validation {
     condition     = length(var.admin_allowed_cidrs) > 0
@@ -102,16 +101,16 @@ variable "admin_allowed_cidrs" {
   validation {
     condition = alltrue([
       for c in var.admin_allowed_cidrs : !can(regex(
-        "^(0\\.0\\.0\\.0/0|127\\.|169\\.254\\.|192\\.0\\.2\\.|198\\.51\\.100\\.|203\\.0\\.113\\.|224\\.|240\\.)",
+        "^(127\\.|169\\.254\\.|192\\.0\\.2\\.|198\\.51\\.100\\.|203\\.0\\.113\\.|224\\.|240\\.)",
         c,
       ))
     ])
-    error_message = "admin_allowed_cidrs contains 0.0.0.0/0, a reserved range (127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4), or an RFC 5737 documentation range (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). Those are unreachable placeholders — replace them with your real operator CIDR (0.0.0.0/0 additionally needs allow_public_admin = true)."
+    error_message = "admin_allowed_cidrs contains a reserved range (127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4) or an RFC 5737 documentation range (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). Those are unreachable placeholders — replace them with your real operator CIDR. 0.0.0.0/0 is not rejected here: it is gated on allow_admin_from_anywhere = true in network.tf's admin_ssh precondition, so a world-open admin needs the explicit opt-in."
   }
 }
 
-variable "allow_public_admin" {
-  description = "Opt-in acknowledgement that admin access (SSH 22, operator/SDK API 21212, Grafana 3000) is intentionally open to the whole internet. Required before admin_allowed_cidrs may contain 0.0.0.0/0. Keep false."
+variable "allow_admin_from_anywhere" {
+  description = "Opt-in acknowledgement that admin access (SSH 22, operator/SDK API 21212, Grafana 3000) is intentionally open to the whole internet (0.0.0.0/0 in admin_allowed_cidrs). Keep false."
   type        = bool
   default     = false
 }
@@ -138,6 +137,50 @@ variable "ssh_gateway_port" {
   description = "Public TCP port for the per-sandbox SSH gateway. Must match SB_SSH_LISTEN_ADDR on the daemon (default 0.0.0.0:2220). Opened on ingress-bearing nodes."
   type        = number
   default     = 2220
+}
+
+variable "api_load_balancer" {
+  description = <<-EOT
+    What sits in front of the ingress nodes. "none" (the default) is DNS
+    round-robin: <domain> and *.<domain> get one A record per ingress node,
+    exactly as before. A client that DNS sends to a node whose sandboxd is
+    down gets 502 until it is back, because the TCP and TLS handshakes with
+    that node's Caddy still succeed and nothing makes the client try the next
+    record.
+
+    "nlb" creates an internet-facing AWS Network Load Balancer (TCP
+    passthrough, so Caddy keeps terminating TLS and caddy-l4 keeps routing by
+    SNI) on public_http_ports and ssh_gateway_port, with the client address
+    preserved. Its health check probes each ingress node's Caddy
+    (install.sh --lb-health-port), which walks caddy-l4 on :443 to sandboxd,
+    so a node leaves rotation about 10 s after its daemon stops. <domain> and
+    *.<domain> then point at the balancer's Elastic IP. The raw-TCP port
+    pool cannot ride an NLB (at most 50 listeners), so raw TCP moves to
+    tcp.<domain>, which keeps one A record per ingress node, and every node
+    gets SB_L4_PUBLIC_HOST.
+
+    Recommended for production. Changing it on a running cluster changes
+    every node's bootstrap, so Terraform replaces the nodes: choose it when
+    you create the cluster.
+  EOT
+  type        = string
+  default     = "none"
+
+  validation {
+    condition     = contains(["none", "nlb"], var.api_load_balancer)
+    error_message = "api_load_balancer must be \"none\" or \"nlb\"."
+  }
+}
+
+variable "api_lb_health_check_port" {
+  description = "Port of the plain-HTTP /health listener each ingress node opens for the load balancer's health check (install.sh --lb-health-port) when api_load_balancer = \"nlb\". Only the balancer's security group may reach it. It must be a port the node does not otherwise use."
+  type        = number
+  default     = 21280
+
+  validation {
+    condition     = var.api_lb_health_check_port >= 1024 && var.api_lb_health_check_port <= 65535 && floor(var.api_lb_health_check_port) == var.api_lb_health_check_port
+    error_message = "api_lb_health_check_port must be a port number from 1024 to 65535."
+  }
 }
 
 variable "ssh_host_key_pem" {
@@ -631,6 +674,23 @@ variable "secret_kms_enabled" {
 # SB_ENTERPRISE_MODE is true, so defaulting it on keeps an enterprise scenario
 # from failing at daemon start with a config error. A scenario can still turn
 # it off through extra_sandboxd_env, which is rendered after this block.
+# Server-key custody (plans/customer-key-custody.md §3). "wrapped" keeps the
+# server key that seals env, registry, mount and toolbox secrets only wrapped
+# by the KMS key above: install.sh and cluster-init.sh never write it in
+# plaintext, and the S3 cred bundle object then holds only the wrapped file.
+# Needs secret_kms_enabled (this module provisions only AWS KMS; Vault and
+# HSM key stores are the customer's own).
+variable "key_custody" {
+  description = "Server-key custody: \"file\" (default, plaintext key) or \"wrapped\" (wrapped by the secret_kms_enabled key; needs a release whose scripts have --key-custody)."
+  type        = string
+  default     = "file"
+
+  validation {
+    condition     = contains(["file", "wrapped"], var.key_custody)
+    error_message = "key_custody must be \"file\" or \"wrapped\"."
+  }
+}
+
 variable "secret_kms_strict_boot" {
   description = "Set SB_SECRET_PROVIDER_STRICT_BOOT when secret_kms_enabled. Required by config.go for awskms + enterprise mode."
   type        = bool
@@ -796,6 +856,31 @@ variable "extra_sandboxd_env" {
     ])
     error_message = "extra_sandboxd_env keys must be valid shell identifiers and values must not contain newlines."
   }
+}
+
+# Where the operator token works, and the client address through Caddy
+# (plans/identity-and-access.md §5.11). These are install.sh flags, not env
+# vars, because each writes a Caddy half that must match its sandboxd half:
+# --pat-scope host points Caddy's API proxy at the public Unix socket, and
+# --l4-proxy-protocol adds the PROXY listener wrapper on the 8443 site. Set
+# through extra_sandboxd_env alone, the sandboxd half would run against a
+# Caddyfile that undoes it. Both default off, so a default render is
+# byte-identical to before.
+variable "pat_scope" {
+  description = "install.sh --pat-scope: \"any\" (default) accepts the PAT from any peer; \"host\" accepts it only from this host's loopback and from mTLS cluster peers, with Caddy on the public socket. Enterprise mode requires \"host\". Needs a release whose install.sh has the flag."
+  type        = string
+  default     = "any"
+
+  validation {
+    condition     = contains(["any", "host"], var.pat_scope)
+    error_message = "pat_scope must be \"any\" or \"host\"."
+  }
+}
+
+variable "l4_proxy_protocol" {
+  description = "install.sh --l4-proxy-protocol: caddy-l4's fallback sends PROXY v2 to the HTTPS site and Caddy forwards the client address to sandboxd, so audit records see the real caller. Domain mode only. Needs a release whose install.sh has the flag."
+  type        = bool
+  default     = false
 }
 
 # Locally-built artifact overrides (integration harness, plans/integration-test-security.md §4.3).

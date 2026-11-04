@@ -54,6 +54,7 @@ func TestManagerNotifiesOnMountCrash(t *testing.T) {
 		hostPath:   hostPath,
 		plan:       adapters.Plan{Argv: []string{"sleep", "0.5"}},
 		cmd:        cmd,
+		exit:       watchExit(cmd),
 		startedAt:  time.Now().UTC(),
 		supervised: true,
 	}
@@ -61,7 +62,7 @@ func TestManagerNotifiesOnMountCrash(t *testing.T) {
 	m.state["sb-hook"] = []*mountState{state}
 	m.mu.Unlock()
 
-	stubProbe(t, func(string, time.Duration) error { return nil })
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error { return nil })
 	m.superviseExit(state)
 
 	select {

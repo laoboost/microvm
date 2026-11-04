@@ -82,6 +82,13 @@ func authorizeTenantImageRef(owner string, refs ...string) error {
 		if namespace, ok := snapshotRefNamespace(ref); ok && namespace != snapshotOwnerNamespace(owner) {
 			return fmt.Errorf("%w: image %q", store.ErrNotFound, ref)
 		}
+		// The cluster auto-import namespace is pulled with the cluster PAT, so
+		// a tenant naming a ref there would borrow that credential to pull
+		// another tenant's re-homed private image. Tenants name the original
+		// upstream ref; the re-home is server-side only.
+		if isClusterImportedRef(ref) {
+			return fmt.Errorf("%w: image %q", store.ErrNotFound, ref)
+		}
 		if docker.IsBuiltImageRef(ref) {
 			if namespace := docker.BuiltImageOwnerNamespace(ref); namespace != "" && namespace != snapshotOwnerNamespace(owner) {
 				return fmt.Errorf("%w: image %q", store.ErrNotFound, ref)
@@ -161,21 +168,49 @@ func (s *Service) resolveSnapshotChain(ctx context.Context, image, stop string) 
 			switch {
 			case err != nil:
 				return nil, "", err
-			case snapshot != nil && snapshotVisible(ctx, snapshot):
+			case snapshot != nil && snapshotResolvableForCreate(ctx, snapshot):
 				return snapshot, snapshot.Image, nil
+			case snapshot != nil:
+				// A committed snapshot the caller may not resolve owns this very
+				// tag (a local image that is the owner's bytes). Returning it as
+				// a plain image would start that owner's image, so answer
+				// not-found — for an unscoped caller too, closing the hijack
+				// where naming another tenant's committed tag boots its bytes.
+				return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
 			case scoped:
 				return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
 			}
 			return last, image, nil
 		}
-		snapshot, err := s.store.GetSnapshotByNames(ctx, names)
+		snapshot, err := s.store.GetSnapshotByNames(ctx, ownerRefForCreate(ctx), names)
 		if errors.Is(err, store.ErrNotFound) {
+			// The name is not the caller's snapshot. Before treating it as a
+			// plain image, make sure it is not ANOTHER owner's committed-under-
+			// its-name image (a legacy pre-tag commit whose Image == name):
+			// running that local image would leak another tenant's bytes. The
+			// owner-scoped lookup above cannot see that row, so this cross-owner
+			// image check restores the guard. New commits use owner-scoped tags,
+			// so this only matters for pre-existing legacy rows.
+			holders, hErr := s.store.GetSnapshotsByImage(ctx, names)
+			if hErr != nil {
+				return nil, "", hErr
+			}
+			for _, h := range holders {
+				if h.SourceSandboxID != "" && slices.Contains(names, strings.TrimSpace(h.Image)) && !snapshotResolvableForCreate(ctx, h) {
+					return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
+				}
+			}
 			return last, image, nil
 		}
 		if err != nil {
 			return nil, "", err
 		}
-		if !snapshotVisible(ctx, snapshot) {
+		if !snapshotResolvableForCreate(ctx, snapshot) {
+			// An unscoped create must not adopt a tenant's snapshot by name
+			// (the #7 hijack), and a user token must not adopt another
+			// account's. If that snapshot owns the very image name asked for
+			// (a pre-tag commit), answer not-found rather than leak it as a
+			// plain image; otherwise treat the name as an ordinary image.
 			if snapshot.SourceSandboxID != "" && slices.Contains(names, strings.TrimSpace(snapshot.Image)) {
 				return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
 			}
@@ -209,11 +244,25 @@ func (s *Service) snapshotCommittedAs(ctx context.Context, images []string) (*mo
 		return nil, err
 	}
 	for _, snapshot := range holders {
-		if strings.TrimSpace(snapshot.Image) == docker.SnapshotImageTag(snapshot.Name) {
+		if snapshotImageIsOwnedTag(snapshot) {
 			return snapshot, nil
 		}
 	}
 	return nil, nil
+}
+
+// HoldsCommittedSnapshotImage reports whether this node's catalogue holds the
+// snapshot committed under image (a docker.SnapshotImageTag, any spelling). It
+// answers for the node, not the caller: whether the caller may start that
+// snapshot is still NormalizeCreateImageDistribution's call. The cluster
+// create router asks it first so a create for a snapshot this node holds stays
+// here, exactly as before, whatever the cluster's snapshot-home index says.
+func (s *Service) HoldsCommittedSnapshotImage(ctx context.Context, image string) (bool, error) {
+	if s == nil || s.store == nil || !docker.IsSnapshotImageRef(image) {
+		return false, nil
+	}
+	snapshot, err := s.snapshotCommittedAs(ctx, docker.EquivalentImageNames(image))
+	return snapshot != nil, err
 }
 
 // NormalizeCreateImageDistribution resolves snapshot aliases and fills the
@@ -256,7 +305,7 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			snapshot, err = s.snapshotCommittedAs(ctx, docker.EquivalentImageNames(req.Image))
 			switch {
 			case err != nil:
-			case snapshot != nil && !snapshotVisible(ctx, snapshot):
+			case snapshot != nil && !snapshotResolvableForCreate(ctx, snapshot):
 				err = fmt.Errorf("%w: image %q", store.ErrNotFound, req.Image)
 			case snapshot != nil:
 				image = snapshot.Image

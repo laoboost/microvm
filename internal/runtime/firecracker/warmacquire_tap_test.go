@@ -26,7 +26,7 @@ func TestWarmAcquireDoesNotLeakTapSlot(t *testing.T) {
 	snap := &TemplateResolution{HasSnapshot: true, RootfsPath: rootfs}
 
 	state, hit, err := f.driver.tryAcquireWarm(context.Background(),
-		models.CreateSandboxRequest{TemplateID: "tpl-warm"}, "sb-warm-leak", snap, "")
+		models.CreateSandboxRequest{TemplateID: "tpl-warm"}, "sb-warm-leak", "tok", snap, "")
 	if err != nil || !hit {
 		t.Fatalf("tryAcquireWarm hit=%v err=%v, want hit", hit, err)
 	}

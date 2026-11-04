@@ -59,7 +59,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	// existence/size oracle (the resolver's errors distinguish missing/
 	// unreadable/empty/too-large/bad-magic). Mirrors the isolate create gate in
 	// isolate.go and the module-API gate in wasm_module_api.go.
-	if _, scoped := ownerScope(ctx); scoped && wasmmod.IsHostPathRef(moduleRef) {
+	if !hostCapable(ctx) && wasmmod.IsHostPathRef(moduleRef) {
 		return nil, fmt.Errorf("runtime %q: file:// and host-path module refs are operator-only; push via /v1/wasm-modules and reference the registry ref", req.Runtime)
 	}
 	req.ModuleRef = moduleRef
@@ -120,15 +120,9 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		}
 	}
 
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	ctx, span := observability.StartSpan(ctx, "wasm.create",
@@ -170,7 +164,15 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	// The runtime instance exists before the row: reconcile's orphan sweep
 	// must not take it for a leak until this create has returned.
 	defer s.createsInFlight.begin(sandboxID)()
-	state, err := s.wasm.Create(ctx, req, sandboxID, toolboxToken, binds)
+	// A catalogue id in module_ref resolves in the namespace of the owner the
+	// row will carry, which a failover recreate knows only from its placement
+	// (its context has no caller). Computed once, here, and reused below.
+	ownerRef := s.ownerRefForCreateOrRecreate(ctx, sandboxID)
+	// wasmResolveContext stops a scoped tenant from booting a sandbox off a raw
+	// host path (module_ref:"/path" or "file://…"); an internal failover/recreate
+	// has no caller and stays host-capable, so a stored operator path still
+	// resolves on replay (issue #537).
+	state, err := s.wasm.Create(wasmmod.WithCatalogueOwner(wasmResolveContext(ctx), ownerRef), req, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
 		releaseAdmission()
@@ -238,7 +240,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			})
 		}
 	}
-	sandbox.OwnerRef = s.ownerRefForCreateOrRecreate(ctx, sandboxID)
+	sandbox.OwnerRef = ownerRef
 
 	// Private sandboxes skip caddy on the boot path; see the docker path.
 	if sandboxAllowsPublicTraffic(sandbox) {

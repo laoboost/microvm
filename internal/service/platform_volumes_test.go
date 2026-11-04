@@ -104,7 +104,7 @@ func TestResolvePlatformVolumes_DockerS3(t *testing.T) {
 	// Authenticated user token → per-tenant scope (t- prefix).
 	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "tenant-xyz"},
-		Operator: false,
+		Fleet:    false,
 	})
 	req := models.CreateSandboxRequest{
 		Mounts:          []models.MountSpec{{Type: models.MountTypeS3, Source: "other", Target: "/pre"}},
@@ -144,7 +144,7 @@ func TestResolvePlatformVolumesForReplication(t *testing.T) {
 	s.cfg.EnableCluster = true
 	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "tenant-xyz"},
-		Operator: false,
+		Fleet:    false,
 	})
 	v, err := s.CreatePlatformVolume(ctx, "data")
 	if err != nil {
@@ -302,6 +302,43 @@ func TestResolvePlatformVolumes_OperatorScope(t *testing.T) {
 	}
 }
 
+// TestResolvePlatformVolumes_PinnedScopeSurvivesPATRotation is H2 end to end
+// (plans/identity-and-access.md §5.11): with SB_OPERATOR_VOLUME_SCOPE pinned
+// to the legacy scope the boot log printed, a node restarted with a new PAT
+// mounts the operator's existing volume from the same path; unpinned, the
+// same rotation would point it at a new, empty one.
+func TestResolvePlatformVolumes_PinnedScopeSurvivesPATRotation(t *testing.T) {
+	st := volumesTestStore(t)
+	resolve := func(cfg config.Config) string {
+		t.Helper()
+		s := &Service{cfg: cfg, store: st}
+		req := models.CreateSandboxRequest{PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/workspace"}}}
+		ctx := controlplane.ContextWithAccess(context.Background(), controlplane.OperatorAccess())
+		if _, err := s.resolvePlatformVolumes(ctx, &req, models.RuntimeDocker); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		return req.Mounts[0].Source
+	}
+	before := enabledS3Cfg() // PAT "operator-pat", nothing pinned
+	original := resolve(before)
+
+	legacy, err := volumes.OperatorScope("", before.PATToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := enabledS3Cfg()
+	rotated.PATToken, rotated.PATTokenPrevious, rotated.OperatorVolumeScope = "new-operator-pat", before.PATToken, legacy
+	if got := resolve(rotated); got != original {
+		t.Fatalf("after rotation with a pinned scope the volume moved:\n %s\nwant\n %s", got, original)
+	}
+
+	unpinned := enabledS3Cfg()
+	unpinned.PATToken = "new-operator-pat"
+	if got := resolve(unpinned); got == original {
+		t.Fatal("unpinned, a new PAT must change the operator scope (the H2 hazard pinning removes)")
+	}
+}
+
 // UC-13b: within-request quota — two volumes in one create against a cap of 1
 // is rejected even with no pre-existing rows.
 func TestResolvePlatformVolumes_QuotaWithinRequest(t *testing.T) {
@@ -417,7 +454,7 @@ func TestCreateSandboxPlatformVolumeRollbackOnValidationFailure(t *testing.T) {
 // background (operator) context, so a test can seed store rows under the same
 // tenant key resolvePlatformVolumes will count.
 func tenantScopeForTest(s *Service, ctx context.Context) (string, error) {
-	return volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken))
+	return volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken, s.cfg.OperatorVolumeScope))
 }
 
 // An invalid volume name surfaces as an error (not a silent skip).

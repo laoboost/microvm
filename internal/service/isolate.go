@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/runtime/isolate"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -87,10 +88,11 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// file:// and bare-path bundle refs read a file off the HOST filesystem as
 	// the daemon user. That is an operator/self-host convenience, not something
 	// a scoped tenant may drive — otherwise module_ref:"file:///etc/…" turns
-	// create into an arbitrary host-file read. Gate it to unscoped callers;
-	// scoped callers must upload via POST /v1/js-bundles and reference a digest
-	// or name.
-	if _, scoped := ownerScope(ctx); scoped && jsbundle.IsFileRef(bundleRef) {
+	// create into an arbitrary host-file read. Gate it to host-capable callers
+	// (operator, admin, internal); everyone else, a runner bound to every team
+	// included, must upload via POST /v1/js-bundles and reference a digest or
+	// name.
+	if !hostCapable(ctx) && jsbundle.IsFileRef(bundleRef) {
 		return nil, fmt.Errorf("runtime %q: file:// bundle refs are operator-only; upload via /v1/js-bundles and reference the digest or name", req.Runtime)
 	}
 
@@ -105,6 +107,17 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// left untouched for the driver to handle.
 	if s.isolateBundles != nil {
 		owner := ownerRefForCreate(ctx)
+		// A digest ref ("sha256:<hex>") resolves bytes by content regardless of
+		// tenant, so an owner-scoped caller must already own that digest —
+		// otherwise a tenant could boot a sandbox from another tenant's bundle
+		// (and co-own it) just by naming its digest. Name refs are already
+		// tenant-scoped by GetByName; file refs are operator/self-host. The
+		// driver's own by-digest resolve after create stays unscoped by design.
+		if digest, isDigest := jsbundle.AsDigest(bundleRef); isDigest {
+			if _, scoped := ownerScope(ctx); scoped && !s.isolateBundles.TenantOwns(owner, digest) {
+				return nil, fmt.Errorf("resolve bundle %q: %w", bundleRef, store.ErrNotFound)
+			}
+		}
 		resolved, resolveErr := jsbundle.NewResolver(s.isolateBundles).Resolve(ctx, owner, bundleRef)
 		if resolveErr != nil {
 			return nil, fmt.Errorf("resolve bundle %q: %w", bundleRef, resolveErr)
@@ -166,15 +179,9 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// per-group RAM is not modeled here (surfaced via expvar, per the capacity
 	// decision); each sandbox is admitted at its declared footprint —
 	// conservative, never over-books.
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	// Cold path: resolve bundle → group router → load. The driver reaps a
@@ -229,19 +236,24 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	sandbox.ContainerIP = "127.0.0.1"
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		if errors.Is(err, models.ErrSandboxExists) {
-			// A concurrent create with the same id won the INSERT. Both callers
-			// ran the full driver create for the SAME id — host.Load, the group
-			// member set, and admission are all keyed by id and idempotent, so
-			// the winner's driver state and reservation are shared and already
-			// correct. Rolling back here (Destroy + Release) would tear down the
-			// winner's live sandbox and free its reservation (pr-review.md §4:
-			// never delete state another caller installed). Return the committed
-			// row instead — idempotent success.
+			// Another writer of the id won the INSERT. The create lease
+			// (create_lease.go) keeps a second create of one id off this node,
+			// so this is the defence behind it. host.Load and the group member
+			// set are keyed by id and idempotent, so the winner's driver state
+			// is shared: rolling back here (Destroy) would tear down the
+			// winner's live sandbox (pr-review.md §4: never delete state
+			// another caller installed). releaseAdmission frees only a
+			// reservation this create made (admitCreate), never the winner's.
+			// Return the committed row instead — idempotent success.
+			releaseAdmission()
 			stored, getErr := s.store.Get(ctx, sandbox.ID)
 			if getErr != nil {
 				return nil, getErr
 			}
-			return &models.CreateSandboxResponse{Sandbox: *stored}, nil
+			if err := s.checkStoredCreateDigest(ctx, sandbox.ID); err != nil {
+				return nil, err
+			}
+			return &models.CreateSandboxResponse{Sandbox: *stored, Replayed: true}, nil
 		}
 		_ = s.isolate.Destroy(ctx, sandbox)
 		releaseAdmission()

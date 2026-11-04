@@ -251,7 +251,7 @@ func TestRegisterSnapshotAndKickReconciler(t *testing.T) {
 		t.Fatal("nil snapshot should fail")
 	}
 
-	row, err := st.GetSnapshot(ctx, "snap-reg")
+	row, err := st.GetSnapshot(ctx, "", "snap-reg")
 	if err != nil || row == nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
@@ -425,11 +425,11 @@ type claimFailPushStore struct {
 	claimErr error
 }
 
-func (f *claimFailPushStore) SetSnapshotPushState(ctx context.Context, name, state, errMsg string) error {
+func (f *claimFailPushStore) SetSnapshotPushState(ctx context.Context, ownerRef, name, state, errMsg string) error {
 	if state == models.SnapshotPushStatePushing && f.claimErr != nil {
 		return f.claimErr
 	}
-	return f.fakePushStore.SetSnapshotPushState(ctx, name, state, errMsg)
+	return f.fakePushStore.SetSnapshotPushState(ctx, ownerRef, name, state, errMsg)
 }
 
 func TestPushOneClaimFailure(t *testing.T) {
@@ -453,7 +453,9 @@ func TestPushOneClaimFailure(t *testing.T) {
 
 func TestHandleDockerEventDestroyAndStart(t *testing.T) {
 	ctx := context.Background()
-	svc, admitter, st := newCapacityHarness(t, nil, nil)
+	svc, admitter, st := newCapacityHarness(t, nil, map[string]*models.SandboxRuntimeState{
+		"ctr-sb-evt": {SandboxID: "sb-evt", ContainerID: "ctr-sb-evt", Status: models.SandboxStatusStarted},
+	})
 	seedSandbox(t, st, "sb-evt", models.SandboxStatusStarted, 1, 512)
 	admitter.Reserve("sb-evt", capacity.Request{CPU: 1, MemoryMB: 512})
 

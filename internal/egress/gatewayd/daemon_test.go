@@ -2,13 +2,16 @@ package gatewayd
 
 import (
 	"context"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,14 +23,63 @@ import (
 
 var lo = netip.MustParseAddr("127.0.0.1")
 
+// Test ports come from [testPortMin, testPortMax): below the kernel's
+// ephemeral range (32768-60999 on Linux, 49152-65535 on macOS).
+const testPortMin, testPortMax = 20000, 32768
+
+var (
+	testPortsMu sync.Mutex
+	testPorts   = map[uint16]bool{}
+)
+
+// freePort hands out a port for the code under test to bind, which it
+// binds by number and often more than once: UDP and TCP DNS on one
+// number, a move to the wildcard and back, a restart on the same ports.
+// A port the kernel picked for a port-0 listener is a bad choice: once
+// released, any process on the host can be given it again for its own
+// port-0 socket or outgoing connection, and only TCP was ever checked,
+// so the UDP DNS bind and the rebinds failed with "address already in
+// use" (CI runs 38782285751, 38881018767, 39122269226). The kernel never
+// hands out a port below its ephemeral range, so one found free there,
+// on the wildcard for TCP and UDP, stays free unless something binds
+// that exact number. A port is not handed out twice while a test holds
+// it, so a test that asks for new ports gets new ones.
 func freePort(t *testing.T) uint16 {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	testPortsMu.Lock()
+	defer testPortsMu.Unlock()
+	for range 1000 {
+		p := uint16(testPortMin + rand.IntN(testPortMax-testPortMin))
+		if testPorts[p] || !portFree(p) {
+			continue
+		}
+		testPorts[p] = true
+		t.Cleanup(func() {
+			testPortsMu.Lock()
+			delete(testPorts, p)
+			testPortsMu.Unlock()
+		})
+		return p
+	}
+	t.Fatalf("no free port in [%d, %d)", testPortMin, testPortMax)
+	return 0
+}
+
+// portFree reports whether p can be bound on the wildcard for TCP and UDP,
+// which means no socket on any address holds it.
+func portFree(p uint16) bool {
+	addr := net.JoinHostPort("0.0.0.0", strconv.Itoa(int(p)))
+	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
-		t.Fatal(err)
+		return false
 	}
 	defer ln.Close()
-	return uint16(ln.Addr().(*net.TCPAddr).Port)
+	pc, err := net.ListenPacket("udp4", addr)
+	if err != nil {
+		return false
+	}
+	_ = pc.Close()
+	return true
 }
 
 type running struct {
@@ -375,7 +427,9 @@ func TestSocketListenerAndGuard(t *testing.T) {
 	}
 	op := filepath.Join(dir, "op.yaml")
 	_ = os.WriteFile(op, []byte("version: 1\ndeny_cidrs: [10.99.0.0/16]\n"), 0o600)
-	if g, _, err := fromOperatorFile(op); err != nil || len(g.DenyFloor) != 1 {
+	// The file's deny_cidrs, then the cloud metadata endpoints every floor
+	// carries.
+	if g, _, err := fromOperatorFile(op); err != nil || len(g.DenyFloor) != 1+len(egresspolicy.MetadataPrefixes) || g.DenyFloor[0].String() != "10.99.0.0/16" {
 		t.Fatalf("operator guard = %+v, %v", g, err)
 	}
 	if safeName("a/b.c") != "a_b_c" {
@@ -425,6 +479,24 @@ func TestDaemonNodeWide(t *testing.T) {
 	}
 	if err := r.client.SetNodeControl(ctx, nil); err != nil || be.Len(egress.SetNodeControl) != 0 {
 		t.Fatalf("an empty list clears the guard: %v %d", err, be.Len(egress.SetNodeControl))
+	}
+	// A pool is guarded whole: one element per port, whatever addresses
+	// in it come and go; the floor is rewritten with it, unchanged.
+	pool := egress.ControlPool{Prefix: netip.MustParsePrefix("127.16.0.0/16"), Ports: []uint16{21212, 22}}
+	if err := r.client.SetNodeControlPools(ctx, egress.NodeControl{Endpoints: eps, Pools: []egress.ControlPool{pool}}); err != nil {
+		t.Fatal(err)
+	}
+	whole := egress.Elem{Src: netip.MustParseAddr("127.0.0.0"), SrcEnd: netip.MustParseAddr("127.255.255.255"),
+		Dst: netip.MustParseAddr("127.16.0.0"), DstEnd: netip.MustParseAddr("127.16.255.255"), Port: 22}
+	if be.Len(egress.SetNodeControl) != 4 || !be.Has(egress.SetNodeControl, whole) || be.Len(egress.SetDenyFloor) != 1 {
+		t.Fatalf("pools: control %d floor %d", be.Len(egress.SetNodeControl), be.Len(egress.SetDenyFloor))
+	}
+	if nw := r.d.Gateway().NodeWideState(); len(nw.ControlPools) != 1 || !nw.ControlKnown {
+		t.Fatalf("pools not remembered: %+v", nw)
+	}
+	// An older sandboxd's push (no pools) drops them.
+	if err := r.client.SetNodeControl(ctx, eps); err != nil || be.Len(egress.SetNodeControl) != 2 || be.Has(egress.SetNodeControl, whole) {
+		t.Fatalf("legacy push: %v %d", err, be.Len(egress.SetNodeControl))
 	}
 }
 

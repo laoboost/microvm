@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -103,6 +102,8 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 	args = append(args, scriptPath)
 	args = append(args, req.Argv...)
 	cmd := exec.CommandContext(ctx, interp, args...)
+	// mergeEnvForExec = childEnviron + request env minus the privileged
+	// keys (LD_*, BASH_FUNC_*, ...): the fork's exec-stream env filter.
 	cmd.Env = mergeEnvForExec(req.Envs)
 
 	stdout, err := cmd.StdoutPipe()
@@ -144,7 +145,7 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 	stderrStr := stderrBytes
 	if waitErr != nil {
 		var exitErr *exec.ExitError
-		if !errors.As(waitErr, &exitErr) && !errors.Is(waitErr, syscall.ECHILD) {
+		if !errors.As(waitErr, &exitErr) && !reapedElsewhere(waitErr) {
 			stderrStr = strings.TrimSpace(stderrStr + "\n" + waitErr.Error())
 		}
 	}

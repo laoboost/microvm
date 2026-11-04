@@ -168,6 +168,14 @@ func (m *Manager) ReassertChain() error {
 	if err := m.ensureBridgeForwardAccept(); err != nil {
 		return err
 	}
+	// A flushed or reordered chain gets the floor's jump back on top.
+	if fb, ok := m.ipt.(floorBackend); ok && m.floorFirst.Load() {
+		if floor, _ := m.floorChain.Load().(string); floor != "" {
+			if err := fb.EnsureJumpChain(chain, floor); err != nil {
+				return err
+			}
+		}
+	}
 	return m.ensureLinkLocalDrop()
 }
 

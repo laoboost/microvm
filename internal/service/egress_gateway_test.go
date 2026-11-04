@@ -34,13 +34,21 @@ type fakeGateway struct {
 	probeErr     error
 	control      []netip.AddrPort
 	controlCalls int
+	// pools is the last pools push; poolsUnknown answers it as a gateway
+	// from before the op, and listCalls counts the list pushes.
+	pools        []egress.ControlPool
+	poolsUnknown bool
+	listCalls    int
 	learned      map[string]json.RawMessage
 	learnedErr   error
 	forgotten    []string
 	inspectCA    []egress.InspectCA
-	inspectErr   error
-	retained     []string
-	retains      int
+	// cleared counts ClearInspectCA calls; clearErr is what they return.
+	cleared    int
+	clearErr   error
+	inspectErr error
+	retained   []string
+	retains    int
 }
 
 func newFakeGateway() *fakeGateway {
@@ -131,6 +139,13 @@ func (f *fakeGateway) RetainLearned(_ context.Context, ids []string) error {
 	f.retains++
 	return nil
 }
+func (f *fakeGateway) ClearInspectCA(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cleared++
+	return f.clearErr
+}
+
 func (f *fakeGateway) SetInspectCA(_ context.Context, ca egress.InspectCA) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -144,6 +159,22 @@ func (f *fakeGateway) SetNodeControl(_ context.Context, eps []netip.AddrPort) er
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.control = append([]netip.AddrPort(nil), eps...)
+	f.pools = nil
+	f.controlCalls++
+	f.listCalls++
+	return nil
+}
+
+// SetNodeControlPools records like SetNodeControl; poolsUnknown makes it a
+// gateway from before the op.
+func (f *fakeGateway) SetNodeControlPools(_ context.Context, nc egress.NodeControl) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.poolsUnknown {
+		return errors.New(`unknown op "node_control_pools"`)
+	}
+	f.control = append([]netip.AddrPort(nil), nc.Endpoints...)
+	f.pools = append([]egress.ControlPool(nil), nc.Pools...)
 	f.controlCalls++
 	return nil
 }
@@ -552,11 +583,18 @@ func TestSuperviseReleasesHoldsOnRecovery(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	// The release clears the store row first and recounts the gauge after,
+	// from the store, with the supervisor's context. Stopping the
+	// supervisor in between cancels that recount's read, so the gauge
+	// stays 1: wait for the gauge too before stopping it.
+	for svc.egressStats.held.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("held gauge must return to 0")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	cancel()
 	<-done
-	if svc.egressStats.held.Load() != 0 {
-		t.Fatal("held gauge must return to 0")
-	}
 }
 
 // TestGetShowsEgressStatus (D16): GET carries egress_status for a container

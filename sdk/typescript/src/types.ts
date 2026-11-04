@@ -161,6 +161,19 @@ import type { Image } from "./Image.js";
 
 export interface CreateOptions {
   /**
+   * Sent as the create's `Idempotency-Key` header, never in the body. A create
+   * sent again with the same key and the same options returns the sandbox the
+   * first one made instead of making a second; the same key with different
+   * options fails with a 422 `MicroVMApiError` whose `code` is
+   * `"idempotency_key_reused"`. Keys are scoped to the caller's account.
+   *
+   * Leave it unset and the SDK makes a random key for each `create` call and
+   * reuses it on that call's automatic retries, so a retry after a timeout
+   * cannot make a second sandbox. Set your own to make your own retries of
+   * the whole call safe too, such as after your process restarts.
+   */
+  idempotencyKey?: string;
+  /**
    * Optional name, unique among the caller's sandboxes (another account may
    * use the same name). A repeat create with a name the caller already holds
    * returns HTTP 409. Names starting with `owner:` or shaped like a sandbox
@@ -542,8 +555,9 @@ export interface Sandbox {
   networkBlockAll: boolean;
   /**
    * Hostname-egress state on `get` for a sandbox whose allow list names
-   * hosts (container runtimes): "active", "held" or "unavailable". Absent
-   * otherwise, and on list results.
+   * hosts (container runtimes): "active", "held" or "unavailable";
+   * "unenforced" when the server's firewall is off and nothing filters the
+   * sandbox. Absent otherwise, and on list results.
    */
   egressStatus?: string;
   /** Egress profiles this sandbox references. */
@@ -693,7 +707,10 @@ export interface NetworkPolicy {
   networkEgressRules: EgressRule[];
   /** Hostname entries in force: inline plus every profile's (at most 1024). */
   effectiveHostnameCount: number;
-  /** "active", "held" or "unavailable" for hostname rules on a container. */
+  /**
+   * "active", "held" or "unavailable" for hostname rules on a container;
+   * "unenforced" when the server's firewall is off.
+   */
   egressStatus?: string;
 }
 
@@ -791,6 +808,65 @@ export interface EgressProfileList {
   profiles: EgressProfile[];
   /** Pass back as `cursor` for the next page; absent on the last one. */
   nextCursor?: string;
+}
+
+/** Who the caller is, as `microvm.whoami()` reports it. */
+export interface WhoAmIPrincipal {
+  /** `"operator"`, `"token"`, `"oidc"`, `"controlplane"`, ... */
+  kind: string;
+  /** Stable id: `"operator"`, `"tok_…"`, `"oidc:<issuer>:<sub>"`, ... */
+  id: string;
+  /** Display name; absent when the server has none. */
+  name?: string;
+}
+
+/** The body of `microvm.whoami()`: the caller's own resolved identity. */
+export interface WhoAmI {
+  principal: WhoAmIPrincipal;
+  /** `"viewer"`, `"runner"`, `"auditor"` or `"admin"`. */
+  role: string;
+  /** `"*"` for every team, a team name, or absent for a managed account. */
+  team?: string;
+  /** When the credential stops working (RFC 3339); absent if it never does. */
+  expiresAt?: string;
+}
+
+/** One scoped API token as `microvm.tokens.list()` returns it. Never the secret. */
+export interface APIToken {
+  /** Public id (`tok_…`): what `tokens.revoke` takes and audit records name. */
+  id: string;
+  name: string;
+  role: string;
+  /** A team name, or `"*"` for every team. */
+  team: string;
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string;
+  /** Expired tokens no longer work; they stay listed for 30 days. */
+  expired: boolean;
+}
+
+/** `microvm.tokens.create()`'s result: the token plus its secret. */
+export interface CreatedAPIToken extends APIToken {
+  /** The secret (`avm_…`), returned this once and never stored by the server. */
+  token: string;
+}
+
+/** The body of `microvm.tokens.create()`. */
+export interface CreateAPITokenOptions {
+  /** 1 to 64 of `A-Z a-z 0-9 . _ -`, unique among the team's tokens. */
+  name: string;
+  /** `"viewer"`, `"runner"`, `"auditor"` or `"admin"`. */
+  role: string;
+  /** A team name, or `"*"` for every team. `auditor` and `admin` require `"*"`. */
+  team: string;
+  /** Required lifetime: `"90d"`, `"720h"` or any Go duration. */
+  expiresIn: string;
+}
+
+/** `microvm.tokens.list()`'s result. */
+export interface APITokenList {
+  tokens: APIToken[];
 }
 
 /** One destination a learn-mode sandbox reached. */

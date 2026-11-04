@@ -122,6 +122,26 @@ var ErrRuntimeNotImplemented = errors.New("runtime not yet implemented on this b
 // already exists. Distinct from name conflicts (store.ErrSandboxNameConflict).
 var ErrSandboxExists = errors.New("sandbox already exists")
 
+// ErrIdempotencyKeyReused is returned when a create's Idempotency-Key was
+// already used with a different request. It is answered 422
+// (ErrorCodeIdempotencyKeyReused) with no sandbox data.
+var ErrIdempotencyKeyReused = errors.New("idempotency key was already used with a different request")
+
+// IdempotencyKeyReusedError is ErrIdempotencyKeyReused naming the key.
+type IdempotencyKeyReusedError struct {
+	Key string
+}
+
+func (e *IdempotencyKeyReusedError) Error() string {
+	if e == nil || e.Key == "" {
+		return "Idempotency-Key was already used with a different request"
+	}
+	return fmt.Sprintf("Idempotency-Key %q was already used with a different request", e.Key)
+}
+
+// Is makes errors.Is(err, ErrIdempotencyKeyReused) hold.
+func (e *IdempotencyKeyReusedError) Is(target error) bool { return target == ErrIdempotencyKeyReused }
+
 // ErrSnapshotCorrupt is returned when a runtime snapshot fails checksum
 // verification at load time — the on-disk artifact does not match the
 // checksum stamped at capture. Firecracker templates and WASM boundary
@@ -573,7 +593,15 @@ type CreateSandboxRequest struct {
 	NetworkBlockAll  bool              `json:"network_block_all"`
 	Registry         *RegistryAuth     `json:"registry,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
-	Mounts           []MountSpec       `json:"mounts,omitempty"`
+	// VerifyRegistryAccess forces the runtime to authorize the image against
+	// its registry even when it is already cached on the node, instead of
+	// trusting the local image. The service sets it for owner-scoped (validated
+	// user-token) callers so one tenant cannot start another tenant's private
+	// image just because it is already in the shared local cache. Internal-only
+	// (json:"-"): never on the wire, re-derived on the owner node after a
+	// cluster forward from the re-authenticated caller.
+	VerifyRegistryAccess bool        `json:"-"`
+	Mounts               []MountSpec `json:"mounts,omitempty"`
 	// PlatformVolumes references named, operator-backed persistent volumes by
 	// name only — the user never supplies storage coordinates or credentials.
 	// The service translates each entry into a synthesized, tenant-scoped
@@ -689,6 +717,14 @@ type CreateSandboxRequest struct {
 	// (Sandbox.CustomDomains) carries per-hostname status. Capped by
 	// MaxCustomDomainsPerCreateRequest.
 	CustomDomains []string `json:"custom_domains,omitempty"`
+	// CreateRequestDigests are keyed digests ("hmac:<key id>:<hex>", one per
+	// server key, the current key's first) of the request an Idempotency-Key
+	// create was made with, as the client sent it. Server-internal: the API
+	// edge sets it from the decoded request and replaces any client value; it
+	// rides a cluster forward and the replicated spec, so the node that runs
+	// the sandbox, and a failover recreate, can tell a retry of the same
+	// request from a reuse of the key for a different one.
+	CreateRequestDigests []string `json:"create_request_digests,omitempty"`
 	// TemplateID, when set alongside Runtime="firecracker", skips the
 	// per-create OCI→ext4 build and reuses a previously prepared
 	// rootfs.ext4 from a Firecracker template (POST /v1/templates). The
@@ -777,6 +813,10 @@ type Sandbox struct {
 	NetworkBlockAll bool              `json:"network_block_all"`
 	ToolboxEnabled  bool              `json:"toolbox_enabled"`
 	ToolboxToken    string            `json:"-"`
+	// CreateRequestDigest is the keyed digest of the request an
+	// Idempotency-Key create was made with (CreateSandboxRequest's current
+	// one). Stored in sandbox_create_digests, never on the wire.
+	CreateRequestDigest string `json:"-"`
 	// AuditIncarnationID scopes retained audit evidence to this exact sandbox
 	// lifecycle. It is persisted in sandbox_audit_acl, not on the sandbox row,
 	// and never crosses the public API or Raft recovery payload.
@@ -863,9 +903,11 @@ type Sandbox struct {
 	// EgressStatus is the hostname-egress state on GET for a sandbox whose
 	// policy needs the egress gateway: "active", "held" (attach failed or the
 	// stored policy is invalid; no egress until it attaches) or
-	// "unavailable" (the gateway is down or lost its table). Empty for every
-	// other sandbox, and on list responses (plans/egress-domain-filtering.md
-	// D16). Response-only: never stored.
+	// "unavailable" (the gateway is down or lost its table). "unenforced" is
+	// any egress policy on a runtime whose host firewall is off on this node
+	// (SB_ENABLE_NETWORK_RULES=false): nothing filters the sandbox's traffic.
+	// Empty for every other sandbox, and on list responses
+	// (plans/egress-domain-filtering.md D16). Response-only: never stored.
 	EgressStatus string `json:"egress_status,omitempty"`
 	// AllowPublicTraffic is whether the sandbox currently has a public route:
 	// only true is public. It starts as the create-time flag and the first
@@ -998,7 +1040,8 @@ type NetworkPolicyRequest struct {
 // NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
 // means it is stored, replicated in a cluster, and live on a running
 // sandbox. EgressStatus is set for a container sandbox in gateway mode, as
-// on GET.
+// on GET; "unenforced" there means the node's host firewall is off and the
+// policy was accepted only under SB_ALLOW_UNENFORCED_NETWORK_POLICY.
 type NetworkPolicy struct {
 	NetworkBlockAll bool     `json:"network_block_all"`
 	NetworkAllowOut []string `json:"network_allow_out"`
@@ -1165,9 +1208,15 @@ type UpdateNetworkLimitsRequest struct {
 // — it is never persisted and never returned again. The corresponding public
 // key is stored on the sandbox record and is the only key authorized to SSH
 // into that sandbox.
+//
+// Replayed is server-side only: the create found a sandbox an earlier create
+// of the same ID made and answered with it. A caller that rolls a failed
+// create back must not roll back a replay — the sandbox is the earlier
+// create's, not this request's.
 type CreateSandboxResponse struct {
 	Sandbox
 	SSHPrivateKey string `json:"ssh_private_key,omitempty"`
+	Replayed      bool   `json:"-"`
 }
 
 // CreateSandboxSnapshotRequest creates a reusable local image snapshot from an
@@ -1326,7 +1375,11 @@ type HealthStatus struct {
 	SSHGateway      string `json:"ssh_gateway"`
 	ClusterTopology string `json:"cluster_topology,omitempty"`
 	ClusterNodes    int    `json:"cluster_nodes,omitempty"`
-	Version         string `json:"version"`
+	// KeyCustody is "revoked" while the customer's key store has revoked
+	// the server key and the node has stopped processing their data;
+	// otherwise empty (plans/customer-key-custody.md §10).
+	KeyCustody string `json:"key_custody,omitempty"`
+	Version    string `json:"version"`
 }
 
 type ExecRequest struct {
@@ -1349,6 +1402,53 @@ type ErrorResponse struct {
 	// to act on programmatically (retry, re-upload, ...). Absent for errors
 	// that are only ever shown to a person.
 	Code string `json:"code,omitempty"`
+	// Reason is the standard refusal reason on a 401 for an avm_ token or a
+	// JWT (expired, not_yet_valid, wrong_audience, ...; plans/
+	// identity-and-access.md D17), mirrored in the RFC 6750 WWW-Authenticate
+	// error_description. On a 403 for a verified OIDC token that matched no
+	// role binding it is no_binding or group_overage (design review DR8).
+	// Absent on every other error, including the operator token's 401, so
+	// those bodies are byte for byte unchanged.
+	Reason string `json:"reason,omitempty"`
+	// RequiredPermission and Role are set only on a 403 for an avm_ token or
+	// an OIDC caller (plans/identity-and-access.md §5.3, D9): the permission
+	// the route needs and the role the caller holds; Error carries the hint.
+	// Absent for the operator token and managed callers, so their 403 bodies
+	// are byte for byte unchanged.
+	RequiredPermission string `json:"required_permission,omitempty"`
+	Role               string `json:"role,omitempty"`
+	// Issuer, Name and Groups are set only on the "no binding" 403 (Reason
+	// no_binding or group_overage): the identity-file name of the issuer
+	// the caller signed in through, the caller's display name, and the
+	// groups the caller's token carried (none on group_overage). All three
+	// are the caller's own claims, so the dashboard and the CLI can show
+	// what an admin needs to add a binding (D9, DR8).
+	Issuer string   `json:"issuer,omitempty"`
+	Name   string   `json:"name,omitempty"`
+	Groups []string `json:"groups,omitempty"`
+}
+
+// WhoAmI is the body of GET /v1/whoami: the caller's own resolved identity
+// (plans/identity-and-access.md §5.2). It only ever describes the caller.
+type WhoAmI struct {
+	Principal WhoAmIPrincipal `json:"principal"`
+	// Role is viewer, runner, auditor or admin.
+	Role string `json:"role"`
+	// Team is "*" for a caller that acts on every team, the team name for a
+	// team-bound credential, and absent for a managed account.
+	Team string `json:"team,omitempty"`
+	// ExpiresAt is when the presented credential stops working; absent for
+	// one that does not expire (the operator token).
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+// WhoAmIPrincipal names who the caller is. ID is stable ("operator",
+// "node:n3", "controlplane:<subject>", later "tok_…" or "oidc:<issuer>:<sub>");
+// Name is for display only.
+type WhoAmIPrincipal struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
 }
 
 // ErrorCodeArtifactNodeUnavailable is returned (503) when an operation needs
@@ -1369,6 +1469,88 @@ const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
 // deployment's default egress policy is unknown, so creates fail closed
 // (plans/egress-domain-filtering.md §5.10).
 const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
+
+// ErrorCodeIPv6FenceNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's IPv6 fence, which keeps
+// IPv6 off the sandbox bridges and TAPs, is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeIPv6FenceNotReady = "ipv6_fence_not_ready"
+
+// ErrorCodeNetworkPolicyUnenforced is returned (501) for a create, start,
+// policy update or byte-cap update that needs the host firewall on a node
+// where it is off (SB_ENABLE_NETWORK_RULES=false, or not a Linux host): the
+// docker, containerd and Firecracker runtimes enforce block-all, address
+// lists, hostname rules and byte caps with it. Retrying won't help; the
+// operator turns the firewall on, or the caller drops the policy or picks a
+// runtime that filters egress itself (wasm, isolate).
+const ErrorCodeNetworkPolicyUnenforced = "network_policy_unenforced"
+
+// ErrorCodeMountToolUnavailable is returned (501) for a create or start whose
+// external-storage or platform-volume mount needs a mount tool (mount-s3,
+// sshfs, rclone, mount) that is not installed on this node, as on a local
+// install. Retrying won't help, so it is not a 503 (every SDK retries those);
+// the operator installs the tool (the server installer does), or the caller
+// creates the sandbox without the mount.
+const ErrorCodeMountToolUnavailable = "mount_tool_unavailable"
+
+// ErrorCodeOverloaded is returned (503, with Retry-After) when the node shed
+// the request: it already runs as many requests of that kind (cluster-wide
+// sandbox lists) as it is configured to. Retrying after Retry-After is the
+// recovery; nothing is wrong with the request.
+const ErrorCodeOverloaded = "overloaded"
+
+// ErrorCodeRateLimited is returned (429, with Retry-After) when the caller's
+// own tenant already runs its share of the node's requests of that kind
+// (cluster-wide sandbox lists): the node has room, but not for one more from
+// this tenant. Other tenants are unaffected. Retrying after Retry-After is
+// the recovery; slowing down is the cure.
+const ErrorCodeRateLimited = "rate_limited"
+
+// ErrorCodeNodeGuardNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's guard that keeps
+// sandboxes off the node's own services is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeNodeGuardNotReady = "node_guard_not_ready"
+
+// ErrorCodeEgressFloorNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's egress deny floor, which
+// keeps sandboxes off the cloud metadata endpoints and the operator's
+// deny_cidrs, is not installed for that runtime; the node retries it every
+// few seconds.
+const ErrorCodeEgressFloorNotReady = "egress_floor_not_ready"
+
+// ErrorCodeIdempotencyKeyReused is returned (422) for a create whose
+// Idempotency-Key was already used with a different request. Retrying the
+// same request cannot succeed: send the original request, or a new key.
+const ErrorCodeIdempotencyKeyReused = "idempotency_key_reused"
+
+// ErrorCodeCreateInProgress is returned (503, with Retry-After) for a create
+// that waited past its bound for another create of the same sandbox ID (the
+// same Idempotency-Key) running on the node. Nothing was created; the same
+// request retried later gets that create's sandbox.
+const ErrorCodeCreateInProgress = "create_in_progress"
+
+// Key-store error codes, each returned with 503 when the key store that wraps
+// sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error
+// classes (plans/customer-key-custody.md, eng review Section 2). The response
+// message is fixed text, never the key store's own response.
+const (
+	// ErrorCodeKeyStoreUnavailable: the key store could not be reached.
+	// Retrying after Retry-After is the recovery.
+	ErrorCodeKeyStoreUnavailable = "key_store_unavailable"
+	// ErrorCodeKeyStoreThrottled: the key store, or this node's cap on calls
+	// to it, is saturated. Retrying after Retry-After is the recovery.
+	ErrorCodeKeyStoreThrottled = "key_store_throttled"
+	// ErrorCodeKeyStoreDenied: the key store refused this node's credentials
+	// or policy. An operator has to fix the grant.
+	ErrorCodeKeyStoreDenied = "key_store_denied"
+	// ErrorCodeKeyRevoked: the key was disabled or deleted in the key store,
+	// so secrets stay sealed until the key owner restores it.
+	ErrorCodeKeyRevoked = "key_revoked"
+	// ErrorCodeKeyVersionRetired: the secret was wrapped under a key version
+	// the key store no longer allows.
+	ErrorCodeKeyVersionRetired = "key_version_retired"
+)
 
 // Facade names used by sandbox_compat_state, snapshot_aliases, and
 // request_idempotency. The string is the only thing persisted, so renaming
@@ -1398,8 +1580,12 @@ type SandboxCompatState struct {
 type SnapshotAlias struct {
 	Alias        string
 	SnapshotName string
-	Facade       string
-	ExtraNames   []string
+	// OwnerRef is the tenant that owns the snapshot this alias points at.
+	// Snapshot names are unique per owner, so the alias carries the owner to
+	// name a single snapshot and to cascade-delete with the right one.
+	OwnerRef   string
+	Facade     string
+	ExtraNames []string
 	// StateJSON is facade-private state for the snapshot, opaque to the
 	// store (the snapshot counterpart of SandboxCompatState.StateJSON).
 	StateJSON string

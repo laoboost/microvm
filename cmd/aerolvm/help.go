@@ -16,9 +16,11 @@ const overviewTail = `
 Sandboxes are addressed as <id-or-name>: sb-<16 hex> is an ID, anything else
 is a name (names are unique per account).
 
-Environment (both override "aerolvm login"):
+Environment (these override "aerolvm login"):
   SB_API_URL       sandboxd URL (default: your login, else http://127.0.0.1:21212)
   SB_PAT_TOKEN     API token (required unless you ran "aerolvm login")
+  SB_API_TOKEN     the same as SB_PAT_TOKEN; SB_PAT_TOKEN wins if both are set
+  SB_TEAM          the team to act for, when your sign-in has several
   AEROLVM_OUTPUT   set to "json" to make --json the default
 
 Output: stdout is data, stderr is everything else. With --json, errors are
@@ -230,30 +232,185 @@ Usage: aerolvm health [--json]
 Says which credentials it used: SB_PAT_TOKEN or the saved login.
 `
 
-const loginHelp = `Save the sandboxd URL and API token, so commands work without
+const loginHelp = `Sign in to sandboxd and save the login, so commands work without
 SB_API_URL and SB_PAT_TOKEN.
 
-Usage: aerolvm login [<url>] [--token-stdin]
+Usage: aerolvm login [<url>] [--sso] [--device] [--issuer NAME] [--team TEAM]
+       aerolvm login [<url>] --token-stdin [--team TEAM]
 
 Asks for the URL (default: SB_API_URL, your last login, or the local
-setup's http://127.0.0.1:21212), then the token, with typing hidden. The
-token is checked against sandboxd before it is saved, readable only by you,
-in ~/.config/aerolvm/config.json ($XDG_CONFIG_HOME/aerolvm when set,
-%AppData%\aerolvm on Windows). A bare host gets https://, or http:// for
+setup's http://127.0.0.1:21212). A bare host gets https://, or http:// for
 localhost. Logging in again replaces the saved login.
 
-The token is the SB_PAT_TOKEN sandboxd runs with; the local setup prints it
-when it installs. SB_PAT_TOKEN in the environment still wins over the login,
-and the saved token is only ever sent to the URL it was saved for.
+When sandboxd offers single sign-on, login opens your browser to sign in
+with your company account (asking which one when there are several). Over
+SSH, --device prints a URL and a code to enter on any device instead. The
+login renews itself while your provider allows; when it can't, sign in
+again with "aerolvm login --sso <url>". Otherwise login asks for an API
+token, with typing hidden, and checks it against sandboxd.
+
+The login is saved readable only by you in ~/.config/aerolvm/config.json
+($XDG_CONFIG_HOME/aerolvm when set, %AppData%\aerolvm on Windows).
+SB_PAT_TOKEN (or SB_API_TOKEN) in the environment still wins over it, and
+the saved credential is only ever sent to the URL it was saved for.
 
 Flags:
-  --token-stdin   read the token from stdin instead of asking (scripts, CI)
-  --json          print {"api_url","config_path","server_version"}
+  --sso                   sign in with single sign-on; fail if it isn't offered
+  --device                sign in with a code on another device (SSH sessions)
+  --issuer NAME           the sign-in provider, when sandboxd offers several
+  --team TEAM             the team to act for when you belong to several; sent
+                          with every request (SB_TEAM overrides it)
+  --client-secret-stdin   read the provider app's client secret from stdin and
+                          save it with the login (Google desktop apps need one;
+                          your AerolVM admin hands it out)
+  --token-stdin           read an API token from stdin instead (scripts, CI)
+  --json                  print {"api_url","config_path","server_version"}
 
 Examples:
-  aerolvm login
   aerolvm login https://sandbox.example.com
+  aerolvm login https://sandbox.example.com --device
+  aerolvm login https://sandbox.example.com --team payments
   aerolvm login https://sandbox.example.com --token-stdin < token.txt
+`
+
+const whoamiHelp = `Show who sandboxd takes you for: your name, role, team, how you signed in
+and when that expires.
+
+Usage: aerolvm whoami [--explain] [--json]
+
+With a sign-in that matches no access rule, whoami says so and lists the
+groups your sign-in carried, so you can tell your admin what to add.
+
+Flags:
+  --explain   also show which access rule (binding) gave you this role, and
+              the claims of your own sign-in it was matched against
+  --json      print sandboxd's answer: {"principal":{"kind","id","name"},
+              "role","team","expires_at"}, plus "explain" with --explain
+
+Examples:
+  aerolvm whoami
+  aerolvm whoami --explain
+`
+
+const authHelp = `Print a fresh bearer token for scripts and SDKs.
+
+Usage: aerolvm auth token [--json]
+
+Prints the credential aerolvm would send, on stdout: your SSO login's ID
+token (renewed first when it is about to expire), the saved API token, or
+SB_PAT_TOKEN. An ID token lasts about an hour; run it again for a new one.
+
+Flags:
+  --json   print {"api_url","token","expires_at"}
+
+Examples:
+  SB_PAT_TOKEN=$(aerolvm auth token) python agent.py
+`
+
+const tokenHelp = `Create, list and revoke scoped API tokens (avm_...) for services and CI.
+
+Usage: aerolvm token create --name N --role R --team T --expires-in D
+       aerolvm token list
+       aerolvm token revoke <token-id>
+
+A token acts with one role (viewer, runner, auditor or admin) on one team,
+or on every team with --team '*'. auditor and admin need --team '*'. Every
+token expires; --expires-in takes days (90d) or a duration (720h), up to
+the server's SB_TOKEN_MAX_TTL. sandboxd needs SB_IDENTITY_ENABLED=true to
+accept the tokens it mints.
+
+create prints the token on stdout. It is shown this once and sandboxd keeps
+only its hash: store it now. A name is unique in its team, so running the
+same create twice fails the second time (exit 1, http_status 409); revoke
+the first and create it again if its token was lost.
+
+revoke takes the token id (tok_...) or the token itself. It succeeds also
+when the token is already gone. Other nodes stop accepting it within
+seconds.
+
+create and revoke need an admin; list needs an auditor or admin.
+
+Flags (create):
+  --name N         1 to 64 characters of A-Z, a-z, 0-9, '.', '_' and '-'
+  --role R         viewer, runner, auditor or admin
+  --team T         a team name (a-z, 0-9, '-'), or '*' for every team
+  --expires-in D   lifetime, e.g. 90d
+  --json           print the created token object, token included
+                   (list: {"tokens":[...]}; revoke: {"revoked":"tok_..."})
+
+Examples:
+  aerolvm token create --name ci-deploy --role runner --team payments --expires-in 90d
+  aerolvm token create --name prom-scrape --role viewer --team '*' --expires-in 90d --json
+  aerolvm token list
+  aerolvm token revoke tok_7Hq2aBcDeFgH
+`
+
+const accessHelp = `Review who holds access and what they did with it: the evidence for a
+quarterly access review (SOC 2 CC6.2/6.3).
+
+Usage: aerolvm access review --since <when> (--export s3://<bucket>[/<prefix>] | --export-dir <dir>)
+                             [--identity-file <path>] [--format md|csv]
+                             [--witness s3://<bucket>[/<prefix>]]
+
+access review joins the token list (GET /v1/tokens, which needs an auditor or
+admin) with the audit export into one report:
+
+  - every token: name, role, team, creator, expiry, its last recorded action
+    and its calls by kind;
+  - every token created or revoked in the window, and who did it;
+  - every identity-file change a node recorded in the window (identity_config
+    records): the old and new file hash, bindings added and removed, a
+    reorder, deny subjects and issuers;
+  - with --identity-file, that file's bindings in order, and which nodes'
+    newest identity_config record names that exact file (by SHA-256);
+  - every other principal the records name (people, the operator token,
+    nodes, daemon subsystems, sandbox SSH keys): last action, calls by kind;
+  - refused credentials (401s) by source address;
+  - each node's verdict and what its records cover.
+
+Flags on rows: admin (an admin token, the operator token, a node, or a
+binding granting admin), admin_grant (a token minted, or a binding added,
+with the admin role), every_team (a binding granting its role on every
+team), identity_change (a node's identity file changed), expired (not yet
+swept), expiring (within 30 days), revoked, not_listed (a
+token that acted but is gone), no_recorded_action (no api record names the
+token in the window), denied (403s), refused (401s) and rate_limited (calls
+the audit flood budget summarized). Plain reads leave a record only with
+SB_AUDIT_API_RECORDS=all; the report says what the records show, so
+no_recorded_action is not read as "unused".
+
+The export is read the way audit verify reads it, so every record counted
+links into its node's chain. A tampered batch fails the review: nothing is
+printed on stdout and the verdict goes to stderr (exit 1). INCOMPLETE
+evidence prints the report with a warning (exit 3), and so does an export
+with no batches (exit 3, no report).
+
+Flags:
+  --since T         window start: an RFC3339 time, a duration (2160h) or days
+                    (90d). Required
+  --export URL      the S3 audit export (SB_AUDIT_EXPORT_S3_*)
+  --export-dir D    batches saved from a webhook or bus receiver, laid out as
+                    D/node=<id>/YYYY/MM/DD/<batch>.jsonl
+  --format F        md (default) or csv
+  --identity-file F the identity file (SB_IDENTITY_FILE) to list bindings
+                    from; it is read locally and never sent anywhere
+  --witness URL     also check the witnessed heads, as audit verify does;
+                    nodes then come from the witness
+  --max-lag D       how long a head may wait for its records (default 15m)
+  --fetch-concurrency N
+                    S3 export batches downloaded at once per node (default
+                    32, 1 to 256); up to 4 nodes are read at once
+  --region R        AWS region for the buckets
+  --endpoint URL    S3-compatible endpoint
+  --path-style      path-style S3 addressing
+  --json            print the report as JSON instead
+
+Markdown special characters in names are escaped, and a CSV cell that starts
+with =, +, - or @ gets a leading ' so a spreadsheet does not run it.
+
+Examples:
+  aerolvm access review --export s3://acme-audit/audit --since 90d > access-review.md
+  aerolvm access review --export-dir ./audit-export --since 2026-07-01T00:00:00Z --format csv > review.csv
 `
 
 const logoutHelp = `Forget the saved login. The token only leaves this machine; it keeps
@@ -267,11 +424,18 @@ const versionHelp = `Print the aerolvm version.
 Usage: aerolvm version [--json]
 `
 
-const auditHelp = `Verify nodes' audit logs against the heads their S3 witness locked.
+const auditHelp = `Verify nodes' audit logs against the heads their S3 witness locked, or
+search them for what a caller did.
 
 Usage: aerolvm audit verify --witness s3://<bucket>[/<prefix>] --since <when>
                             (--export s3://<bucket>[/<prefix>] | --export-dir <dir>)
                             [--local <node-id>=<secrets.jsonl>]... [--node <id>]...
+       aerolvm audit search --since <when> (--export ... | --export-dir <dir>)
+                            [--caller <id-or-name>] [--kind <kind>] [--sandbox <id>]
+                            [--result <result>] [--until <when>] [--witness ...]
+                            [--local ...] [--node <id>]... [--limit N]
+
+audit verify
 
 Checks that every head the witness recorded since --since links to the next
 one through the audit records, in the order they were witnessed. Records
@@ -298,6 +462,12 @@ Flags:
   --node ID         check only this node (repeatable; default: every node in
                     the witness)
   --max-lag D       how long a head may wait for its records (default 15m)
+  --fetch-concurrency N
+                    S3 export batches downloaded at once (default 32, 1 to
+                    256). Every batch is still read and checked; this only
+                    sets how many GETs overlap. Downloads wait in a
+                    temporary directory that is removed when the check
+                    ends, Ctrl-C included
   --region R        AWS region for both buckets
   --endpoint URL    S3-compatible endpoint
   --path-style      path-style S3 addressing
@@ -305,9 +475,31 @@ Flags:
 
 Credentials come from the standard AWS chain and need read access only.
 
+audit search
+
+Prints every record in the window that matches the filters, then each node's
+verdict. The records are read the way audit verify reads them, so every one
+printed links into its node's chain; with --witness the heads are checked
+too, without it only the links. Exit codes are audit verify's.
+
+  --caller C        the caller's id (tok_..., operator, system:lifecycle) or
+                    display name (an email, ignoring case)
+  --kind K          api, secret_open, egress, auth_denied, ...
+  --sandbox ID      records about one sandbox
+  --result R        ok, denied, error (api records); success, failure
+  --until T         window end, same forms as --since (default: now)
+  --limit N         print at most N matches (default 1000, 0 = all); the
+                    walk and the verdict always cover the whole window
+  --witness URL     also check the witnessed heads, as audit verify does
+  --node, --local, --export, --export-dir, --since, --max-lag,
+  --fetch-concurrency, --region, --endpoint, --path-style, --json
+                    as for audit verify
+
 Examples:
   aerolvm audit verify --witness s3://acme-witness/witness/ --since 30d \
       --export s3://acme-audit/audit
   aerolvm audit verify --witness s3://acme-witness --since 2026-10-01T00:00:00Z \
       --export-dir ./audit --node node-1 --local ./node-1-secrets.jsonl
+  aerolvm audit search --export s3://acme-audit/audit --caller ana@acme.com --since 7d
+  aerolvm audit search --export-dir ./audit --kind api --result denied --since 30d
 `

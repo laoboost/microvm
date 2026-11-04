@@ -293,7 +293,7 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 	return nil
 }
 
-func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
+func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
 	if err := validateSandboxID(sandboxID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start: %w", err)
 	}
@@ -327,6 +327,10 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 		}, nil
 	}
 	d.mu.Unlock()
+	// A restore must be able to adopt the guest it boots (see below).
+	if strings.TrimSpace(toolboxToken) == "" {
+		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, errGuestTokenMissing)
+	}
 
 	manifest, err := d.readSandboxSnapshotManifest(sandboxID)
 	if err != nil {
@@ -441,6 +445,14 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 			"tap", slot.TapName)
 	}
 	cancel()
+	// The restored agent's identity. It normally holds this token already
+	// (it was adopted at create, and Stop snapshotted its memory) and the op
+	// converges. One that holds none gets it now; one that cannot take it is
+	// an agent from before identity delivery that serves without a token, so
+	// it is shut down again with the snapshot left on disk.
+	if err := d.adoptGuest(ctx, vsockPath, manifest.VsockCID, sandboxID, toolboxToken, adoptRemedyStart); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, err)
+	}
 	d.probeToolboxTCP(ctx, "start", sandboxID, slot, true)
 
 	d.mu.Lock()
@@ -466,6 +478,15 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
 	}
+	// LoadSnapshot reopens every drive the snapshot names, read-write, as the
+	// jailer's uid. startFromSandboxSnapshot copied the rootfs in as root, so
+	// it is chowned here, before the load, like the overlay (#248). Chowned
+	// after the load, every Start under the jailer failed with
+	// "Permission denied (os error 13) rootfs.ext4".
+	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
+	if err != nil {
+		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
+	}
 	var overlayAPIPath string
 	if manifest.HasOverlay {
 		overlayAPIPath, err = d.chrootFilePath(runDir, overlayPath, overlayFileName)
@@ -488,10 +509,6 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: LoadSnapshot: %w", err)
 	}
-	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
-	if err != nil {
-		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
-	}
 	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
 		DriveID:    rootDriveID,
 		PathOnHost: rootfsAPIPath,
@@ -511,9 +528,11 @@ func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMM
 
 // copyFileDst is the destination open used by copyFile. Production opens a
 // real file; tests swap it to inject Sync/Close/Write failures that real
-// filesystems almost never surface.
+// filesystems almost never surface. WriteAt and Truncate let copySparse
+// write only the blocks that hold data and leave the rest as holes.
 type copyFileDest interface {
-	io.Writer
+	io.WriterAt
+	Truncate(size int64) error
 	Sync() error
 	Close() error
 }
@@ -522,6 +541,9 @@ var copyFileOpenDst = func(path string, perm os.FileMode) (copyFileDest, error) 
 	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 }
 
+// copyFile copies src to dst and keeps dst sparse (see copySparse). Every
+// caller copies a VM file that is mostly zeros: a 10 GiB rootfs or overlay
+// holding a few hundred MiB, or a memory snapshot of mostly untouched RAM.
 func copyFile(src, dst string) error {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -539,7 +561,7 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if err := copySparse(out, in, dataRanges(in, info.Size()), info.Size()); err != nil {
 		_ = out.Close()
 		_ = os.Remove(dst)
 		return fmt.Errorf("copy %s to %s: %w", src, dst, err)

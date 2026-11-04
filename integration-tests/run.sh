@@ -28,7 +28,11 @@
 #            cluster-hetero-secrets | cluster-hetero-secrets-kms |
 #            cluster-hetero-lite-secrets | cluster-hetero-lite-kms |
 #            cluster-3-mixed-bench
+# Key custody (plans/customer-key-custody.md): cluster-3-mixed-secrets-vault |
+#            cluster-3-mixed-secrets-pkcs11 | cluster-3-mixed-wrapped-kms |
+#            cluster-3-mixed-kms-switch | single-node-wrapped-kms
 # Ingress proxy routing gate: cluster-3-mixed-routing | cluster-hetero-lite-routing
+# Ingress load balancer (UC-356): cluster-3-mixed-lb
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
@@ -80,6 +84,7 @@ NO_BUILD=0
 BENCH_ONLY=0
 DESTROY_ONLY=0
 OBS_SNAPSHOT_ONLY=0
+UPGRADE_FROM=""
 SCENARIO=""
 # PID of the local-mode SSH port-forward, so teardown can reap it. Without this
 # the `ssh -fN` forks leak: each leftover keeps local :21212 bound, so the next
@@ -123,12 +128,32 @@ while [[ $# -gt 0 ]]; do
     # Render Grafana dashboard PNGs from a keep-provisioned obs stack and pull
     # them into integration-tests/reports/obs/ (Phase 5 snapshot pipeline).
     --obs-snapshot-only) OBS_SNAPSHOT_ONLY=1 ;;
+    # Warm-upgrade release gate: provision on an OLD released tag, upgrade the
+    # daemon in place to the local build, and verify the schema migration kept
+    # every row. Delegates to upgrade-gate.sh (it orchestrates its own run.sh
+    # provision + teardown), so it short-circuits the normal flow below.
+    --upgrade-from)
+      shift
+      [[ $# -gt 0 ]] || { echo "--upgrade-from needs a release tag (e.g. --upgrade-from v0.6.7)" >&2; exit 2; }
+      UPGRADE_FROM="$1"
+      ;;
+    --upgrade-from=*) UPGRADE_FROM="${arg#--upgrade-from=}" ;;
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) SCENARIO="$arg" ;;
   esac
   shift
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--no-build]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag>] [--no-build]" >&2; exit 2; }
+# --upgrade-from hands off to the warm-upgrade gate before any normal
+# provisioning. It runs its own old-tag provision and teardown, so returning
+# here afterwards would double-provision; exec replaces this process.
+if [[ -n "${UPGRADE_FROM:-}" ]]; then
+  if [[ "$KEEP" == 1 ]]; then
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" --keep
+  else
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM"
+  fi
+fi
 # A pinned tag and "reuse the last local build" describe different artifact
 # sources; silently honouring one would provision something the operator did
 # not ask for.
@@ -171,6 +196,8 @@ tf_varfile_args() {
   printf -- '-var-file=%s -var-file=%s' "$PROD_TFVARS" "${HERE}/scenarios/${scenario}.tfvars"
   local cert_tfvars="${HERE}/.tf/${scenario}/cert-storage.tfvars"
   [[ -f "$cert_tfvars" ]] && printf -- ' -var-file=%s' "$cert_tfvars"
+  local admin_tfvars="${HERE}/.tf/${scenario}/admin-cidrs.tfvars"
+  [[ -f "$admin_tfvars" ]] && printf -- ' -var-file=%s' "$admin_tfvars"
   # Locally-built artifact URLs (§4.4), chained LAST so they override any
   # sandboxd_url/install_script_url a scenario file happens to pin. Written by
   # prepare_artifacts before apply and deliberately LEFT ON DISK afterwards, so
@@ -211,6 +238,20 @@ deploy_obs_tfvar() {
   fi
 }
 
+# api_lb_tfvar mirrors the scenario api-load-balancer capability into
+# Terraform's api_load_balancer var, so the capability that gates UC-356 and
+# the balancer it needs cannot disagree. Passed on every apply AND destroy,
+# like deploy_obs: an operator's terraform.tfvars cannot put a balancer under
+# scenarios that do not ask for one, or leave one out of the scenario that does.
+api_lb_tfvar() {
+  local caps_file="$1"
+  if yq -r '.capabilities | contains(["api-load-balancer"])' "$caps_file" | grep -q true; then
+    echo "nlb"
+  else
+    echo "none"
+  fi
+}
+
 # T7 resolved 2026-07-19: 5×c5.metal workers + 2×m6i.large ingress + 3×t3.medium
 # servers + m6i.large obs (~$21/hr). Kept as a cost acknowledgement gate — set
 # AEROL_HETERO_OBS_T7_OK=1 (Makefile does) to proceed; unset still warns loudly.
@@ -225,6 +266,37 @@ acknowledge_hetero_obs_t7() {
   fi
   echo "WARNING: ${scenario} costs ~\$21/hr (5×c5.metal). Set AEROL_HETERO_OBS_T7_OK=1 to acknowledge (Makefile target does)." >&2
   exit 2
+}
+
+# prod_sets_admin_cidrs: the operator's own tfvars name who may reach SSH and
+# the API, and the harness leaves that alone.
+prod_sets_admin_cidrs() {
+  grep -qE '^[[:space:]]*admin_allowed_cidrs[[:space:]]*=' "$PROD_TFVARS" 2>/dev/null
+}
+
+# emit_admin_cidrs_tfvars gives Terraform's required admin_allowed_cidrs this
+# runner's public address when the operator's tfvars leave it unset, so a
+# scenario's SSH and API answer this machine and not the whole internet. It is
+# re-learned every run, so a kept stack follows a runner that changed networks;
+# the last file stands when the address can't be learned.
+emit_admin_cidrs_tfvars() {
+  local sdir="$1" ip
+  local out="${sdir}/admin-cidrs.tfvars"
+  if prod_sets_admin_cidrs; then
+    rm -f "$out"
+    return 0
+  fi
+  ip=$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]') || ip=""
+  if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    if [[ -f "$out" ]]; then
+      echo "admin CIDRs: cannot learn this runner's public address; keeping $(tr -d '\n' < "$out")" >&2
+      return 0
+    fi
+    echo "admin CIDRs: cannot learn this runner's public address; set admin_allowed_cidrs in $PROD_TFVARS" >&2
+    return 1
+  fi
+  printf 'admin_allowed_cidrs = ["%s/32"]\n' "$ip" > "$out"
+  echo "admin CIDRs: SSH and the API open to this runner only (${ip}/32)"
 }
 
 # emit_cert_storage_tfvars writes the persistent BYO cert-store override for a
@@ -346,13 +418,20 @@ EOF
 # scenario applied with.
 destroy_scenario() {
   local scenario="$1"
+  # A stack applied before the harness wrote admin-cidrs.tfvars has none on
+  # disk; the destroy needs the required variable set, not a real address.
+  local admin=()
+  if ! prod_sets_admin_cidrs && [[ ! -f "${REPO_ROOT}/integration-tests/.tf/${scenario}/admin-cidrs.tfvars" ]]; then
+    admin=(-var='admin_allowed_cidrs=["127.0.0.1/32"]')
+  fi
   # shellcheck disable=SC2046
   TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
     terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
-    $(tf_varfile_args "$scenario") \
+    $(tf_varfile_args "$scenario") ${admin[@]+"${admin[@]}"} \
     -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
     -var="force_on_demand=$(on_demand_tfvar)" \
-    -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")"
+    -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")" \
+    -var="api_load_balancer=$(api_lb_tfvar "${HERE}/scenarios/${scenario}.caps.yml")"
 }
 
 teardown() {
@@ -493,6 +572,8 @@ lease_domain_for_scenario() {
   pin="${sdir}/.leased-domain"
 
   if [[ "$KEEP" == "1" ]]; then
+    # -s alone would trust a pin holding only a newline, which is what a failed
+    # lease used to leave behind; the trimmed name has to be non-empty too.
     if [[ -s "$pin" ]]; then
       domain=$(tr -d '[:space:]' < "$pin")
       if [[ -n "$domain" ]]; then
@@ -521,7 +602,17 @@ lease_domain_for_scenario() {
     fi
   fi
 
-  domain=$(lease_domain "$pin")
+  # The `|| return 1` is load-bearing. This function runs inside run_one's
+  # $(…), and bash clears errexit in command substitutions, so a failed lease
+  # does not stop anything on its own. Without it a missing domains.yml wrote
+  # an EMPTY pin, echoed nothing and returned 0, and a domain scenario went on
+  # toward Terraform with no test domain (2026-10-16). A blank pool entry is no
+  # lease either, so the pin is written only once there is a name to put in it.
+  domain=$(lease_domain "$pin") || return 1
+  if [[ -z "$domain" || "$domain" == "null" ]]; then
+    echo "scenario ${scenario}: ${DOMAINS_FILE} handed out a blank entry; refusing to lease it" >&2
+    return 1
+  fi
   mkdir -p "$sdir"
   printf '%s\n' "$domain" > "$pin"
   echo "$domain"
@@ -715,7 +806,14 @@ wait_for_download_url() {
 # provision that would otherwise work; only a definitive "zone absent" aborts.
 verify_leased_zone() {
   local domain="$1"
-  [[ -n "$domain" ]] || return 0
+  # An empty name is a failure, not "nothing to check". run_one calls this only
+  # for domain scenarios (local-mode never gets here), so an empty argument can
+  # only mean a lease that went wrong upstream. This used to return 0, and was
+  # one of the gates that let the 2026-10-16 run through with no domain.
+  if [[ -z "$domain" ]]; then
+    echo "zone precheck: no leased domain to check; refusing to provision a domain scenario without one" >&2
+    return 1
+  fi
 
   local token
   token=$(yq -r '.cloudflare.api_token // ""' "${REPO_ROOT}/config/secrets.yml" 2>/dev/null || echo "")
@@ -1010,8 +1108,29 @@ run_one() {
   caps_docker_netns_pool=$(yq -r '.capabilities | contains(["docker-netns-pool"])' "$caps_file")
   caps_docker_engine=$(yq -r '.capabilities | contains(["docker-engine"])' "$caps_file")
   caps_obs=$(yq -r '.capabilities | contains(["observability"])' "$caps_file")
+  # Identity and access (plans/identity-and-access.md T12). pat-scope-host:
+  # the nodes run SB_PAT_SCOPE=host, so the PAT works only from a loopback
+  # peer and every remote call needs a named token (see mint_suite_token).
+  # audit-export-s3: the suite reads the scenario's audit export bucket.
+  local caps_pat_scope_host caps_audit_export_s3
+  caps_pat_scope_host=$(yq -r '.capabilities | contains(["pat-scope-host"])' "$caps_file")
+  caps_audit_export_s3=$(yq -r '.capabilities | contains(["audit-export-s3"])' "$caps_file")
   if [[ "$caps_domain" == "true" ]]; then
-    leased=$(lease_domain_for_scenario "$scenario")
+    # Refused by hand, not left to errexit. The lease runs inside $(…), where
+    # bash clears -e, and errexit in run_one itself is off whenever a caller
+    # wraps it in `if` or `||`. An empty name used to flow on as the local-mode
+    # placeholder at the safety gate, a skipped zone precheck and an empty
+    # ingress.domain_name in the overlay: that is how a domain scenario reached
+    # the edge of a Terraform apply on 2026-10-16 with no test domain at all.
+    leased=$(lease_domain_for_scenario "$scenario") || leased=""
+    if [[ -z "$leased" ]]; then
+      echo "scenario ${scenario}: needs a test domain but none was leased; refusing to provision." >&2
+      echo "  The pool is ${DOMAINS_FILE}" >&2
+      echo "  It is gitignored, so a fresh clone or worktree has none: copy" >&2
+      echo "  scenarios/domains.example.yml there and list test FQDNs you control." >&2
+      echo "  Any other reason the lease failed is printed above." >&2
+      return 1
+    fi
   else
     leased="" # local-mode: no domain
   fi
@@ -1022,11 +1141,24 @@ run_one() {
   # picks it up for both the apply and the teardown/destroy that share it.
   emit_cert_storage_tfvars "$scenario" "$sdir" "$caps_domain"
 
-  # SAFETY GATE — before any apply.
-  bash "$PROVISION" check-safety "$state_key" "${leased:-none.itest.invalid}" "$prod_domain" "$cluster_name"
+  # SAFETY GATE — before any apply. A domain scenario is checked against the
+  # name it is about to point DNS at. The .invalid placeholder is only for a
+  # scenario with no domain at all (local-mode): the collision tripwire still
+  # needs a name, and a reserved TLD can never collide with prod. Picking it by
+  # capability, not by `${leased:-…}`, keeps an empty lease from passing the
+  # gate under the placeholder's name.
+  local safety_domain="none.itest.invalid"
+  if [[ "$caps_domain" == "true" ]]; then
+    safety_domain="$leased"
+  fi
+  bash "$PROVISION" check-safety "$state_key" "$safety_domain" "$prod_domain" "$cluster_name"
   if [[ "$caps_domain" == "true" ]]; then
     verify_leased_zone "$leased"
   fi
+
+  # Who may reach SSH and the API: this runner, unless the operator's tfvars
+  # say. After the gate, which runs before anything leaves this machine.
+  emit_admin_cidrs_tfvars "$sdir"
 
   # Resolve the SSH identity BEFORE anything is provisioned. wait_for_cloud_init
   # is an SSH call, and without a key it burns its whole timeout, the harness
@@ -1163,7 +1295,8 @@ run_one() {
     $(tf_varfile_args "$scenario") \
     -var="config_dir=${overlay}" \
     -var="force_on_demand=$(on_demand_tfvar)" \
-    -var="deploy_obs=$(deploy_obs_tfvar "$caps_file")"
+    -var="deploy_obs=$(deploy_obs_tfvar "$caps_file")" \
+    -var="api_load_balancer=$(api_lb_tfvar "$caps_file")"
 
   # Discover endpoint.
   local targets base_url pat grafana_url pushgateway_url
@@ -1171,6 +1304,11 @@ run_one() {
   grafana_url=$(echo "$targets" | jq -r '.grafana_url // ""')
   pushgateway_url=$(echo "$targets" | jq -r '.pushgateway_url // ""')
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
+  # api_token is what every REMOTE call presents: the PAT, unless the
+  # scenario confines the PAT to the host, in which case it is an admin avm_
+  # token minted on the seed's loopback below. Calls made on a node over SSH
+  # (log collection, membership dumps) keep the PAT, which works there.
+  local api_token="$pat"
 
   local inconclusive=0
   if [[ "$caps_domain" == "true" ]]; then
@@ -1187,7 +1325,14 @@ run_one() {
     # later. Replacement is the COMMON case now, because the local-build
     # pipeline changes user_data on every code change.
     wait_for_tls "$leased" || echo "tls: pre-wait timed out; deferring to the health probe" >&2
-    wait_for_health "$base_url" "$pat" || inconclusive=1
+    if [[ "$caps_pat_scope_host" == "true" ]]; then
+      # Mint before the first health probe: through Caddy the PAT is a 401.
+      api_token=$(mint_suite_token "ubuntu@$(echo "$targets" | jq -r '.seed_ip')" "$pat" "$scenario") || {
+        api_token="$pat"
+        inconclusive=1
+      }
+    fi
+    wait_for_health "$base_url" "$api_token" || inconclusive=1
     # A healthy API is not a finished box. A scenario's extra_user_data runs
     # after install and may restart sandboxd and the egress gateway: the
     # private-cloud one installs dnsmasq and squid and writes the operator
@@ -1202,7 +1347,7 @@ run_one() {
       if (( ci_rc != 0 )); then
         echo "cloud-init: not confirmed done on ${seed_ip} (rc=${ci_rc}); running the suite anyway" >&2
       fi
-      wait_for_health "$base_url" "$pat" || inconclusive=1
+      wait_for_health "$base_url" "$api_token" || inconclusive=1
     fi
   else
     # local-mode: SSH tunnel to the seed, talk to localhost:21212. Unlike the
@@ -1245,7 +1390,7 @@ run_one() {
   if [[ "$inconclusive" != "1" && "$caps_wasm" == "true" ]]; then
     echo "=== staging wasm standard modules on ${scenario} ==="
     if stage_wasm_modules "${HERE}/fixtures/wasm" "${overlay}/cluster.yml" "$caps_domain" "$targets"; then
-      wait_for_health "$base_url" "$pat" || inconclusive=1
+      wait_for_health "$base_url" "$api_token" || inconclusive=1
     else
       echo "scenario ${scenario}: wasm module staging failed" >&2
       inconclusive=1
@@ -1257,7 +1402,7 @@ run_one() {
   local expected_members
   expected_members=$(yq -r '.expected_members // ""' "$caps_file")
   if [[ "$inconclusive" != "1" && "$caps_cluster" == "true" && -n "$expected_members" ]]; then
-    wait_for_members "$base_url" "$pat" "$expected_members" || inconclusive=1
+    wait_for_members "$base_url" "$api_token" "$expected_members" || inconclusive=1
   fi
 
   # Observability stack: wait for Grafana after sandboxd health (obs user_data
@@ -1309,7 +1454,7 @@ run_one() {
   if [[ "$BENCH_ONLY" == "1" ]]; then
     local bench_out="${AEROL_BENCH_OUT:-integration-tests/reports/${scenario}-bench.json}"
     set +e
-    run_bench_tests "$scenario" "$base_url" "$pat" "$caps_file" "$leased" \
+    run_bench_tests "$scenario" "$base_url" "$api_token" "$caps_file" "$leased" \
       "$expected_members" "$wasm_ref" "$bench_out"
     local test_rc=$?
     set -e
@@ -1396,6 +1541,25 @@ run_one() {
   if [[ -n "$suite_aws_profile" ]]; then
     export AWS_PROFILE="$suite_aws_profile"
   fi
+  # terraform takes its region from the var-file, not AWS_*, so the suite's own
+  # aws CLI calls (the EC2 stop/start failover helpers, the witness S3 reads)
+  # have no region unless we export one. Without this every node-kill failover
+  # case (UC-58b/c/d) fails with "You must specify a region". witness_region is
+  # the scenario's aws_region.
+  if [[ -n "$witness_region" ]]; then
+    export AWS_REGION="${AWS_REGION:-$witness_region}"
+    export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$witness_region}"
+  fi
+
+  # The audit export bucket, for the auditor's tools (UC-279). Empty unless
+  # the scenario exports to S3.
+  local audit_export_bucket="" audit_export_prefix=""
+  if [[ "$caps_audit_export_s3" == "true" ]]; then
+    audit_export_bucket=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+      output -raw audit_export_bucket 2>/dev/null) || audit_export_bucket=""
+    audit_export_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+      output -raw audit_export_prefix 2>/dev/null) || audit_export_prefix=""
+  fi
 
     # 150m, not 60m: the 8-member hetero suite runs every disruptive case
     # with real rejoin waits, and T18's first scenario was killed by the 60m
@@ -1405,11 +1569,13 @@ run_one() {
     # command: a comment line inside a backslash continuation ends it, and
     # every AEROL_* assignment above silently stops applying — which is
     # exactly how this comment first broke the suite.)
-  AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
+  AEROL_BASE_URL="$base_url" AEROL_PAT="$api_token" AEROL_OPERATOR_PAT="$pat" AEROL_SCENARIO="$scenario" \
     AEROL_CAPS="${caps_file}" \
     AEROL_DOMAIN="${leased}" \
     AEROL_EXPECTED_MEMBERS="${expected_members}" \
     AEROL_INTEGRATION_TARGETS="${targets}" \
+    AEROL_AUDIT_EXPORT_BUCKET="${audit_export_bucket}" \
+    AEROL_AUDIT_EXPORT_PREFIX="${audit_export_prefix}" \
     AEROL_AUDIT_WITNESS_BUCKET="${witness_bucket}" \
     AEROL_AUDIT_WITNESS_PREFIX="${witness_prefix}" \
     AEROL_AUDIT_WITNESS_REGION="${witness_region:-us-east-1}" \
@@ -1442,7 +1608,7 @@ run_one() {
       pass=$((pass + 1))
       echo "=== soak pass ${pass} ===" >&2
       set +e
-      AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
+      AEROL_BASE_URL="$base_url" AEROL_PAT="$api_token" AEROL_OPERATOR_PAT="$pat" AEROL_SCENARIO="$scenario" \
         AEROL_CAPS="${caps_file}" \
         AEROL_DOMAIN="${leased}" \
         AEROL_EXPECTED_MEMBERS="${expected_members}" \

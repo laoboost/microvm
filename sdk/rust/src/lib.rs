@@ -24,7 +24,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::blocking::{
@@ -44,6 +44,7 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
+pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
     EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
@@ -66,6 +67,21 @@ pub use types::{
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
+
+/// The request header that selects which of a credential's teams a request
+/// acts for. Keep in sync with `pkg/api.HeaderTeam` on the server.
+pub const TEAM_HEADER: &str = "X-AerolVM-Team";
+
+/// The header a sandbox create carries so the server can recognise a retry
+/// of it. Keep in sync with `clustercreate.HeaderIdempotencyKey` on the
+/// server.
+pub const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+
+/// A fresh create key: 128 random bits as 32 lowercase hex characters.
+fn new_idempotency_key() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
 const STREAM_PREFIX_STDOUT: u8 = 0x01;
 const STREAM_PREFIX_STDERR: u8 = 0x02;
 
@@ -96,11 +112,25 @@ pub struct SessionAttachOptions {
     pub rows: Option<u16>,
 }
 
+/// Every failure a [`Client`] call can return.
+///
+/// It is `#[non_exhaustive]`: a later SDK may add a variant without a
+/// breaking release, so a `match` on it needs a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     Reqwest(reqwest::Error),
     MissingToken,
-    Api(String),
+    /// The server, or a proxy in front of it, answered with an HTTP error
+    /// status. [`ApiError`] carries the status, the server's stable error
+    /// code and its `Retry-After`.
+    Api(ApiError),
+    /// A failure the SDK client found itself rather than an HTTP error
+    /// response: a missing or invalid argument, a server that lacks a
+    /// feature (Image builds, name lookup), an incomplete cluster list, or a
+    /// WebSocket handshake or stream failure. Before 0.8.0 these were
+    /// `Error::Api(String)`.
+    Client(String),
     WebSocket(WebSocketError),
     Http(http::Error),
     SerdeJson(serde_json::Error),
@@ -114,9 +144,11 @@ impl fmt::Display for Error {
             Error::Reqwest(err) => write!(f, "HTTP error: {}", err),
             Error::MissingToken => write!(
                 f,
-                "PAT token is required. Set SB_PAT_TOKEN or pass pat_token."
+                "PAT token is required. Set SB_PAT_TOKEN or SB_API_TOKEN, or pass pat_token."
             ),
-            Error::Api(message) => write!(f, "API error: {}", message),
+            Error::Api(err) => write!(f, "API error: {}", err),
+            // The text these errors had as Error::Api(String) before 0.8.0.
+            Error::Client(message) => write!(f, "API error: {}", message),
             Error::WebSocket(err) => write!(f, "WebSocket error: {}", err),
             Error::Http(err) => write!(f, "HTTP request build error: {}", err),
             Error::SerdeJson(err) => write!(f, "JSON error: {}", err),
@@ -127,6 +159,80 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// An HTTP error response from the AerolVM server, returned as
+/// [`Error::Api`].
+///
+/// Branch on [`ApiError::code`], not on the message: the code is a stable
+/// identifier such as `"idempotency_key_reused"` or `"overloaded"`, the
+/// message is wording for a person. It displays as
+/// `"<status>: <message>"`, the same text `Error::Api(String)` carried for
+/// these errors before 0.8.0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiError {
+    status: reqwest::StatusCode,
+    code: Option<String>,
+    message: String,
+    retry_after: Option<Duration>,
+}
+
+impl ApiError {
+    /// Reads an error response: the server's `{"error": ..., "code": ...}`
+    /// body, or, for any other body (a proxy's error page), the body text as
+    /// the message with no code.
+    fn from_response(status: reqwest::StatusCode, retry_after: Option<&str>, body: &str) -> Self {
+        let mut message = body.to_string();
+        let mut code = None;
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if let Some(error) = value.get("error").and_then(|entry| entry.as_str()) {
+                message = error.to_string();
+                code = value
+                    .get("code")
+                    .and_then(|entry| entry.as_str())
+                    .filter(|entry| !entry.is_empty())
+                    .map(String::from);
+            }
+        }
+        ApiError {
+            status,
+            code,
+            message,
+            retry_after: retry_after.and_then(|value| parse_retry_after(value, SystemTime::now())),
+        }
+    }
+
+    /// The HTTP status of the final attempt, such as 422 or 503.
+    pub fn status(&self) -> u16 {
+        self.status.as_u16()
+    }
+
+    /// The server's stable error code, or `None` when the response has
+    /// none: many errors are only ever shown to a person, and a proxy's
+    /// error page has no code.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    /// The server's message, or the response body when it was not the
+    /// server's JSON error.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// How long the response's `Retry-After` header asked the caller to
+    /// wait, or `None` without a usable header.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
@@ -198,6 +304,104 @@ fn is_cross_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
 }
 
 const MAX_REDIRECTS: usize = 5;
+/// The bearer a client sends: the explicit value, else `SB_PAT_TOKEN`, else
+/// its alias `SB_API_TOKEN`. A blank value counts as unset. `SB_PAT_TOKEN`
+/// wins over the alias so a setup that already exports it keeps its token.
+fn resolve_token(explicit: Option<String>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let set = |value: &String| !value.trim().is_empty();
+    explicit
+        .filter(set)
+        .or_else(|| env("SB_PAT_TOKEN").filter(set))
+        .or_else(|| env("SB_API_TOKEN").filter(set))
+}
+
+/// The team a client sends in [`TEAM_HEADER`]: the explicit value, else
+/// `SB_TEAM`, trimmed; `None` (no header) when both are blank.
+fn resolve_team(explicit: Option<String>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let trimmed = |value: String| Some(value.trim().to_string()).filter(|v| !v.is_empty());
+    explicit
+        .and_then(trimmed)
+        .or_else(|| env("SB_TEAM").and_then(trimmed))
+}
+
+/// Adds the client's credential and team selection to a request. Every HTTP
+/// call goes through it, so a client built with a team never sends a
+/// request that acts for another one.
+trait Authorize {
+    fn authorize(self, client: &Client) -> Self;
+}
+
+impl Authorize for reqwest::blocking::RequestBuilder {
+    fn authorize(self, client: &Client) -> Self {
+        let builder = self.bearer_auth(&client.pat_token);
+        match &client.team {
+            Some(team) => builder.header(TEAM_HEADER, team),
+            None => builder,
+        }
+    }
+}
+
+/// The WebSocket handshake for `ws_url`, carrying the same credential and
+/// team header as every HTTP request.
+fn websocket_request(
+    ws_url: String,
+    pat_token: &str,
+    team: Option<&str>,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, Error> {
+    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
+            .map_err(|err| Error::Client(format!("invalid auth header: {}", err)))?,
+    );
+    if let Some(team) = team {
+        request.headers_mut().insert(
+            TEAM_HEADER,
+            http::HeaderValue::from_str(team)
+                .map_err(|err| Error::Client(format!("invalid {} header: {}", TEAM_HEADER, err)))?,
+        );
+    }
+    Ok(request)
+}
+
+/// Scoped API tokens (`avm_…`) for services and CI, reached through
+/// [`Client::tokens`]. Creating and revoking needs an admin credential;
+/// listing needs an auditor or an admin.
+pub struct Tokens<'a> {
+    client: &'a Client,
+}
+
+impl Tokens<'_> {
+    fn path(&self, suffix: &str) -> String {
+        format!("{}/tokens{}", self.client.version_prefix(), suffix)
+    }
+
+    /// Mints a token. The result's `token` is the secret, returned this once
+    /// and never again. A 409 means the name is taken, possibly by an
+    /// earlier attempt whose reply was lost; that secret cannot be
+    /// recovered, so revoke the token and create it again.
+    pub fn create(&self, opts: CreateApiTokenOptions) -> Result<CreatedApiToken, Error> {
+        self.client
+            .do_json::<CreateApiTokenOptions, CreatedApiToken>(Method::POST, &self.path(""), Some(&opts))
+    }
+
+    /// Lists every token, expired ones included (`expired` is true) until
+    /// the server removes them 30 days after expiry. Never a secret.
+    pub fn list(&self) -> Result<ApiTokenList, Error> {
+        self.client.do_json::<(), ApiTokenList>(Method::GET, &self.path(""), None)
+    }
+
+    /// Revokes a token by id (`tok_…`). Revoking one that is already gone
+    /// succeeds, so a retried revoke is safe.
+    pub fn revoke(&self, id: &str) -> Result<(), Error> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Client("token id is required".to_string()));
+        }
+        let path = self.path(&format!("/{}", urlencoding::encode(id)));
+        self.client.do_json::<(), ()>(Method::DELETE, &path, None)
+    }
+}
 
 /// Bounds only the TCP/TLS connect, which no legitimate call needs long for.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -263,10 +467,112 @@ impl RetryPolicy {
     }
 }
 
+/// Default cap on one retry's wait for the server's `Retry-After`. An
+/// overloaded node asks for about a second, so the cap only bites on a long
+/// ask (maintenance, a misconfigured proxy), which should not hold a call for
+/// minutes per retry.
+const DEFAULT_MAX_RETRY_AFTER_MS: u64 = 30_000;
+
+/// Longer delta-seconds values are clamped: no cap is that long anyway.
+const MAX_RETRY_AFTER_SECS: u64 = 1_000_000_000;
+
+/// The response's `Retry-After` when the status is one the server paces
+/// clients with: 429 (this caller is over its share) and 503 (the node is
+/// shedding load). A 421, 502 or 504 comes from a routing or proxy hop, so
+/// a `Retry-After` on it is not the server's and the backoff applies.
+fn retry_after_hint(response: &reqwest::blocking::Response) -> Option<String> {
+    use reqwest::StatusCode as S;
+    if ![S::TOO_MANY_REQUESTS, S::SERVICE_UNAVAILABLE].contains(&response.status()) {
+        return None;
+    }
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(String::from)
+}
+
+/// Reads a `Retry-After` value in either form RFC 9110 allows:
+/// delta-seconds (`"120"`) or an HTTP date in IMF-fixdate form (`"Sun, 06
+/// Nov 1994 08:49:37 GMT"`, the form servers send). A date already past is
+/// a zero wait; `None` for a malformed value.
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        // All digits, so parse fails only on overflow: absurdly long.
+        let secs = value.parse::<u64>().unwrap_or(u64::MAX).min(MAX_RETRY_AFTER_SECS);
+        return Some(Duration::from_secs(secs));
+    }
+    let when = parse_imf_fixdate(value)?;
+    Some(when.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+fn parse_imf_fixdate(value: &str) -> Option<SystemTime> {
+    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // Byte offsets below are only char boundaries for ASCII.
+    let b = value.as_bytes();
+    if !value.is_ascii()
+        || b.len() != 29
+        || &b[3..5] != b", "
+        || b[7] != b' '
+        || b[11] != b' '
+        || b[16] != b' '
+        || b[19] != b':'
+        || b[22] != b':'
+        || &b[25..] != b" GMT"
+        || !WEEKDAYS.contains(&&value[0..3])
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let text = &value[range];
+        if text.bytes().all(|c| c.is_ascii_digit()) {
+            text.parse().ok()
+        } else {
+            None
+        }
+    };
+    let month = MONTHS.iter().position(|m| *m == &value[8..11])? as i64 + 1;
+    let (day, year) = (number(5..7)?, number(12..16)?);
+    let (hour, minute, second) = (number(17..19)?, number(20..22)?, number(23..25)?);
+    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+    // days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    // A date before 1970 is long past: a zero wait.
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(0)))
+}
+
+/// Turns the server's `Retry-After` into a wait. It never retries sooner
+/// than the server asked (nor sooner than the client's own backoff), and
+/// adds up to a fifth on top so clients told the same value spread out.
+/// `limit` is a hard ceiling: when the server asks for at least that long,
+/// the client is early anyway, so the spread goes below the limit instead.
+fn wait_for_hint(hint: Duration, backoff: Duration, limit: Duration, r: f64) -> Duration {
+    let target = hint.max(backoff);
+    if target >= limit {
+        return limit - limit.mul_f64(0.2 * r);
+    }
+    let upper = (target + target / 5).min(limit);
+    target + (upper - target).mul_f64(r)
+}
+
 #[derive(Clone)]
 pub struct Client {
     api_url: String,
     pat_token: String,
+    team: Option<String>,
     api_version: ApiVersion,
     inner: HttpClient,
     retry_config: RetryConfig,
@@ -667,6 +973,7 @@ impl Client {
             api_url: api_url.map(String::from),
             pat_token: pat_token.map(String::from),
             retry: None,
+            team: None,
         }, api_version)
     }
 
@@ -674,15 +981,9 @@ impl Client {
         config: ClientConfig,
         api_version: ApiVersion,
     ) -> Result<Self, Error> {
-        let token = config.pat_token
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                std::env::var("SB_PAT_TOKEN")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            });
-
-        let pat_token = token.ok_or(Error::MissingToken)?;
+        let env = |name: &str| std::env::var(name).ok();
+        let pat_token = resolve_token(config.pat_token, env).ok_or(Error::MissingToken)?;
+        let team = resolve_team(config.team, env);
         let api_url = config.api_url
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().trim_end_matches('/').to_string())
@@ -697,6 +998,7 @@ impl Client {
         Ok(Client {
             api_url,
             pat_token,
+            team,
             api_version,
             inner: build_http_client(None)?,
             retry_config: config.retry.unwrap_or_default(),
@@ -708,11 +1010,25 @@ impl Client {
         self.api_version.path_prefix()
     }
 
+    /// Creates a sandbox. The request carries an `Idempotency-Key`: the
+    /// caller's [`CreateOptions::idempotency_key`], or a random one made for
+    /// this call. Either way it is sent unchanged on each of the call's
+    /// automatic retries, so a create retried after a timeout gets back the
+    /// sandbox the first attempt made instead of making a second one.
     pub fn create(&self, opts: CreateOptions) -> Result<Sandbox, Error> {
-        let raw = self.do_json::<CreateOptions, CreateSandboxResponse>(
+        let key = opts
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(String::from)
+            .unwrap_or_else(new_idempotency_key);
+        let (raw, _) = self.send_json_with_headers::<CreateOptions, CreateSandboxResponse>(
             Method::POST,
             &format!("{}/sandboxes", self.version_prefix()),
             Some(&opts),
+            RetryPolicy::Idempotent,
+            &[(IDEMPOTENCY_KEY_HEADER, key.as_str())],
         )?;
         Ok(Sandbox::new_with_ssh_private_key(
             self.clone(),
@@ -762,18 +1078,18 @@ impl Client {
         }
 
         if let Some(message) = image.validation_error() {
-            return Err(Error::Api(message.to_string()));
+            return Err(Error::Client(message.to_string()));
         }
 
         let push_body = if let Some(push) = options.push.as_ref() {
             let registry = push.registry.trim();
             if registry.is_empty() {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "push.registry is required when push is set".to_string(),
                 ));
             }
             if push.username.is_empty() || push.password.is_empty() {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "push.username and push.password are required when push is set".to_string(),
                 ));
             }
@@ -797,6 +1113,9 @@ impl Client {
                 let mut builder = self.inner.request(hop_method.clone(), hop_url);
                 if !strip_credentials {
                     builder = builder.bearer_auth(&self.pat_token);
+                        if let Some(team) = &self.team {
+                            builder = builder.header(TEAM_HEADER, team);
+                        }
                 }
                 if with_body {
                     builder = builder.json(&BuildImageRequest {
@@ -809,7 +1128,7 @@ impl Client {
         )?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             let _ = response.text();
-            return Err(Error::Api(format!(
+            return Err(Error::Client(format!(
                 "this daemon does not support Image builds (POST {} is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
                 path,
             )));
@@ -867,7 +1186,7 @@ impl Client {
                 None => return Ok(items),
             }
         }
-        Err(Error::Api(
+        Err(Error::Client(
             "incomplete cluster list: exceeded max pages".into(),
         ))
     }
@@ -893,7 +1212,7 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if partial == "true" || ready == "false" {
-            return Err(Error::Api("incomplete cluster list".into()));
+            return Err(Error::Client("incomplete cluster list".into()));
         }
         let next = headers
             .get("X-Cluster-List-Next-Page-Token")
@@ -927,7 +1246,7 @@ impl Client {
     ) -> Result<Option<Sandbox>, Error> {
         let wanted = name.trim();
         if wanted.is_empty() {
-            return Err(Error::Api("sandbox name is required".into()));
+            return Err(Error::Client("sandbox name is required".into()));
         }
         let mut path = format!("{}/sandboxes", self.version_prefix());
         path.push_str(&build_sandbox_query(
@@ -940,7 +1259,7 @@ impl Client {
             return Ok(None);
         }
         if raw.len() > 1 || raw[0].name.as_deref() != Some(wanted) {
-            return Err(Error::Api(format!(
+            return Err(Error::Client(format!(
                 "{} does not support sandbox name lookup; use the sandbox ID or upgrade the server",
                 self.api_url
             )));
@@ -1027,7 +1346,7 @@ impl Client {
 
         let name = opts.name.trim();
         if name.is_empty() {
-            return Err(Error::Api("name is required".to_string()));
+            return Err(Error::Client("name is required".to_string()));
         }
 
         let image = opts
@@ -1040,12 +1359,12 @@ impl Client {
             .filter(|value| !value.is_empty());
         match (&image, &dockerfile_content) {
             (None, None) => {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "image or dockerfile_content is required".to_string(),
                 ))
             }
             (Some(_), Some(_)) => {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "image and dockerfile_content are mutually exclusive".to_string(),
                 ))
             }
@@ -1090,7 +1409,7 @@ impl Client {
         mut opts: RegisterSnapshotOptions,
     ) -> Result<SandboxSnapshot, Error> {
         if let Some(message) = image.validation_error() {
-            return Err(Error::Api(message.to_string()));
+            return Err(Error::Client(message.to_string()));
         }
         opts.name = name.to_string();
         opts.image = None;
@@ -1099,8 +1418,8 @@ impl Client {
     }
 
     /// Look a snapshot up by name. In a cluster the request is routed to the
-    /// node holding the image. A missing snapshot surfaces as an `Api` error
-    /// carrying the server's 404.
+    /// node holding the image. A missing snapshot surfaces as an
+    /// [`Error::Api`] carrying the server's 404.
     pub fn get_snapshot(&self, name: &str) -> Result<SandboxSnapshot, Error> {
         self.do_json::<(), SandboxSnapshot>(
             Method::GET,
@@ -1159,7 +1478,7 @@ impl Client {
     /// template.
     pub fn create_template(&self, opts: CreateTemplateOptions) -> Result<Template, Error> {
         if opts.image.trim().is_empty() {
-            return Err(Error::Api("image is required".to_string()));
+            return Err(Error::Client("image is required".to_string()));
         }
         self.do_json::<CreateTemplateOptions, Template>(
             Method::POST,
@@ -1196,7 +1515,7 @@ impl Client {
     /// the returned row is typically already `WasmModuleStatus::Ready`.
     pub fn create_wasm_module(&self, opts: CreateWasmModuleOptions) -> Result<WasmModule, Error> {
         if opts.module_ref.trim().is_empty() {
-            return Err(Error::Api("module_ref is required".to_string()));
+            return Err(Error::Client("module_ref is required".to_string()));
         }
         self.do_json::<CreateWasmModuleOptions, WasmModule>(
             Method::POST,
@@ -1238,10 +1557,10 @@ impl Client {
         opts: PushWasmModuleOptions,
     ) -> Result<PushWasmModuleResponse, Error> {
         if opts.name.trim().is_empty() {
-            return Err(Error::Api("name is required".to_string()));
+            return Err(Error::Client("name is required".to_string()));
         }
         if opts.registry_token.trim().is_empty() {
-            return Err(Error::Api("registry_token is required".to_string()));
+            return Err(Error::Client("registry_token is required".to_string()));
         }
         let tag = if opts.tag.trim().is_empty() {
             "latest"
@@ -1424,6 +1743,21 @@ impl Client {
         self.do_json::<(), ()>(Method::DELETE, &self.egress_profile_path(name), None)
     }
 
+    /// Who the server says the caller is: principal, role, team and when
+    /// the credential expires. Every valid credential may ask.
+    pub fn whoami(&self) -> Result<WhoAmI, Error> {
+        self.do_json::<(), WhoAmI>(
+            Method::GET,
+            &format!("{}/whoami", self.version_prefix()),
+            None,
+        )
+    }
+
+    /// Scoped API tokens: `client.tokens().create/list/revoke`.
+    pub fn tokens(&self) -> Tokens<'_> {
+        Tokens { client: self }
+    }
+
     pub fn get_audit(&self, id: &str, opts: AuditOptions) -> Result<AuditPage, Error> {
         let mut path = format!("{}/sandboxes/{}/audit", self.version_prefix(), resource_path(id));
         if let Some(kind) = &opts.kind {
@@ -1578,6 +1912,9 @@ impl Client {
                 let mut builder = self.inner.request(hop_method.clone(), hop_url);
                 if !strip_credentials {
                     builder = builder.bearer_auth(&self.pat_token);
+                        if let Some(team) = &self.team {
+                            builder = builder.header(TEAM_HEADER, team);
+                        }
                 }
                 builder
             },
@@ -1603,6 +1940,9 @@ impl Client {
                 let mut builder = self.inner.request(hop_method.clone(), hop_url);
                 if !strip_credentials {
                     builder = builder.bearer_auth(&self.pat_token);
+                        if let Some(team) = &self.team {
+                            builder = builder.header(TEAM_HEADER, team);
+                        }
                 }
                 builder
             },
@@ -1623,6 +1963,7 @@ impl Client {
         let (done_tx, done_rx) = mpsc::channel();
         let api_url = self.api_url.clone();
         let pat_token = self.pat_token.clone();
+        let team = self.team.clone();
         let api_version = self.api_version;
         let sandbox_id = id.to_string();
         let session_id = session_id.to_string();
@@ -1634,6 +1975,7 @@ impl Client {
                     api_url,
                     api_version,
                     pat_token,
+                    team,
                     sandbox_id,
                     session_id,
                     options,
@@ -1656,13 +1998,14 @@ impl Client {
         options: ExecStreamOptions,
     ) -> Result<ExecStreamHandle, Error> {
         if options.command.trim().is_empty() {
-            return Err(Error::Api("command is required".to_string()));
+            return Err(Error::Client("command is required".to_string()));
         }
 
         let (control_tx, control_rx) = unbounded_channel();
         let (done_tx, done_rx) = mpsc::channel();
         let api_url = self.api_url.clone();
         let pat_token = self.pat_token.clone();
+        let team = self.team.clone();
         let api_version = self.api_version;
         let sandbox_id = id.to_string();
 
@@ -1673,6 +2016,7 @@ impl Client {
                     api_url,
                     api_version,
                     pat_token,
+                    team,
                     sandbox_id,
                     options,
                     control_rx,
@@ -1739,6 +2083,9 @@ impl Client {
                 let mut builder = self.inner.request(hop_method.clone(), hop_url);
                 if !strip_credentials {
                     builder = builder.bearer_auth(&self.pat_token);
+                        if let Some(team) = &self.team {
+                            builder = builder.header(TEAM_HEADER, team);
+                        }
                 }
                 builder
             },
@@ -1782,7 +2129,7 @@ impl Client {
             "http" | "" => Ok(ExposeResult::Http {
                 url: wire.public_url,
             }),
-            other => Err(Error::Api(format!("unknown expose protocol: {}", other))),
+            other => Err(Error::Client(format!("unknown expose protocol: {}", other))),
         }
     }
 
@@ -1902,7 +2249,7 @@ impl Client {
         F: Fn(&Method, &str, bool, bool) -> reqwest::blocking::RequestBuilder,
     {
         let origin = reqwest::Url::parse(initial_url)
-            .map_err(|err| Error::Api(format!("invalid request URL: {}", err)))?;
+            .map_err(|err| Error::Client(format!("invalid request URL: {}", err)))?;
         let mut url = origin.clone();
         let mut method = method;
         let mut with_body = has_body;
@@ -1925,13 +2272,13 @@ impl Client {
             let location = match response.headers().get(reqwest::header::LOCATION) {
                 Some(value) => value
                     .to_str()
-                    .map_err(|_| Error::Api("redirect Location is not a valid URL".to_string()))?
+                    .map_err(|_| Error::Client("redirect Location is not a valid URL".to_string()))?
                     .to_string(),
                 None => return Ok(response),
             };
             let next = url
                 .join(&location)
-                .map_err(|err| Error::Api(format!("invalid redirect location: {}", err)))?;
+                .map_err(|err| Error::Client(format!("invalid redirect location: {}", err)))?;
             if is_cross_origin(&origin, &next)
                 && matches!(
                     status,
@@ -1940,7 +2287,7 @@ impl Client {
                 )
                 && with_body
             {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "refusing to follow cross-origin redirect with a request body".to_string(),
                 ));
             }
@@ -1957,7 +2304,7 @@ impl Client {
             url = next;
         }
 
-        Err(Error::Api(format!(
+        Err(Error::Client(format!(
             "stopped after {} redirects",
             MAX_REDIRECTS
         )))
@@ -1982,6 +2329,27 @@ impl Client {
         self.send_json(method, path, payload, RetryPolicy::Idempotent)
     }
 
+    /// How long [`Client::send_json`] sleeps before re-sending. `attempt`
+    /// counts from 0, `retry_after` is [`retry_after_hint`]'s result and `r`
+    /// is uniform in [0, 1). Without a usable header it is the exponential
+    /// backoff ±25%; with one, see [`wait_for_hint`].
+    fn retry_wait(&self, attempt: i32, retry_after: Option<&str>, now: SystemTime, r: f64) -> Duration {
+        let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
+        let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
+        let factor = 1u64.checked_shl(attempt.max(0) as u32).unwrap_or(u64::MAX);
+        let backoff = Duration::from_millis(base_delay.saturating_mul(factor).min(max_delay));
+        let limit = self
+            .retry_config
+            .max_retry_after_ms
+            .unwrap_or(DEFAULT_MAX_RETRY_AFTER_MS);
+        if limit > 0 {
+            if let Some(hint) = retry_after.and_then(|value| parse_retry_after(value, now)) {
+                return wait_for_hint(hint, backoff, Duration::from_millis(limit), r);
+            }
+        }
+        backoff.mul_f64(0.75 + 0.5 * r)
+    }
+
     fn send_json<T: Serialize, U: DeserializeOwned>(
         &self,
         method: Method,
@@ -1989,12 +2357,24 @@ impl Client {
         payload: Option<&T>,
         policy: RetryPolicy,
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        self.send_json_with_headers(method, path, payload, policy, &[])
+    }
+
+    /// [`Client::send_json`] with extra request headers, set on every
+    /// attempt so a retry carries them unchanged.
+    fn send_json_with_headers<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+        policy: RetryPolicy,
+        headers: &[(&str, &str)],
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
-        let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
-        let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
 
         let mut attempt = 0;
         loop {
+            let mut retry_after = None;
             let url = self.full_url(path);
             let send_result = self.send_following_redirects(
                 &url,
@@ -2004,11 +2384,17 @@ impl Client {
                     let mut builder = self.inner.request(hop_method.clone(), hop_url);
                     if !strip_credentials {
                         builder = builder.bearer_auth(&self.pat_token);
+                        if let Some(team) = &self.team {
+                            builder = builder.header(TEAM_HEADER, team);
+                        }
                     }
                     if with_body {
                         if let Some(body) = payload {
                             builder = builder.json(body);
                         }
+                    }
+                    for (name, value) in headers {
+                        builder = builder.header(*name, *value);
                     }
                     builder
                 },
@@ -2017,7 +2403,9 @@ impl Client {
             match send_result {
                 Ok(response) => {
                     if attempt < max_retries && policy.retries_status(response.status()) {
-                        // Fall through to retry logic
+                        // Fall through to retry logic; dropping the response
+                        // frees the connection before the wait.
+                        retry_after = retry_after_hint(&response);
                     } else {
                         let response = self.handle_response(response)?;
                         let headers = response.headers().clone();
@@ -2037,13 +2425,28 @@ impl Client {
                 Err(err) => return Err(err),
             }
 
-            let delay_ms = std::cmp::min(base_delay * (1 << attempt), max_delay);
-            // Add jitter
-            let jitter = 1.0 + (rand::random::<f64>() - 0.5) * 0.5;
-            let sleep_duration = std::time::Duration::from_millis((delay_ms as f64 * jitter) as u64);
-            std::thread::sleep(sleep_duration);
+            // A 429 or 503 waits as long as its Retry-After asks, within
+            // max_retry_after_ms. The client is blocking, so nothing can
+            // interrupt this sleep; the cap is what bounds it.
+            std::thread::sleep(self.retry_wait(
+                attempt,
+                retry_after.as_deref(),
+                SystemTime::now(),
+                rand::random::<f64>(),
+            ));
             attempt += 1;
         }
+    }
+
+    fn do_multipart(&self, path: &str, form: Form) -> Result<(), Error> {
+        let url = self.full_url(path);
+        let response = self
+            .inner
+            .post(&url)
+            .authorize(self)
+            .multipart(form)
+            .send()?;
+        self.handle_response(response).map(|_| ())
     }
 
     fn handle_response(
@@ -2054,13 +2457,17 @@ impl Client {
             Ok(response)
         } else {
             let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(String::from);
             let body = response.text().unwrap_or_default();
-            if let Ok(value) = serde_json::from_str::<Value>(&body) {
-                if let Some(message) = value.get("error").and_then(|entry| entry.as_str()) {
-                    return Err(Error::Api(format!("{}: {}", status, message)));
-                }
-            }
-            Err(Error::Api(format!("{}: {}", status, body)))
+            Err(Error::Api(ApiError::from_response(
+                status,
+                retry_after.as_deref(),
+                &body,
+            )))
         }
     }
 }
@@ -2069,6 +2476,7 @@ async fn run_exec_stream(
     api_url: String,
     api_version: ApiVersion,
     pat_token: String,
+    team: Option<String>,
     sandbox_id: String,
     options: ExecStreamOptions,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
@@ -2081,12 +2489,7 @@ async fn run_exec_stream(
             urlencoding::encode(&sandbox_id)
         ),
     )?;
-    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
-    request.headers_mut().insert(
-        http::header::AUTHORIZATION,
-        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
-            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
-    );
+    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
 
     let (stream, _) = connect_async(request)
         .await
@@ -2148,10 +2551,10 @@ async fn run_exec_stream(
                             if let Some(callback) = &options.on_error {
                                 callback(message.clone());
                             }
-                            return Err(Error::Api(message));
+                            return Err(Error::Client(message));
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => return Err(Error::Api("stream closed before exit".to_string())),
+                    Some(Ok(Message::Close(_))) | None => return Err(Error::Client("stream closed before exit".to_string())),
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(Error::WebSocket(err)),
                 }
@@ -2164,6 +2567,7 @@ async fn run_session_attach(
     api_url: String,
     api_version: ApiVersion,
     pat_token: String,
+    team: Option<String>,
     sandbox_id: String,
     session_id: String,
     options: SessionAttachOptions,
@@ -2178,12 +2582,7 @@ async fn run_session_attach(
             urlencoding::encode(&session_id)
         ),
     )?;
-    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
-    request.headers_mut().insert(
-        http::header::AUTHORIZATION,
-        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
-            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
-    );
+    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
 
     let (stream, _) = connect_async(request)
         .await
@@ -2249,10 +2648,10 @@ async fn run_session_attach(
                             if let Some(callback) = &options.on_error {
                                 callback(message.clone());
                             }
-                            return Err(Error::Api(message));
+                            return Err(Error::Client(message));
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => return Err(Error::Api("session stream closed before exit".to_string())),
+                    Some(Ok(Message::Close(_))) | None => return Err(Error::Client("session stream closed before exit".to_string())),
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(Error::WebSocket(err)),
                 }
@@ -2319,12 +2718,12 @@ fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
             let body_str = String::from_utf8_lossy(&body);
             let trimmed = body_str.trim();
             if trimmed.is_empty() {
-                Error::Api(format!(
+                Error::Client(format!(
                     "{} websocket handshake failed: status={}",
                     label, status
                 ))
             } else {
-                Error::Api(format!(
+                Error::Client(format!(
                     "{} websocket handshake failed: status={}, body={:?}",
                     label, status, trimmed
                 ))
@@ -2336,7 +2735,7 @@ fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
 
 fn websocket_url(base_url: &str, path: &str) -> Result<String, Error> {
     let mut parsed = reqwest::Url::parse(&format!("{}{}", base_url.trim_end_matches('/'), path))
-        .map_err(|err| Error::Api(format!("invalid API URL: {}", err)))?;
+        .map_err(|err| Error::Client(format!("invalid API URL: {}", err)))?;
     match parsed.scheme() {
         "http" => {
             let _ = parsed.set_scheme("ws");
@@ -2345,7 +2744,7 @@ fn websocket_url(base_url: &str, path: &str) -> Result<String, Error> {
             let _ = parsed.set_scheme("wss");
         }
         "ws" | "wss" => {}
-        other => return Err(Error::Api(format!("unsupported API URL scheme: {}", other))),
+        other => return Err(Error::Client(format!("unsupported API URL scheme: {}", other))),
     }
     Ok(parsed.to_string())
 }
@@ -2369,11 +2768,23 @@ mod tests {
         content_type: &str,
         body: Vec<u8>,
     ) -> (String, std::sync::mpsc::Receiver<String>) {
+        spawn_response_server_with_headers(status_line, content_type, "", body)
+    }
+
+    /// [`spawn_response_server`] with `extra_headers` (each line ending in
+    /// `\r\n`) added to the response head.
+    fn spawn_response_server_with_headers(
+        status_line: &str,
+        content_type: &str,
+        extra_headers: &str,
+        body: Vec<u8>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         let (request_tx, request_rx) = std::sync::mpsc::channel();
         let status_line = status_line.to_string();
         let content_type = content_type.to_string();
+        let extra_headers = extra_headers.to_string();
 
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("server should accept");
@@ -2381,8 +2792,9 @@ mod tests {
             request_tx.send(request).expect("request should be sent");
 
             let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {}\r\n{}Content-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 status_line,
+                extra_headers,
                 content_type,
                 body.len(),
             );
@@ -2405,6 +2817,11 @@ mod tests {
             body: String,
             delay: Duration,
         },
+        /// A refusal carrying a `Retry-After` header (none when `None`).
+        Paced {
+            status: &'static str,
+            retry_after: Option<String>,
+        },
     }
 
     impl Reply {
@@ -2425,30 +2842,54 @@ mod tests {
     /// read. The last reply repeats for every further connection, so a client
     /// that re-sends more than expected is counted rather than refused.
     fn spawn_scripted_server(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
+        let (url, hits, _) = spawn_recording_scripted_server(script);
+        (url, hits)
+    }
+
+    /// [`spawn_scripted_server`] that also keeps every raw request it read.
+    fn spawn_recording_scripted_server(
+        script: Vec<Reply>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         let hits = Arc::new(AtomicUsize::new(0));
         let server_hits = hits.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
         thread::spawn(move || {
             for (i, stream) in listener.incoming().enumerate() {
                 let Ok(mut stream) = stream else { continue };
-                let _ = read_http_request(&mut stream);
+                let request = read_http_request(&mut stream);
+                server_requests.lock().expect("requests lock").push(request);
                 server_hits.fetch_add(1, Ordering::SeqCst);
-                if let Reply::Json { status, body, delay } = &script[i.min(script.len() - 1)] {
-                    thread::sleep(*delay);
-                    let head = format!(
-                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        status,
-                        body.len()
-                    );
-                    // The client may have given up already; that is the point
-                    // of some scripts, so a failed write is not an error.
-                    let _ = stream.write_all(head.as_bytes());
-                    let _ = stream.write_all(body.as_bytes());
-                }
+                let paced_body = r#"{"error":"busy","code":"overloaded"}"#.to_string();
+                let (status, body, delay, extra) = match &script[i.min(script.len() - 1)] {
+                    Reply::Hangup => continue,
+                    Reply::Json { status, body, delay } => (*status, body, *delay, String::new()),
+                    Reply::Paced { status, retry_after } => (
+                        *status,
+                        &paced_body,
+                        Duration::ZERO,
+                        retry_after
+                            .as_ref()
+                            .map(|v| format!("Retry-After: {}\r\n", v))
+                            .unwrap_or_default(),
+                    ),
+                };
+                thread::sleep(delay);
+                let head = format!(
+                    "HTTP/1.1 {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    extra,
+                    body.len()
+                );
+                // The client may have given up already; that is the point
+                // of some scripts, so a failed write is not an error.
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
             }
         });
-        (format!("http://{}", addr), hits)
+        (format!("http://{}", addr), hits, requests)
     }
 
     /// Retries in milliseconds, so a test that counts re-sends stays fast.
@@ -2461,7 +2902,9 @@ mod tests {
                     max_retries: Some(3),
                     base_delay_ms: Some(1),
                     max_delay_ms: Some(5),
+                    max_retry_after_ms: None,
                 }),
+                ..Default::default()
             },
             ApiVersion::V1,
         )
@@ -2665,6 +3108,7 @@ mod tests {
             tenant_id: None,
             name: None,
             tags: None,
+            idempotency_key: None,
         }
     }
 
@@ -2874,7 +3318,9 @@ mod tests {
                     max_retries: Some(3),
                     base_delay_ms: Some(40),
                     max_delay_ms: Some(1000),
+                    max_retry_after_ms: None,
                 }),
+                ..Default::default()
             },
             ApiVersion::V1,
         )
@@ -2903,6 +3349,231 @@ mod tests {
             .expect("get should retry to success");
         assert_eq!(sandbox.data.id, "sb-1");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// Formats `t` as an IMF-fixdate, the HTTP-date form servers send.
+    fn format_imf_fixdate(t: SystemTime) -> String {
+        const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let secs = t.duration_since(UNIX_EPOCH).expect("after 1970").as_secs() as i64;
+        let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+        // Howard Hinnant's civil_from_days.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+        format!(
+            "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+            WEEKDAYS[days.rem_euclid(7) as usize],
+            day,
+            MONTHS[(month - 1) as usize],
+            year,
+            rem / 3_600,
+            rem % 3_600 / 60,
+            rem % 60
+        )
+    }
+
+    #[test]
+    fn parse_retry_after_reads_seconds_and_http_dates() {
+        // Mon, 02 Nov 2026 12:00:00 GMT
+        let now = UNIX_EPOCH + Duration::from_secs(1_793_620_800);
+        let secs = |s: u64| Some(Duration::from_secs(s));
+        for (value, want) in [
+            ("", None),
+            ("   ", None),
+            ("3", secs(3)),
+            (" 3 ", secs(3)),
+            ("0", secs(0)),
+            ("-1", None),
+            ("+3", None),
+            ("1.5", None),
+            ("soon", None),
+            ("99999999999999999999", secs(MAX_RETRY_AFTER_SECS)),
+            ("Mon, 02 Nov 2026 12:00:07 GMT", secs(7)),
+            ("Mon, 02 Nov 2026 11:59:00 GMT", secs(0)),
+            ("Thu, 01 Jan 1960 00:00:00 GMT", secs(0)),
+            ("Mon, 32 Nov 2026 12:00:07 GMT", None),
+            ("Mon, 02 Foo 2026 12:00:07 GMT", None),
+            ("Mon, 02 Nov 2026 12:00:07 UTC", None),
+            ("Monday, 02-Nov-26 12:00:07 GMT", None),
+            ("Mon, 02 Nov 2026 12:00:07 GMT\u{e9}", None),
+        ] {
+            assert_eq!(parse_retry_after(value, now), want, "{:?}", value);
+        }
+        assert_eq!(format_imf_fixdate(now), "Mon, 02 Nov 2026 12:00:00 GMT");
+        // Round trip across leap years and month ends.
+        for secs in [0u64, 951_782_400, 1_709_208_000, 1_793_620_807, 4_102_444_799] {
+            let t = UNIX_EPOCH + Duration::from_secs(secs);
+            assert_eq!(parse_imf_fixdate(&format_imf_fixdate(t)), Some(t), "{}", secs);
+        }
+    }
+
+    #[test]
+    fn retry_wait_honours_retry_after_between_backoff_and_cap() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_793_620_800);
+        let ms = Duration::from_millis;
+        let client = |limit: u64| {
+            Client::with_config(
+                ClientConfig {
+                    api_url: Some("http://unused".to_string()),
+                    pat_token: Some("pat-token".to_string()),
+                    retry: Some(RetryConfig {
+                        max_retries: Some(3),
+                        base_delay_ms: Some(100),
+                        max_delay_ms: Some(1000),
+                        max_retry_after_ms: Some(limit),
+                    }),
+                    ..Default::default()
+                },
+                ApiVersion::V1,
+            )
+            .expect("client should build")
+        };
+        for (name, limit, attempt, header, r, want) in [
+            ("no header: backoff minus a quarter", 2000, 0, None, 0.0, ms(75)),
+            ("no header: backoff plus a quarter", 2000, 0, None, 1.0, ms(125)),
+            ("no header: doubles per attempt", 2000, 2, None, 0.5, ms(400)),
+            ("no header: capped by max_delay_ms", 2000, 5, None, 0.5, ms(1000)),
+            ("no header: huge attempt saturates", 2000, 200, None, 0.5, ms(1000)),
+            ("malformed header falls back", 2000, 0, Some("soon"), 0.0, ms(75)),
+            ("seconds: never sooner than asked", 2000, 0, Some("1"), 0.0, ms(1000)),
+            ("seconds: at most a fifth later", 2000, 0, Some("1"), 1.0, ms(1200)),
+            ("HTTP date", 2000, 0, Some("Mon, 02 Nov 2026 12:00:01 GMT"), 0.0, ms(1000)),
+            ("backoff is the floor", 2000, 2, Some("0"), 0.0, ms(400)),
+            ("spread stops at the cap", 1100, 0, Some("1"), 1.0, ms(1100)),
+            ("long ask is cut to the cap", 2000, 0, Some("120"), 0.0, ms(2000)),
+            ("long ask spreads below the cap", 2000, 0, Some("120"), 1.0, ms(1600)),
+            ("cap 0 ignores the header", 0, 0, Some("120"), 0.0, ms(75)),
+        ] {
+            assert_eq!(client(limit).retry_wait(attempt, header, now, r), want, "{}", name);
+        }
+        assert_eq!(RetryConfig::default().max_retry_after_ms, Some(DEFAULT_MAX_RETRY_AFTER_MS));
+    }
+
+    fn paced(status: &'static str, retry_after: Option<&str>) -> Reply {
+        Reply::Paced { status, retry_after: retry_after.map(String::from) }
+    }
+
+    /// Runs one call through each retry policy: get is idempotent, exec is
+    /// re-sent only after a refusal.
+    fn get_or_exec(client: &Client, exec: bool) -> Result<(), Error> {
+        if exec {
+            client.exec("sb-1", ExecRequest::from("true")).map(|_| ())
+        } else {
+            client.get("sb-1").map(|_| ())
+        }
+    }
+
+    // With a 1 ms backoff, only the server's Retry-After explains a 1 s wait.
+    // The cases run side by side so the test takes about 2 s.
+    #[test]
+    fn retry_waits_out_retry_after_on_429_and_503() {
+        // Whole-second precision: the date asks for 1-2 s.
+        let in_two_seconds = format_imf_fixdate(SystemTime::now() + Duration::from_secs(2));
+        let cases = [
+            ("429 seconds", "429 Too Many Requests", "1".to_string(), 1000, 2000),
+            ("503 seconds", "503 Service Unavailable", "1".to_string(), 1000, 2000),
+            ("503 HTTP date", "503 Service Unavailable", in_two_seconds, 1000, 3000),
+        ];
+        let runs: Vec<_> = cases
+            .into_iter()
+            .flat_map(|(name, status, header, low, high)| {
+                [false, true].map(move |exec| {
+                    let header = header.clone();
+                    thread::spawn(move || {
+                        let ok = if exec { exec_ok_json() } else { named_sandbox_json("sb-1", "web").to_string() };
+                        let (url, hits) = spawn_scripted_server(vec![paced(status, Some(&header)), Reply::ok(ok)]);
+                        let started = std::time::Instant::now();
+                        let result = get_or_exec(&fast_retry_client(&url), exec);
+                        let elapsed = started.elapsed();
+                        assert!(result.is_ok(), "{} exec={}: {:?}", name, exec, result.err());
+                        assert_eq!(hits.load(Ordering::SeqCst), 2, "{} exec={}", name, exec);
+                        assert!(
+                            elapsed >= Duration::from_millis(low) && elapsed <= Duration::from_millis(high),
+                            "{} exec={}: retried after {:?}",
+                            name,
+                            exec,
+                            elapsed
+                        );
+                    })
+                })
+            })
+            .collect();
+        for run in runs {
+            run.join().expect("case should pass");
+        }
+    }
+
+    #[test]
+    fn retry_after_is_capped() {
+        let ok = named_sandbox_json("sb-1", "web").to_string();
+        let (url, hits) = spawn_scripted_server(vec![paced("503 Service Unavailable", Some("120")), Reply::ok(ok)]);
+        let client = Client::with_config(
+            ClientConfig {
+                api_url: Some(url),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig { max_retry_after_ms: Some(100), ..fast_retry_client("http://unused").retry_config }),
+                ..Default::default()
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build");
+        let started = std::time::Instant::now();
+        client.get("sb-1").expect("get should retry to success");
+        let elapsed = started.elapsed();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(
+            elapsed >= Duration::from_millis(80) && elapsed <= Duration::from_secs(1),
+            "Retry-After: 120 with a 100 ms cap waited {:?}",
+            elapsed
+        );
+    }
+
+    // A missing or malformed header, or one on a status that is a hop's
+    // rather than the server's pacing (421/502/504), keeps the 1 ms backoff.
+    #[test]
+    fn retry_without_usable_retry_after_uses_backoff() {
+        for (status, header) in [
+            ("503 Service Unavailable", None),
+            ("429 Too Many Requests", Some("soon")),
+            ("503 Service Unavailable", Some("-1")),
+            ("421 Misdirected Request", Some("120")),
+            ("502 Bad Gateway", Some("120")),
+            ("504 Gateway Timeout", Some("120")),
+        ] {
+            let ok = named_sandbox_json("sb-1", "web").to_string();
+            let (url, hits) = spawn_scripted_server(vec![paced(status, header), Reply::ok(ok)]);
+            let started = std::time::Instant::now();
+            fast_retry_client(&url).get("sb-1").expect("get should retry to success");
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{} {:?}", status, header);
+            assert!(started.elapsed() < Duration::from_millis(500), "{} {:?}: {:?}", status, header, started.elapsed());
+        }
+    }
+
+    #[test]
+    fn retry_after_keeps_retry_budget_and_statuses() {
+        let (url, hits) = spawn_scripted_server(vec![paced("503 Service Unavailable", Some("0"))]);
+        let err = fast_retry_client(&url).get("sb-1").expect_err("every attempt is refused");
+        assert!(err.to_string().contains("503"), "unexpected error: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 4, "1 + 3 retries");
+
+        for status in ["400 Bad Request", "404 Not Found", "500 Internal Server Error"] {
+            let (url, hits) = spawn_scripted_server(vec![paced(status, Some("1"))]);
+            assert!(fast_retry_client(&url).get("sb-1").is_err(), "{}", status);
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "{} is not retried", status);
+        }
+
+        let (url, hits) = spawn_scripted_server(vec![paced("502 Bad Gateway", Some("1"))]);
+        assert!(get_or_exec(&fast_retry_client(&url), true).is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "exec does not re-send a 502");
     }
 
     // reqwest's 30 s default total timeout failed every exec longer than
@@ -4511,13 +5182,13 @@ mod tests {
             let (url, _rx) = spawn_json_server(reply.to_string());
             let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
             match client.get_by_name("agent") {
-                Err(Error::Api(msg)) => assert!(msg.contains("does not support sandbox name lookup"), "{}", msg),
+                Err(Error::Client(msg)) => assert!(msg.contains("does not support sandbox name lookup"), "{}", msg),
                 other => panic!("expected unsupported error, got {:?}", other.map(|s| s.map(|s| s.data.id))),
             }
         }
 
         let client = Client::new(Some("http://127.0.0.1:1"), Some("pat-token")).expect("client should build");
-        assert!(matches!(client.get_by_name("  "), Err(Error::Api(_))));
+        assert!(matches!(client.get_by_name("  "), Err(Error::Client(_))));
     }
 
     #[test]
@@ -4702,7 +5373,7 @@ mod tests {
             Client::new(Some(&format!("http://{}", addr)), Some("pat-token")).expect("client");
         let err = client.list().expect_err("partial list must fail");
         match err {
-            Error::Api(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
+            Error::Client(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
             other => panic!("unexpected error: {other:?}"),
         }
     }
@@ -4874,7 +5545,7 @@ mod tests {
 
     // 409 Conflict is the documented response when the hostname is already
     // bound to a different sandbox. We just need to confirm it surfaces as an
-    // Api error carrying the server-supplied JSON `error` field — that's the
+    // Status error carrying the server-supplied JSON `error` field — that's the
     // contract handle_response promises for any 4xx.
     #[test]
     fn add_custom_domain_surfaces_409_conflict() {
@@ -5090,7 +5761,7 @@ mod tests {
             .create_template(CreateTemplateOptions::default())
             .expect_err("empty image must be rejected");
         match err {
-            Error::Api(msg) => assert!(msg.contains("image is required"), "msg = {}", msg),
+            Error::Client(msg) => assert!(msg.contains("image is required"), "msg = {}", msg),
             other => panic!("unexpected error: {:?}", other),
         }
     }
@@ -5148,7 +5819,7 @@ mod tests {
             })
             .expect_err("empty module_ref must be rejected");
         match err {
-            Error::Api(msg) => assert!(msg.contains("module_ref is required"), "msg = {}", msg),
+            Error::Client(msg) => assert!(msg.contains("module_ref is required"), "msg = {}", msg),
             other => panic!("unexpected error: {:?}", other),
         }
     }
@@ -5179,7 +5850,10 @@ mod tests {
             .rebuild_template("tpl-pending")
             .expect_err("412 must surface as error");
         match err {
-            Error::Api(msg) => assert!(msg.contains("not eligible"), "msg = {}", msg),
+            Error::Api(api) => {
+                assert_eq!(api.status(), 412);
+                assert!(api.message().contains("not eligible"), "msg = {}", api.message());
+            }
             other => panic!("unexpected error: {:?}", other),
         }
     }
@@ -5232,6 +5906,516 @@ mod tests {
 
         assert!(dns.records.is_empty());
         assert_eq!(dns.target.hostname.as_deref(), Some("ingress.example.com"));
+    }
+
+    fn env_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    // SB_API_TOKEN is an alias of SB_PAT_TOKEN; SB_PAT_TOKEN wins when both
+    // are set, and an explicit pat_token beats both.
+    #[test]
+    fn resolve_token_prefers_option_then_pat_then_alias() {
+        let cases: Vec<(&str, Option<&str>, Vec<(&str, &str)>, Option<&str>)> = vec![
+            ("pat only", None, vec![("SB_PAT_TOKEN", "pat")], Some("pat")),
+            ("alias only", None, vec![("SB_API_TOKEN", "avm_alias")], Some("avm_alias")),
+            ("pat beats alias", None, vec![("SB_PAT_TOKEN", "pat"), ("SB_API_TOKEN", "avm_alias")], Some("pat")),
+            ("blank pat falls through", None, vec![("SB_PAT_TOKEN", "  "), ("SB_API_TOKEN", "avm_alias")], Some("avm_alias")),
+            ("option beats both", Some("opt"), vec![("SB_PAT_TOKEN", "pat"), ("SB_API_TOKEN", "avm_alias")], Some("opt")),
+            ("blank option falls through", Some(" "), vec![("SB_API_TOKEN", "avm_alias")], Some("avm_alias")),
+            ("nothing set", None, vec![], None),
+        ];
+        for (name, explicit, env, want) in cases {
+            let got = resolve_token(explicit.map(String::from), env_from(&env));
+            assert_eq!(got.as_deref(), want, "{}", name);
+        }
+    }
+
+    #[test]
+    fn resolve_team_trims_and_falls_back_to_sb_team() {
+        let cases: Vec<(&str, Option<&str>, Vec<(&str, &str)>, Option<&str>)> = vec![
+            ("SB_TEAM", None, vec![("SB_TEAM", " payments ")], Some("payments")),
+            ("option beats SB_TEAM", Some("ml"), vec![("SB_TEAM", "payments")], Some("ml")),
+            ("blank option falls through", Some("  "), vec![("SB_TEAM", "payments")], Some("payments")),
+            ("blank SB_TEAM is no header", None, vec![("SB_TEAM", "   ")], None),
+            ("nothing set", None, vec![], None),
+        ];
+        for (name, explicit, env, want) in cases {
+            let got = resolve_team(explicit.map(String::from), env_from(&env));
+            assert_eq!(got.as_deref(), want, "{}", name);
+        }
+    }
+
+    #[test]
+    fn missing_token_error_names_the_alias() {
+        assert!(Error::MissingToken.to_string().contains("SB_API_TOKEN"));
+    }
+
+    /// Serves `count` requests, answering each by its request line from
+    /// `routes` (404 otherwise), and hands back every raw request.
+    fn spawn_route_server(
+        routes: Vec<(&'static str, &'static str, String)>,
+        count: usize,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().expect("server should accept");
+                let request = read_http_request(&mut stream);
+                let line = request.lines().next().unwrap_or_default().to_string();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(prefix, _, _)| line.starts_with(prefix))
+                    .map(|(_, status, body)| (*status, body.clone()))
+                    .unwrap_or(("404 Not Found", r#"{"error":"unexpected"}"#.to_string()));
+                let head = if status.starts_with("204") {
+                    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        body
+                    )
+                };
+                stream.write_all(head.as_bytes()).expect("response should write");
+                request_tx.send(request).expect("request should be sent");
+            }
+        });
+        (format!("http://{}", addr), request_rx)
+    }
+
+    fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    }
+
+    fn team_client(url: &str, team: Option<&str>) -> Client {
+        let mut client = Client::with_config(
+            ClientConfig {
+                api_url: Some(url.to_string()),
+                pat_token: Some("avm_admin".to_string()),
+                team: team.map(String::from),
+                retry: Some(RetryConfig { max_retries: Some(0), base_delay_ms: Some(1), max_delay_ms: Some(1), max_retry_after_ms: None }),
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build");
+        // Pin the team so an SB_TEAM in the test environment can't leak in.
+        client.team = team.map(String::from);
+        client
+    }
+
+    #[test]
+    fn whoami_and_tokens_round_trip_with_the_team_header() {
+        let token = serde_json::json!({
+            "id": "tok_abc123def456",
+            "name": "ci",
+            "role": "runner",
+            "team": "payments",
+            "created_by": "operator",
+            "created_at": "2026-10-17T09:00:00Z",
+            "expires_at": "2027-01-02T03:04:05Z",
+            "expired": false
+        });
+        let mut created = token.clone();
+        created["token"] = serde_json::json!("avm_secret");
+        let mut expired = token.clone();
+        expired["expired"] = serde_json::json!(true);
+        let routes = vec![
+            (
+                "GET /v1/whoami ",
+                "200 OK",
+                serde_json::json!({
+                    "principal": {"kind": "token", "id": "tok_abc123def456", "name": "ci"},
+                    "role": "runner",
+                    "team": "payments",
+                    "expires_at": "2027-01-02T03:04:05Z"
+                })
+                .to_string(),
+            ),
+            ("POST /v1/tokens ", "201 Created", created.to_string()),
+            ("GET /v1/tokens ", "200 OK", serde_json::json!({ "tokens": [expired] }).to_string()),
+            ("DELETE /v1/tokens/", "204 No Content", String::new()),
+        ];
+        let (url, request_rx) = spawn_route_server(routes, 6);
+        let client = team_client(&url, Some("ops"));
+
+        let who = client.whoami().expect("whoami should succeed");
+        assert_eq!(who.principal.id, "tok_abc123def456");
+        assert_eq!(who.principal.name, "ci");
+        assert_eq!(who.role, "runner");
+        assert_eq!(who.team.as_deref(), Some("payments"));
+        assert_eq!(who.expires_at.as_deref(), Some("2027-01-02T03:04:05Z"));
+
+        let made = client
+            .tokens()
+            .create(CreateApiTokenOptions {
+                name: "ci".into(),
+                role: "runner".into(),
+                team: "payments".into(),
+                expires_in: "90d".into(),
+            })
+            .expect("create should succeed");
+        assert_eq!(made.token, "avm_secret");
+        assert_eq!(made.api_token.id, "tok_abc123def456");
+        assert_eq!(made.api_token.created_by, "operator");
+
+        let list = client.tokens().list().expect("list should succeed");
+        assert_eq!(list.tokens.len(), 1);
+        assert!(list.tokens[0].expired);
+
+        // A repeat revoke is another 204; the id is one escaped path segment.
+        client.tokens().revoke("tok_abc123def456").expect("revoke should succeed");
+        client.tokens().revoke(" tok_abc123def456 ").expect("repeat revoke should succeed");
+        client.tokens().revoke("../sandboxes").expect("revoke should succeed");
+        assert!(client.tokens().revoke("  ").is_err(), "a blank id must fail before sending");
+
+        let requests: Vec<String> = (0..6).map(|_| request_rx.recv().expect("request")).collect();
+        let lines: Vec<&str> = requests.iter().map(|r| r.lines().next().unwrap_or_default()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "GET /v1/whoami HTTP/1.1",
+                "POST /v1/tokens HTTP/1.1",
+                "GET /v1/tokens HTTP/1.1",
+                "DELETE /v1/tokens/tok_abc123def456 HTTP/1.1",
+                "DELETE /v1/tokens/tok_abc123def456 HTTP/1.1",
+                "DELETE /v1/tokens/..%2Fsandboxes HTTP/1.1",
+            ]
+        );
+        let body = requests[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+        let body: Value = serde_json::from_str(body).expect("create body is JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({"name": "ci", "role": "runner", "team": "payments", "expires_in": "90d"})
+        );
+        for request in &requests {
+            assert_eq!(header_value(request, TEAM_HEADER), Some("ops"), "{}", request);
+            assert_eq!(header_value(request, "authorization"), Some("Bearer avm_admin"));
+        }
+    }
+
+    #[test]
+    fn no_team_header_without_a_team() {
+        let (url, request_rx) = spawn_route_server(
+            vec![("GET /v1/tokens ", "200 OK", r#"{"tokens":null}"#.to_string())],
+            1,
+        );
+        let client = team_client(&url, None);
+        let list = client.tokens().list().expect("list should succeed");
+        assert!(list.tokens.is_empty(), "a null list decodes as empty");
+        let request = request_rx.recv().expect("request");
+        assert_eq!(header_value(&request, TEAM_HEADER), None, "{}", request);
+    }
+
+    #[test]
+    fn token_refusal_keeps_the_server_message() {
+        let (url, _request_rx) = spawn_route_server(
+            vec![(
+                "POST /v1/tokens ",
+                "403 Forbidden",
+                r#"{"error":"role viewer on team payments cannot token.write","required_permission":"token.write","role":"viewer"}"#.to_string(),
+            )],
+            1,
+        );
+        let err = team_client(&url, None)
+            .tokens()
+            .create(CreateApiTokenOptions::default())
+            .expect_err("a viewer cannot create tokens");
+        assert!(err.to_string().contains("cannot token.write"), "{}", err);
+    }
+
+    #[test]
+    fn websocket_request_carries_the_team() {
+        let request = websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", Some("payments"))
+            .expect("request should build");
+        assert_eq!(request.headers().get("authorization").unwrap(), "Bearer pat");
+        assert_eq!(request.headers().get(TEAM_HEADER).unwrap(), "payments");
+
+        let bare = websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", None)
+            .expect("request should build");
+        assert!(bare.headers().get(TEAM_HEADER).is_none());
+
+        assert!(websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", Some("bad\nteam")).is_err());
+    }
+
+    fn no_retry_client(url: &str) -> Client {
+        Client::with_config(
+            ClientConfig {
+                api_url: Some(url.to_string()),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig {
+                    max_retries: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build")
+    }
+
+    // Every HTTP error response is Error::Api(ApiError) carrying the status,
+    // the server's stable code and its Retry-After; Display keeps the
+    // "API error: <status>: <message>" text of the old Error::Api(String).
+    #[test]
+    fn http_errors_carry_status_code_and_retry_after() {
+        struct Case {
+            name: &'static str,
+            status_line: &'static str,
+            content_type: &'static str,
+            headers: &'static str,
+            body: &'static str,
+            status: u16,
+            code: Option<&'static str>,
+            message: &'static str,
+            retry_after: Option<Duration>,
+        }
+        let cases = [
+            Case {
+                name: "422 idempotency_key_reused",
+                status_line: "422 Unprocessable Entity",
+                content_type: "application/json",
+                headers: "",
+                body: r#"{"error":"Idempotency-Key reused with a different request","code":"idempotency_key_reused"}"#,
+                status: 422,
+                code: Some("idempotency_key_reused"),
+                message: "Idempotency-Key reused with a different request",
+                retry_after: None,
+            },
+            Case {
+                name: "503 egress_floor_not_ready with Retry-After",
+                status_line: "503 Service Unavailable",
+                content_type: "application/json",
+                headers: "Retry-After: 5\r\n",
+                body: r#"{"error":"egress deny floor not ready","code":"egress_floor_not_ready"}"#,
+                status: 503,
+                code: Some("egress_floor_not_ready"),
+                message: "egress deny floor not ready",
+                retry_after: Some(Duration::from_secs(5)),
+            },
+            Case {
+                name: "non-JSON body keeps the body text and has no code",
+                status_line: "502 Bad Gateway",
+                content_type: "text/html",
+                headers: "",
+                body: "<html>Bad Gateway</html>",
+                status: 502,
+                code: None,
+                message: "<html>Bad Gateway</html>",
+                retry_after: None,
+            },
+        ];
+        for case in cases {
+            let (url, _request_rx) = spawn_response_server_with_headers(
+                case.status_line,
+                case.content_type,
+                case.headers,
+                case.body.as_bytes().to_vec(),
+            );
+            let err = no_retry_client(&url)
+                .create(CreateOptions {
+                    image: "ubuntu:22.04".to_string(),
+                    ..Default::default()
+                })
+                .expect_err(case.name);
+            let display = err.to_string();
+            let Error::Api(api) = err else {
+                panic!("{}: want Error::Api, got {:?}", case.name, err);
+            };
+            assert_eq!(api.status(), case.status, "{}", case.name);
+            assert_eq!(api.code(), case.code, "{}", case.name);
+            assert_eq!(api.message(), case.message, "{}", case.name);
+            assert_eq!(api.retry_after(), case.retry_after, "{}", case.name);
+            assert_eq!(
+                display,
+                format!("API error: {}: {}", case.status_line, case.message),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn idempotency_key_reused_is_not_retried() {
+        let (url, hits) = spawn_scripted_server(vec![Reply::Json {
+            status: "422 Unprocessable Entity",
+            body: r#"{"error":"reused","code":"idempotency_key_reused"}"#.to_string(),
+            delay: Duration::ZERO,
+        }]);
+        let err = fast_retry_client(&url)
+            .create(CreateOptions {
+                image: "ubuntu:22.04".to_string(),
+                ..Default::default()
+            })
+            .expect_err("a reused key is refused");
+        assert!(
+            matches!(&err, Error::Api(api) if api.code() == Some("idempotency_key_reused")),
+            "unexpected error: {:?}",
+            err
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a 422 is not re-sent");
+    }
+
+    #[test]
+    fn error_retry_after_reads_an_http_date() {
+        let at = SystemTime::now() + Duration::from_secs(60);
+        let api = ApiError::from_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Some(&format_imf_fixdate(at)),
+            r#"{"error":"busy","code":"overloaded"}"#,
+        );
+        let wait = api.retry_after().expect("a date parses");
+        assert!(wait > Duration::from_secs(50) && wait <= Duration::from_secs(60), "{:?}", wait);
+        let malformed = ApiError::from_response(reqwest::StatusCode::SERVICE_UNAVAILABLE, Some("soon"), "{}");
+        assert_eq!(malformed.retry_after(), None);
+        assert_eq!(malformed.code(), None, "JSON without an error field has no code");
+        assert_eq!(malformed.message(), "{}");
+    }
+
+    /// The `Idempotency-Key` header of a raw request, if it has one.
+    fn idempotency_key_of(request: &str) -> Option<String> {
+        request
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or("")
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case(IDEMPOTENCY_KEY_HEADER))
+            .map(|(_, value)| value.trim().to_string())
+    }
+
+    fn is_generated_key(key: &str) -> bool {
+        key.len() == 32 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn create_ok_json() -> String {
+        serde_json::json!({
+            "id": "sb-keyed",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb-keyed.example.com",
+            "cpu": 2,
+            "memory_mb": 2048,
+            "disk_gb": 20,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "exposed_ports": [],
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T10:00:00Z",
+            "last_active_at": "2026-05-07T10:00:00Z"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn create_sends_the_callers_idempotency_key_not_in_the_body() {
+        let (url, _hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(create_ok_json())]);
+        fast_retry_client(&url)
+            .create(CreateOptions {
+                image: "ubuntu:22.04".to_string(),
+                idempotency_key: Some(" order-42 ".to_string()),
+                ..Default::default()
+            })
+            .expect("create should succeed");
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(idempotency_key_of(&requests[0]).as_deref(), Some("order-42"));
+        let body = request_json_body(&requests[0]);
+        assert!(body.get("idempotency_key").is_none(), "key leaked into the body: {}", body);
+        assert_eq!(body["image"], "ubuntu:22.04");
+    }
+
+    #[test]
+    fn create_keeps_one_idempotency_key_across_retries() {
+        let cases: Vec<(&str, Vec<Reply>, Option<&str>)> = vec![
+            (
+                "generated key across 503s",
+                vec![paced("503 Service Unavailable", Some("0")), paced("503 Service Unavailable", Some("0")), Reply::ok(create_ok_json())],
+                None,
+            ),
+            ("generated key across dropped connections", vec![Reply::Hangup, Reply::Hangup, Reply::ok(create_ok_json())], None),
+            ("caller's key across a 503", vec![paced("503 Service Unavailable", Some("0")), Reply::ok(create_ok_json())], Some("order-42")),
+        ];
+        for (name, script, key) in cases {
+            let attempts = script.len();
+            let (url, hits, requests) = spawn_recording_scripted_server(script);
+            let sandbox = fast_retry_client(&url)
+                .create(CreateOptions {
+                    image: "ubuntu:22.04".to_string(),
+                    idempotency_key: key.map(String::from),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|err| panic!("{}: {}", name, err));
+            assert_eq!(sandbox.data.id, "sb-keyed", "{}", name);
+            assert_eq!(hits.load(Ordering::SeqCst), attempts, "{}", name);
+            let keys: Vec<String> = requests
+                .lock()
+                .expect("requests lock")
+                .iter()
+                .map(|request| idempotency_key_of(request).expect("every attempt sends a key"))
+                .collect();
+            match key {
+                Some(key) => assert_eq!(keys[0], key, "{}", name),
+                None => assert!(is_generated_key(&keys[0]), "{}: {:?}", name, keys),
+            }
+            assert!(keys.iter().all(|k| *k == keys[0]), "{}: {:?}", name, keys);
+        }
+    }
+
+    #[test]
+    fn each_create_call_gets_a_new_idempotency_key() {
+        let (url, _hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(create_ok_json())]);
+        let client = fast_retry_client(&url);
+        for key in [None, None, Some("   ")] {
+            client
+                .create(CreateOptions {
+                    image: "ubuntu:22.04".to_string(),
+                    idempotency_key: key.map(String::from),
+                    ..Default::default()
+                })
+                .expect("create should succeed");
+        }
+        let keys: Vec<String> = requests
+            .lock()
+            .expect("requests lock")
+            .iter()
+            .map(|request| idempotency_key_of(request).expect("a key"))
+            .collect();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|k| is_generated_key(k)), "{:?}", keys);
+        assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2], "{:?}", keys);
+    }
+
+    #[test]
+    fn only_sandbox_create_sends_the_idempotency_key() {
+        let (url, _hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(create_ok_json())]);
+        let client = fast_retry_client(&url);
+        let _ = client.get("sb-keyed");
+        let _ = client.exec("sb-keyed", ExecRequest::from("true"));
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(idempotency_key_of(request), None, "{}", request.lines().next().unwrap_or(""));
+        }
+    }
+
+    #[test]
+    fn new_idempotency_keys_are_hex_and_unique() {
+        let keys: std::collections::HashSet<String> = (0..1000).map(|_| new_idempotency_key()).collect();
+        assert_eq!(keys.len(), 1000);
+        assert!(keys.iter().all(|k| is_generated_key(k)));
     }
 }
 
@@ -5450,6 +6634,7 @@ mod security_tests {
                     ClientConfig {
                         api_url: Some("https://api.example.com".to_string()),
                         pat_token: Some(SECRET.to_string()),
+                        team: None,
                         retry: None,
                     }
                 ),

@@ -26,12 +26,14 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/operator"
+	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/internal/netsplice"
 	"github.com/aerol-ai/microvm/internal/runtime"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -119,6 +121,10 @@ type Service struct {
 	// SetIsolateRuntime when cfg.EnableIsolate is true. Host-mediated like
 	// wasm: satisfies Runtime only, never ContainerRuntime.
 	isolate runtime.Runtime
+	// ipv6Fence answers the create gate: whether the node's IPv6 fence
+	// covers a runtime's sandboxes (ipv6_fence.go). Nil until pkg/daemon
+	// wires it (tests, non-Linux, nodes that own no sandboxes).
+	ipv6Fence IPv6Fence
 	// isolateBundles is the content-addressed JS/TS bundle store behind
 	// POST /v1/js-bundles and the owner-scoped name→digest resolution on an
 	// isolate create. Nil unless pkg/daemon wired it (EnableIsolate).
@@ -172,6 +178,20 @@ type Service struct {
 	// Lazily built from cipher+store when tests construct &Service{...}
 	// without New; mount/registry seal paths still use cipher directly.
 	secretProvider secrets.Provider
+	// secretWrapBackend replaces the key-store client ConfigureSecretProvider
+	// builds (tests inject a fake KMS so no call leaves the process). It is
+	// still routed and limited.
+	secretWrapBackend secrets.DataKeyWrapper
+	// pkcs11Helper is the running PKCS#11 helper client, set by pkg/daemon
+	// before ConfigureSecretProvider; nil when no PKCS#11 settings are set.
+	pkcs11Helper secrets.DataKeyWrapper
+	// keyStoreWrapper is the key-store client the daemon built before it
+	// opened the server key (SetKeyStoreWrapper); nil for local, or when a
+	// test builds the service directly.
+	keyStoreWrapper secrets.DataKeyWrapper
+	// keyCustody is the server key's lifecycle under wrapped custody:
+	// re-check, revoke, recover (plans/customer-key-custody.md §10).
+	keyCustody keyCustodyState
 	// secretAudit records every secret decrypt/open (cluster provider,
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
@@ -187,6 +207,9 @@ type Service struct {
 	secretAuditBootVerify  sync.WaitGroup
 	secretAuditInitErr     error // retained so daemon boot can fail closed
 	secretAuditOnce        sync.Once
+	// apiFlood is the api record flood control and its shared-node
+	// evaluator (api_audit.go, api_audit_flood.go).
+	apiFlood               apiFloodState
 	secretAuditPruneStop   chan struct{}
 	secretAuditPruneDone   sync.WaitGroup
 	auditWitnessMu         sync.Mutex
@@ -318,6 +341,9 @@ type Service struct {
 	localReadyWasmModuleIDsCache   []string
 	localReadyWasmModuleIDsKnown   bool
 	localReadyWasmModuleIDsExpires time.Time
+	// slotPools caches LocalSlotPools (slot_pools.go) for the capacity
+	// heartbeat, so placement's per-create self refresh does not read SQLite.
+	slotPools slotPoolCache
 	// Reserved standard-module aliases that actually resolve on this host,
 	// computed once: each resolve hashes a staged file up to 256MiB, so it must
 	// not run on every 5s inventory refresh (hard rule 2). Staged modules are
@@ -381,6 +407,11 @@ type Service struct {
 	// show yet into it (review finding 1).
 	egressSyncMu   sync.RWMutex
 	egressInflight egressInflight
+	// egressCreateHolds counts the creates holding an early gateway attach
+	// per sandbox, and egressCreateLocks orders an undo's check-and-detach
+	// against a duplicate create's attach (egress_early.go).
+	egressCreateHolds egressCreateHolds
+	egressCreateLocks egressPolicyLocks
 	// egressHoldLocks serializes each sandbox's hold record with the
 	// enforcement derived from it (egress_blocks.go).
 	egressHoldLocks egressPolicyLocks
@@ -416,6 +447,12 @@ type Service struct {
 	// createsInFlight is the sandbox IDs whose create is running, which the
 	// reconcile orphan sweep skips (create_inflight.go).
 	createsInFlight createsInFlight
+	// createLeases holds, per sandbox ID, the one create of it running on
+	// this node; a second create of the ID waits for it (create_lease.go).
+	createLeases createLeases
+	// reconcileUnknown tracks sandboxes whose runtime could not say whether
+	// they exist, pass after pass (reconcile_unknown.go).
+	reconcileUnknown reconcileUnknownTracker
 	// egressApplyIdle is true once a pass found no apply_failed hold left;
 	// recording one clears it. Zero (false) at start, so the first pass
 	// after a restart reads the store (review 3 finding 8).
@@ -434,12 +471,16 @@ type Service struct {
 	egressGaugeDirty atomic.Bool
 	// egressCA is the node's TLS inspection CA once loaded or made (P3-1);
 	// egressCAMu single-flights its creation, and egressCAPushed records
-	// that the connected gateway has it.
-	egressCA       atomic.Pointer[egress.InspectCA]
-	egressCAMu     sync.Mutex
-	egressCAPushed atomic.Bool
-	egressSubOnce  sync.Once
-	egressStats    egressCounters
+	// that the connected gateway has it. egressCAPushMu orders the CA's
+	// pushes against a revoke's clear at the gateway, and
+	// egressCAClearOwed is set while that clear has not reached it.
+	egressCA          atomic.Pointer[egress.InspectCA]
+	egressCAMu        sync.Mutex
+	egressCAPushed    atomic.Bool
+	egressCAPushMu    sync.Mutex
+	egressCAClearOwed atomic.Bool
+	egressSubOnce     sync.Once
+	egressStats       egressCounters
 	// egressSelfTest is the per-bridge self-test (T41); nil skips it. Atomic
 	// for the same reason as egressWired: readiness reads it.
 	egressSelfTest atomic.Pointer[egressSelfTest]
@@ -449,6 +490,13 @@ type Service struct {
 	// egressControlPushed is the control-port guard list last pushed to the
 	// gateway; nil after a full sync, so a restarted gateway gets it again.
 	egressControlPushed atomic.Pointer[string]
+	// nodeGuard is the node guard's state: what each runtime got, and the
+	// per-runtime result the create gate reads (node_guard.go).
+	nodeGuard nodeGuardState
+	// egressFloor is the host-firewall deny floor's state: the floor each
+	// runtime got, and the per-runtime result the create gate reads
+	// (egress_floor.go).
+	egressFloor egressFloorState
 	// egressPolicyLocks serializes live policy updates per sandbox (§5.8).
 	egressPolicyLocks egressPolicyLocks
 	// egressProfileKick wakes SuperviseEgressProfiles after a profile change
@@ -458,6 +506,15 @@ type Service struct {
 	// egressProfiles stores named egress profiles; nil is the local store
 	// (single node). A cluster swaps in its Raft-backed store.
 	egressProfiles egressProfileBackend
+
+	// API tokens (api_tokens.go). apiTokenSet is the single-node in-memory
+	// index the request path reads; apiTokenMirror is the token copy on a
+	// cluster node without Raft state (nil elsewhere). apiTokenEntropy and
+	// apiTokenClock are nil in production (crypto/rand, time.Now).
+	apiTokenSet     identity.TokenSet
+	apiTokenMirror  *identity.TokenMirror
+	apiTokenEntropy io.Reader
+	apiTokenClock   func() time.Time
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the
@@ -577,6 +634,16 @@ type Service struct {
 	warmCacheMu sync.RWMutex
 	warmCache   map[string]int64
 
+	// toolboxCalls holds every in-flight network toolbox request by
+	// sandbox, so the stop and destroy paths can end them at once instead
+	// of leaving them to wait on a sandbox that is gone (toolbox_calls.go).
+	toolboxCalls toolboxCallRegistry
+
+	// sandboxOOMs remembers recent oom events, so the die that follows an
+	// init's OOM kill is recorded as one (sandbox_oom.go). An oom event is
+	// not a stop.
+	sandboxOOMs sandboxOOMTracker
+
 	// touchCoalescer debounces last_active_at flushes per sandbox so a
 	// burst of HTTP requests (wake-aware ingress proxy, toolbox/session/
 	// runtime proxies, SSH gateway) does not become one SQLite UPDATE
@@ -637,6 +704,10 @@ type Service struct {
 	// create paths. Tests close the DB here so PutMounts / custom-domain
 	// persist failure arms run without a store wrapper. Nil in production.
 	testAfterStoreCreate func()
+	// testAttachStage, when set, sees each gateway-attach sub-stage's
+	// duration (egress_attach_stages.go); the attach benchmark reads the
+	// split from it. Nil in production.
+	testAttachStage func(stage string, d time.Duration)
 	// testAfterCustomDomainsOnCreate runs after persistCustomDomainsOnCreate
 	// succeeds on the wasm create path so the subsequent Get/sync failure
 	// rollbacks can be forced. Nil in production.
@@ -684,6 +755,10 @@ type Service struct {
 	// testForceUnmountErr, when non-nil, replaces the UnmountAll result in
 	// DestroySandbox so the warn arm is reachable offline. Nil in production.
 	testForceUnmountErr error
+	// testCreateLeaseWait, when >0, replaces createLeaseWait so a test can
+	// reach a waiter's ErrCreateInProgress without waiting out the create
+	// timeout. Zero in production.
+	testCreateLeaseWait time.Duration
 	// testSecretPeerPusher overrides cluster secret fan-out in tests. Nil in
 	// production (SealAndDistribute type-asserts the live Cluster/Agent).
 	testSecretPeerPusher cluster.SecretPeerPusher
@@ -750,26 +825,53 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 }
 
 // ConfigureSecretProvider selects the secrets.Provider from cfg.SecretProvider.
-// For awskms it builds the AWS client, runs an optional wrap/unwrap canary
-// (E4 lite), and fails open unless cfg.SecretProviderStrictBoot. Safe to call
-// when the provider is already local — it is a no-op refresh for that case.
+// For an external provider it builds the key-store client behind the per-node
+// limiter, runs a wrap/unwrap canary (E4 lite), and fails open unless
+// cfg.SecretProviderStrictBoot. Safe to call when the provider is already
+// local — it is a no-op refresh for that case.
 func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 	if s == nil || s.store == nil {
 		return nil
 	}
 	name := secrets.NormalizeProviderName(s.cfg.SecretProvider)
-	opts := secrets.ProviderOptions{
-		Name:        name,
-		AWSKMSKeyID: s.cfg.SecretAWSkmsKeyID,
-		Cipher:      s.cipher,
-		Store:       newSecretBlobStore(s.store),
+	ctx = bootContext(ctx)
+	wrapper := s.keyStoreWrapper
+	switch {
+	case wrapper != nil:
+	case secrets.IsExternalProvider(name):
+		opts := KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper)
+		opts.Wrapper = s.secretWrapBackend
+		w, err := secrets.NewWrapper(ctx, opts)
+		if err != nil {
+			return err
+		}
+		wrapper = w
+	default:
+		// Still sealing local, maybe with a key store's settings already
+		// added: step 1 of the two-step switch (§12, eng D8).
+		w, err := secrets.NewOpenWrapper(ctx, KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper))
+		if err != nil {
+			return err
+		}
+		wrapper = w
 	}
-	p, wrapper, err := secrets.NewProvider(ctx, opts)
+	p, wrapper, err := secrets.NewProvider(ctx, secrets.ProviderOptions{
+		Name: name, Cipher: s.cipher, Store: newSecretBlobStore(s.store), Prebuilt: wrapper,
+	})
 	if err != nil {
 		return err
 	}
 	s.secretProvider = p
-	if name != secrets.ProviderAWSKMS || wrapper == nil {
+	if !secrets.IsExternalProvider(name) || wrapper == nil {
+		return nil
+	}
+	if s.cfg.CredentialKeyCustody == secrets.CustodyWrapped && s.keyStoreWrapper != nil {
+		// The daemon unwrapped the server key through this same client at
+		// boot: real data already proved the key store (§3 step 5).
+		recordSecretProviderCanary(true)
+		if s.logger != nil {
+			s.logger.Info("secret provider ok: the server key unwrapped through it at boot", "provider", name)
+		}
 		return nil
 	}
 	if err := secrets.CanaryWrapUnwrap(ctx, wrapper); err != nil {
@@ -788,6 +890,26 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 		s.logger.Info("secret provider boot canary ok", "provider", name)
 	}
 	return nil
+}
+
+// SetPKCS11Helper hands ConfigureSecretProvider the running PKCS#11 helper
+// (pkg/daemon starts it: the vendor library never loads into sandboxd).
+func (s *Service) SetPKCS11Helper(w secrets.DataKeyWrapper) {
+	if s != nil {
+		s.pkcs11Helper = w
+	}
+}
+
+// keyStoreNodeID names this node in the key store's audit log: the cluster
+// id when there is one, else the configured node id, else "standalone".
+func (s *Service) keyStoreNodeID() string {
+	if id := s.selfNodeID(); id != "" {
+		return id
+	}
+	if id := strings.TrimSpace(s.cfg.NodeID); id != "" {
+		return id
+	}
+	return "standalone"
 }
 
 // ensureTouchCoalescer is the lazy init path TouchSandbox uses. Direct
@@ -1174,7 +1296,23 @@ func (s *Service) EnsureClusterReady(ctx context.Context) error {
 }
 
 func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxRequest) (*models.CreateSandboxResponse, error) {
-	return s.createSandbox(ctx, req, "")
+	resp, err := s.createSandbox(ctx, req, "")
+	s.noteSandboxCreated(ctx, resp)
+	return resp, err
+}
+
+// noteSandboxCreated tells the API edge's record which sandbox the create
+// made (its route has no id), with the lifecycle and owner the record is
+// stamped with, so the create record names the sandbox, its creator can be
+// found from it, and writing it needs no lookup; and nudges the api
+// flood-mode evaluator, since the node may now host a second owner. Both are
+// in-memory: a context lookup under a mutex and a non-blocking send.
+func (s *Service) noteSandboxCreated(ctx context.Context, resp *models.CreateSandboxResponse) {
+	if resp == nil {
+		return
+	}
+	auditlog.NoteSandboxIdentity(ctx, resp.Sandbox.ID, resp.Sandbox.AuditIncarnationID, resp.Sandbox.OwnerRef)
+	s.NoteLocalOwnersChanged()
 }
 
 // CreateSandboxWithID is the failover-recreate entry point: it behaves like
@@ -1182,7 +1320,14 @@ func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxReq
 // Idempotent at the cluster boundary — if a sandbox with this ID already
 // exists locally we return the existing record without touching docker. Used
 // by the cluster owner watcher to re-materialize a sandbox after its previous
-// owner died.
+// owner died, and by every create that derives its ID (Idempotency-Key, E2B,
+// Runloop).
+//
+// It holds the ID's create lease (create_lease.go) from before it looks for
+// the row until the create's rollback has run, so a second create of the ID
+// on this node waits for this one and then replays its sandbox, or creates
+// afresh when this one failed, instead of running a second create whose
+// failure would undo this one's reservation and mounts.
 func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSandboxRequest, id string) (*models.CreateSandboxResponse, error) {
 	if id == "" {
 		return nil, errors.New("CreateSandboxWithID: id required")
@@ -1194,21 +1339,38 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 	if err := models.ValidateSandboxID(id); err != nil {
 		return nil, err
 	}
-	if existing, err := s.store.Get(ctx, id); err == nil && existing != nil {
+	// An Idempotency-Key create replays only the request it was made with
+	// (keyed_create.go): a different one is refused here, before anything is
+	// created, when a create of the ID is running, and below when the
+	// sandbox exists.
+	ctx, release, err := s.beginCreateLease(ctx, id, req.CreateRequestDigests)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if existing, getErr := s.store.Get(ctx, id); getErr == nil && existing != nil {
 		// The fast path returns a fully-hydrated row — toolbox token included
 		// — so it must never answer a caller that does not own it. A facade
 		// deriving the ID from request content (E2B) would otherwise let any
 		// tenant reclaim another tenant's ID and be handed its credentials.
 		// enforceOwner passes for the owner-watcher / internal recreate path,
 		// which carries no Access and legitimately re-materializes any row.
+		// It answers before the digest check, so a digest says nothing about
+		// another tenant's sandbox.
 		if err := enforceOwner(ctx, existing); err != nil {
 			return nil, fmt.Errorf("%w: sandbox id is already in use", models.ErrSandboxExists)
 		}
+		if err := s.checkStoredCreateDigest(ctx, id); err != nil {
+			return nil, err
+		}
 		// Already present locally — recreate is a no-op. The watcher tick that
 		// noticed the FSM-only entry must have raced with a local create.
-		return &models.CreateSandboxResponse{Sandbox: *existing}, nil
+		auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
+		return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, nil
 	}
-	return s.createSandbox(ctx, req, id)
+	resp, err := s.createSandbox(ctx, req, id)
+	s.noteSandboxCreated(ctx, resp)
+	return resp, err
 }
 
 // reconcileStaleOwnership destroys local materializations whose authoritative
@@ -1343,12 +1505,17 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 		return err
 	}
 	if !runtimeAlreadyGone {
-		if err := rt.Destroy(ctx, sandbox); err != nil {
+		// The gateway lets go once the workload is gone and before the
+		// runtime frees the address (gatewayReleaser).
+		if err := rt.Destroy(s.gatewayReleaserCtx(ctx, sandbox, false), sandbox); err != nil {
 			// With the row gone, the ordinary orphan-runtime sweep owns retries and
 			// cannot mistake this for a lifecycle-wide delete.
 			return err
 		}
 	}
+	// This node's copy is gone (the row first, then the runtime): its
+	// toolbox requests end; a retry is routed to the owner.
+	s.endToolboxCalls(sandbox.ID, toolboxEndMoved, "moved to another node")
 	s.forgetWakeFlight(sandbox.ID)
 	s.invalidateWarm(sandbox.ID)
 	s.forgetNetstatsActivity(sandbox.ID)
@@ -1436,6 +1603,9 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 // idempotent route replay work is already healthy. This keeps the failover
 // recreate counter from becoming a constant five-second polling rate.
 func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) (bool, error) {
+	// The owner watcher calls this for a placement that failed over to us;
+	// no request is behind it.
+	ctx = withAuditSubsystem(ctx, auditSubsystemFailover)
 	// The replicated spec holds the owner-qualified name key; the local row
 	// gets the user's name back (names are unique per owner in the store).
 	// A malformed legacy "owner:" name decodes to itself and never fails.
@@ -1609,6 +1779,22 @@ func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.Moun
 	if len(mounts) > models.MaxMountsPerSandbox {
 		return fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
 	}
+	// Raw mounts run host-side as the daemon user, OUTSIDE the microVM
+	// isolation boundary: Source, NFS opts and S3 extra_args are passed
+	// verbatim into mount commands, and a credential-less network mount uses
+	// the host's ambient (instance-role) identity. pr-review.md §5 treats
+	// these inputs as trusted only because "PAT holder == host operator". A
+	// validated user token is NOT an operator, so for an owner-scoped caller a
+	// raw mount is a host attack surface (reach another tenant's export root,
+	// borrow the host S3 role, inject mount flags). Until the mount helper is
+	// isolated (§5: low-priv user, scoped netns, seccomp) raw mounts stay an
+	// operator-only capability; tenants use owner-namespaced platform volumes.
+	// Operator/PAT, admin and internal replay/failover callers pass. A runner
+	// bound to every team is unscoped but not a host operator, so it is
+	// refused like a tenant (hostCapable, eng review D3).
+	if !hostCapable(ctx) && len(mounts) > 0 {
+		return models.ErrMountOperatorOnly
+	}
 	for i := range mounts {
 		if err := mounts[i].Validate(s.cfg.ToolboxMountPath); err != nil {
 			return fmt.Errorf("mount %d: %w", i, err)
@@ -1671,6 +1857,19 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if err := models.ValidateSandboxID(idOverride); err != nil {
 			return nil, err
 		}
+		// Every per-ID side effect below (admission, mounts, the runtime's
+		// names, routes, rows) assumes it is the only create of this ID:
+		// hold the ID's create lease (create_lease.go) before the first of
+		// them and until the last rollback has run. CreateSandboxWithID
+		// already holds it, so this take joins it; it is here so no caller
+		// can reach the side effects without it. A generated ID cannot
+		// collide and needs no lease.
+		var release func()
+		ctx, release, err = s.beginCreateLease(ctx, idOverride, req.CreateRequestDigests)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 	}
 	// Bound the entire create operation so a stalled image pull or a slow
 	// registry cannot block a goroutine forever. 0 disables the guard.
@@ -1698,6 +1897,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	req = normalizeCreateRequest(req)
 	if err := s.NormalizeCreateImageDistribution(ctx, &req); err != nil {
 		return nil, err
+	}
+	// An owner-scoped (validated user-token) caller must not be able to start
+	// another tenant's private image just because it is already in the shared
+	// local image cache: tell the runtime to authorize the image against its
+	// registry even on a cache hit. Operator/PAT and internal/failover callers
+	// are unscoped and keep the fast cache-trusting path.
+	if _, scoped := ownerScope(ctx); scoped {
+		req.VerifyRegistryAccess = true
 	}
 	if err := NormalizeCreateFailover(&req); err != nil {
 		return nil, err
@@ -1841,6 +2048,18 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
+	// Fail closed: no sandbox on a runtime whose node guard failed to
+	// install, since it could reach every service on the node. One atomic
+	// map read (node_guard.go).
+	if err := s.requireNodeGuard(chosenRuntime); err != nil {
+		return nil, err
+	}
+	// Fail closed: no sandbox on a runtime whose egress deny floor is not
+	// installed, since it could reach the cloud metadata endpoints and the
+	// node's credentials. One atomic map read (egress_floor.go).
+	if err := s.requireEgressFloor(chosenRuntime); err != nil {
+		return nil, err
+	}
 	if hasBinariesRule(req.NetworkEgressRules) && chosenRuntime == models.RuntimeGvisor {
 		return nil, unsupportedBinaries(chosenRuntime)
 	}
@@ -1849,6 +2068,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 	req.Durability = durability
+	// Fail closed: no container or Firecracker sandbox while the node's
+	// IPv6 fence is not installed for its runtime. One atomic map read
+	// (ipv6_fence.go).
+	if err := s.requireIPv6Fence(chosenRuntime); err != nil {
+		return nil, err
+	}
 	if err := validateMaskRequestHost(req.MaskRequestHost); err != nil {
 		return nil, err
 	}
@@ -1922,6 +2147,26 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return s.createIsolateSandbox(ctx, req, idOverride)
 	}
 	req.Runtime = chosenRuntime
+
+	// Block-all, the address lists, hostname rules and byte caps are host
+	// firewall rules on a container: on a node whose firewall is off, refuse
+	// them before any work rather than create a sandbox whose GET claims a
+	// policy nothing enforces. Checked on the effective request, so an
+	// operator default and a failover replay are held to it too.
+	if ociRt, rerr := s.ociEngineForNewCreate(); rerr == nil {
+		fields := firewallPolicyFields(&req)
+		unenforced, ferr := s.requireNetRules(ociRt, chosenRuntime, fields)
+		if ferr != nil {
+			return nil, ferr
+		}
+		if unenforced {
+			defer func() {
+				if err == nil && resp != nil {
+					s.warnUnenforced(resp.ID, chosenRuntime, "create", fields)
+				}
+			}()
+		}
+	}
 
 	if err := s.validateCreateMounts(ctx, req.Mounts, idOverride); err != nil {
 		return nil, err
@@ -2019,15 +2264,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// > 0 by normalizeCreateRequest above), so a default-sized request still
 	// counts against the host budget. Reservation happens here; every failure
 	// path below must release it.
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	prepareStart := time.Now()
@@ -2074,8 +2313,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		releaseAdmission()
 		return nil, fmt.Errorf("mount external storage: %w", err)
 	}
+	// The ID's mount set is this create's only if it made one: MountAll
+	// refuses an ID whose mounts are established, and a create without
+	// mounts made none. Tearing down rootDir/<id> otherwise would unmount
+	// the storage of whatever holds the ID.
+	mountedHere := len(req.Mounts) > 0
 	cleanupMounts := func() {
-		if s.mounts == nil {
+		if s.mounts == nil || !mountedHere {
 			return
 		}
 		err := s.mounts.UnmountAll(sandboxID)
@@ -2112,6 +2356,21 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		createtiming.From(ctx).RecordStage("svc_egress_join", time.Since(joinStart))
 		return err
 	}
+	// early is the gateway attach this create starts as soon as the runtime
+	// reports the sandbox's address, so it overlaps the runtime create
+	// (egress_early.go). Per-binary rules keep the late attach: the gateway
+	// traces them from the container's init pid, which only the started
+	// container has.
+	var early *earlyEgressAttach
+	createCtx := ctx
+	if gatewayMode && !hasBinariesRule(req.NetworkEgressRules) {
+		if cr, ok := runtime.AsContainerRuntime(ociRt); ok {
+			early = s.newEarlyEgressAttach(ctx, cr, models.Sandbox{ID: sandboxID, Runtime: chosenRuntime, Engine: chosenEngine,
+				NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode,
+				NetworkEgressRules: req.NetworkEgressRules, Env: req.Env})
+			createCtx = runtime.WithAddressObserver(ctx, early)
+		}
+	}
 	rollbackDestroy := func(partial *models.Sandbox) {
 		if partial == nil {
 			return
@@ -2120,9 +2379,26 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		partial.Runtime = chosenRuntime
 		partial.Engine = chosenEngine
 		// Destroy first: a container that outlives a failed rollback stays
-		// filtered (attached, or still behind the driver's block-all).
-		destroyErr := ociRt.Destroy(rollback.Context(), partial)
-		if gatewayMode && destroyErr == nil {
+		// filtered (attached, or still behind the driver's block-all). The
+		// runtime tells the observer once the workload is gone and before
+		// its address is free, so the gateway lets go first: an early attach
+		// undoes itself (unless a duplicate create holds it), any other
+		// attach detaches.
+		_, reported := early.reported()
+		destroyCtx := s.gatewayReleaserCtx(rollback.Context(), partial, false)
+		if reported {
+			destroyCtx = runtime.WithAddressObserver(rollback.Context(), early)
+		}
+		destroyErr := ociRt.Destroy(destroyCtx, partial)
+		switch {
+		case !gatewayMode:
+		case reported && destroyErr != nil:
+			// It may still run: it keeps the attach, and the orphan sweep's
+			// removal detaches it.
+			early.commit()
+		case reported:
+			early.undo()
+		case destroyErr == nil:
 			s.detachSandboxEgress(rollback.Context(), partial, partial.ContainerIP)
 		}
 	}
@@ -2132,18 +2408,35 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// The runtime instance exists before the row: reconcile's orphan sweep
 	// must not take it for a leak until this create has returned.
 	defer s.createsInFlight.begin(sandboxID)()
+	// Settles the early attach on every exit, before the in-flight mark
+	// goes: once the row is stored with the attach joined it owns the
+	// attach; any other exit undoes it (a no-op once a rollback has).
+	egressCommitted := false
+	defer func() { early.end(egressCommitted) }()
 	clearGen := s.egressClears.now()
-	state, err := ociRt.Create(ctx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
+	state, err := ociRt.Create(createCtx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
 	if err != nil {
+		// A driver that reported the address and failed let it go through
+		// ReleasingAddress; this covers one that didn't.
+		early.undo()
+		// A name collision (ErrSandboxContainerExists) means another
+		// instance holds the ID. This create still releases only what it
+		// made: releaseAdmission and cleanupMounts are no-ops for a
+		// reservation or a mount set it found in place (admitCreate,
+		// mountedHere), on the replay exit as on every other.
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateCreateAfterRuntime(ctx, sandboxID, err); dupErr == nil {
+			releaseAdmission()
 			return resp, nil
 		} else if !errors.Is(dupErr, err) {
 			releaseAdmission()
 			return nil, dupErr
 		}
 		releaseAdmission()
-		return nil, err
+		// A bridge or subnet that filled past the counted pool (a port
+		// taken without a reservation) is still capacity, not a fault: the
+		// driver removed what it created, and the API answers 503.
+		return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(chosenEngine), err)
 	}
 	s.releaseAdoptedParkReservation(state)
 	if gatewayMode {
@@ -2152,17 +2445,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode,
 			NetworkEgressRules: req.NetworkEgressRules, Env: req.Env}
 		egressDone = make(chan error, 1)
-		go func() {
-			attachStart := time.Now()
-			var err error
-			if !ok {
-				err = ErrEgressGatewayRequired
-			} else {
-				err = s.attachSandboxEgress(ctx, attachSB, cr)
-			}
-			createtiming.From(ctx).RecordStage("svc_egress_attach", time.Since(attachStart))
-			egressDone <- err
-		}()
+		s.startCreateAttach(ctx, early, attachSB, cr, ok, egressDone)
 	}
 
 	// Seal the registry creds (if any) BEFORE building the row so a marshal
@@ -2256,10 +2539,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	persistStart := time.Now()
 	sandbox.OwnerRef = ownerRef
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
-		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+		// ErrSandboxExists: a row holds the ID, and with it the ID's public
+		// route, reservation and mounts. This create releases only what it
+		// made (admitCreate, mountedHere) and puts the route back.
+		s.rollbackCreatePublicRoutes(rollback.Context(), sandbox, errors.Is(err, models.ErrSandboxExists))
 		rollbackDestroy(sandbox)
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateStoreCreate(ctx, sandbox.ID, err); dupErr == nil {
+			releaseAdmission()
 			return resp, nil
 		} else if !errors.Is(dupErr, err) {
 			releaseAdmission()
@@ -2357,6 +2644,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 	platformVolumesCommitted = true
+	egressCommitted = true
 	s.settleEgressAttach(sandbox.ID)
 	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 	stored, err := s.store.Get(ctx, sandbox.ID)
@@ -2439,6 +2727,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// Hostname entries, profiles and learn mode go through the egress
 	// gateway, as on the container runtimes: the driver gets a block-all
 	// copy, so the guest boots shut, and the attach lifts it (§5.7).
+	prepareStart := time.Now()
 	egressPol, err := compileCreateEgressEffective(&req)
 	if err != nil {
 		return nil, err
@@ -2451,10 +2740,17 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 		driverReq.NetworkBlockAll = true
 		driverReq.NetworkAllowOut, driverReq.NetworkDenyOut = nil, nil
+		// The same stage as the container path, so a Firecracker create's
+		// Server-Timing splits its egress work the same way (UC-185).
+		createtiming.From(ctx).RecordStage("svc_egress_prepare", time.Since(prepareStart))
 	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")
 	}
+	// The driver delivers the env into the guest, so a key the egress
+	// gateway injects (or ever injected) stays a placeholder there, as on
+	// the container path (P3-2). The row keeps the real value, sealed.
+	driverReq.Env = withholdEnv(driverReq.Env, withheldKeys(&req))
 
 	toolboxToken, err := generateToolboxToken()
 	if err != nil {
@@ -2476,27 +2772,40 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// Admission check mirrors the docker path. The capacity model is
 	// runtime-agnostic — a firecracker VMM's vCPU/memory footprint
 	// is counted the same way as a docker container's.
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	// Dispatch into the firecracker driver. The driver's Create owns
 	// TAP slot allocation, host TAP creation, rootfs build, VMM spawn,
 	// REST orchestration, and the vsock handshake. On error, the
 	// driver releases everything it acquired before returning.
+	//
+	// The gateway attach starts as soon as the driver has the guest's TAP
+	// slot shut and reports its address, so it overlaps the boot
+	// (egress_early.go); a warm-pool hit reports nothing and attaches late.
+	gwSB := models.Sandbox{ID: sandboxID, Runtime: req.Runtime,
+		NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode}
+	var early *earlyEgressAttach
+	createCtx := ctx
+	if gatewayMode && !hasBinariesRule(req.NetworkEgressRules) {
+		if cr, ok := runtime.AsContainerRuntime(s.firecracker); ok {
+			early = s.newEarlyEgressAttach(ctx, cr, gwSB)
+			createCtx = runtime.WithAddressObserver(ctx, early)
+		}
+	}
+	committed := false
 	// The runtime instance exists before the row: reconcile's orphan sweep
 	// must not take it for a leak until this create has returned.
 	defer s.createsInFlight.begin(sandboxID)()
+	// Settles the early attach on every exit, before the in-flight mark
+	// goes (see the container path).
+	defer func() { early.end(committed) }()
 	clearGen := s.egressClears.now()
-	state, err := s.firecracker.Create(ctx, driverReq, sandboxID, toolboxToken, nil)
+	state, err := s.firecracker.Create(createCtx, driverReq, sandboxID, toolboxToken, nil)
 	if err != nil {
+		early.undo()
 		// Phase 6 PR-A: cold-load corruption intercept. The driver's
 		// configureVMMForLoad path verifies the snapshot checksum and
 		// returns ErrSnapshotCorrupt-wrapping errors on mismatch; surface
@@ -2517,32 +2826,40 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		if egressDone == nil {
 			return nil
 		}
+		joinStart := time.Now()
 		err := <-egressDone
 		egressDone = nil
+		createtiming.From(ctx).RecordStage("svc_egress_join", time.Since(joinStart))
 		return err
 	}
+	gwSB.ContainerIP = state.ContainerIP
 	destroyVM := func(partial *models.Sandbox) {
 		_ = waitEgress()
 		// As on the docker path: a VM that outlives a failed rollback stays
-		// filtered.
-		if err := s.firecracker.Destroy(rollback.Context(), partial); err == nil && gatewayMode {
+		// filtered, and the gateway lets go once the VM is down and before
+		// the TAP slot is free.
+		_, reported := early.reported()
+		destroyCtx := s.gatewayReleaserCtx(rollback.Context(), &gwSB, false)
+		if reported {
+			destroyCtx = runtime.WithAddressObserver(rollback.Context(), early)
+		}
+		err := s.firecracker.Destroy(destroyCtx, partial)
+		switch {
+		case !gatewayMode:
+		case reported && err != nil:
+			early.commit()
+		case reported:
+			early.undo()
+		case err == nil:
 			s.detachSandboxEgress(rollback.Context(), partial, state.ContainerIP)
 		}
 	}
 	if gatewayMode {
 		cr, ok := runtime.AsContainerRuntime(s.firecracker)
-		attachSB := &models.Sandbox{ID: state.SandboxID, ContainerIP: state.ContainerIP, Runtime: req.Runtime,
-			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode}
+		attachSB := gwSB
+		attachSB.ID = state.SandboxID
 		egressDone = make(chan error, 1)
-		go func() {
-			attachStart := time.Now()
-			err := ErrEgressGatewayRequired
-			if ok {
-				err = s.attachSandboxEgress(ctx, attachSB, cr)
-			}
-			createtiming.From(ctx).RecordStage("svc_egress_attach", time.Since(attachStart))
-			egressDone <- err
-		}()
+		s.startCreateAttach(ctx, early, &attachSB, cr, ok, egressDone)
 	}
 
 	sealedRegistry, err := s.sealRegistry(req.Registry)
@@ -2652,6 +2969,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 			return nil, fmt.Errorf("%w: %v", ErrEgressGatewayUnavailable, err)
 		}
 	}
+	committed = true
 	s.settleEgressAttach(sandbox.ID)
 	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 
@@ -2697,19 +3015,19 @@ func (s *Service) sealRegistry(auth *models.RegistryAuth) ([]byte, error) {
 // when the input is empty (no credentials persisted). Exported for the
 // boot-time backfill in cmd/sandboxd that rebuilds CreateSandboxRequest from
 // the persisted Sandbox row. sandboxID is audit-only (ref registry:{id}).
-func (s *Service) UnsealRegistry(sandboxID string, sealed []byte) (auth *models.RegistryAuth, err error) {
+func (s *Service) UnsealRegistry(ctx context.Context, sandboxID string, sealed []byte) (auth *models.RegistryAuth, err error) {
 	if len(sealed) == 0 {
 		return nil, nil
 	}
 	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
-	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, registryAuditRef(sandboxID), s.auditActor(), "", auditIncarnationID, auditOwnerRef)
+	done := s.beginSecretAuditFor(ctx, sandboxID, registryAuditRef(sandboxID), s.auditActor(), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 	if s == nil || s.cipher == nil {
 		return nil, fmt.Errorf("%w: registry auth cipher is not configured", secrets.ErrDecryptFailed)
 	}
 	plain, decErr := s.cipher.Decrypt(sealed)
 	if decErr != nil {
-		return nil, fmt.Errorf("%w: decrypt registry auth: %v", secrets.ErrDecryptFailed, decErr)
+		return nil, sealedOpenError("decrypt registry auth", decErr)
 	}
 	var out models.RegistryAuth
 	if err := json.Unmarshal(plain, &out); err != nil {
@@ -2724,11 +3042,11 @@ func (s *Service) UnsealRegistry(sandboxID string, sealed []byte) (auth *models.
 // Fail closed when persisted credentials cannot be opened. Falling through to
 // the node's ambient registry identity would cross the tenant authorization
 // boundary and make credential revocation ineffective.
-func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) error {
+func (s *Service) attachWasmRegistryAuth(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil || len(sandbox.RegistryAuthSealed) == 0 {
 		return nil
 	}
-	auth, err := s.UnsealRegistry(sandbox.ID, sandbox.RegistryAuthSealed)
+	auth, err := s.UnsealRegistry(ctx, sandbox.ID, sandbox.RegistryAuthSealed)
 	if err != nil {
 		return fmt.Errorf("wasm: unseal registry auth for %s: %w", sandbox.ID, err)
 	}
@@ -2741,6 +3059,9 @@ func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) error {
 func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sandbox) error {
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")
+	}
+	if digests := createRequestDigestsFrom(ctx); sandbox.CreateRequestDigest == "" && len(digests) > 0 {
+		sandbox.CreateRequestDigest = digests[0]
 	}
 	if strings.TrimSpace(sandbox.AuditIncarnationID) == "" {
 		incarnationID, err := s.prepareAuditIncarnation(ctx, sandbox.ID, sandbox.ToolboxToken)
@@ -2796,7 +3117,7 @@ func (s *Service) sealEnv(sandboxID, incarnationID string, env map[string]string
 // loadEnv reads the sealed sandbox_env row. Explicit loads are audited (D9 / T6).
 func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) (env map[string]string, err error) {
 	sealed, envPresent, auditIncarnationID, auditOwnerRef, getErr := s.store.GetEnvWithIdentity(ctx, sandboxID)
-	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
+	done := s.beginSecretAuditFor(ctx, sandboxID, envAuditRef(sandboxID), s.auditActor(), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 
 	if getErr == nil {
@@ -2813,7 +3134,7 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) 
 		}
 		plain, decErr := s.cipher.DecryptWithAAD(sealed, secrets.EnvAAD(sandboxID, auditIncarnationID))
 		if decErr != nil {
-			return nil, fmt.Errorf("%w: decrypt env: %v", secrets.ErrDecryptFailed, decErr)
+			return nil, sealedOpenError("decrypt env", decErr)
 		}
 		var out map[string]string
 		if umErr := json.Unmarshal(plain, &out); umErr != nil {
@@ -2937,14 +3258,14 @@ func (s *Service) loadMounts(ctx context.Context, sandboxID string) (specs []mod
 		return nil, nil
 	}
 	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
-	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, mountsAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
+	done := s.beginSecretAuditFor(ctx, sandboxID, mountsAuditRef(sandboxID), s.auditActor(), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 	if s.cipher == nil {
 		return nil, fmt.Errorf("%w: mounts cipher is not configured", secrets.ErrDecryptFailed)
 	}
 	plain, decErr := s.cipher.Decrypt(sealed)
 	if decErr != nil {
-		return nil, fmt.Errorf("%w: decrypt mounts: %v", secrets.ErrDecryptFailed, decErr)
+		return nil, sealedOpenError("decrypt mounts", decErr)
 	}
 	var file models.MountSpecFile
 	if umErr := json.Unmarshal(plain, &file); umErr != nil {
@@ -2998,6 +3319,19 @@ type GetSandboxOptions struct {
 
 func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, error) {
 	return s.GetSandboxWithOptions(ctx, id, GetSandboxOptions{})
+}
+
+// HasLocalSandbox reports whether this node's store holds a row for id,
+// unscoped (the handler that serves the row applies owner scoping). Only a
+// definite miss is false: any other store error is true, so the caller serves
+// locally and the handler surfaces that error instead of a guessed absence.
+// The cluster router asks it only while the placement view is catching up.
+func (s *Service) HasLocalSandbox(ctx context.Context, id string) bool {
+	if s == nil || s.store == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	_, err := s.store.Get(ctx, id)
+	return !errors.Is(err, store.ErrNotFound)
 }
 
 // GetSandboxWithOptions returns a sandbox. Env is omitted unless IncludeEnv
@@ -3159,6 +3493,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		}
 	}
 
+	// A sandbox created with a firewall policy, on a node whose firewall has
+	// since been turned off, stays stopped: starting it would run it open
+	// while GET still shows the policy. Nothing has been touched yet.
+	if err := s.checkSandboxNetRules(sandbox, "start", sandboxFirewallFields(sandbox)); err != nil {
+		return nil, err
+	}
+
 	// Re-Admit against the host budget before touching Docker. StopSandbox
 	// (and the die/stop/oom event handler) releases the reservation, so a
 	// stopped sandbox does not hold capacity. Admit is idempotent per ID:
@@ -3199,7 +3540,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 			// Unseal per-tenant registry creds so a private oci:// module
 			// re-pulls under the tenant's identity if this node lacks it
 			// (codex C4). Transient: never persisted or serialized.
-			if err := s.attachWasmRegistryAuth(sandbox); err != nil {
+			if err := s.attachWasmRegistryAuth(ctx, sandbox); err != nil {
 				_ = s.mounts.UnmountAll(id)
 				releaseAdmission()
 				_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
@@ -3224,6 +3565,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		if err != nil {
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
+			if capacity.IsNetworkExhaustion(err) {
+				// A full bridge refused the start the way admission
+				// would have: the sandbox is still stopped and a retry
+				// can start it, so it is not marked error.
+				s.invalidateWarm(id)
+				return nil, capacity.AsNetworkSlotExhausted(networkSlotPool(models.SandboxEngine(sandbox)), err)
+			}
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 			s.invalidateWarm(id)
 			return nil, err
@@ -3417,14 +3765,22 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	// Leave the egress gateway only once the runtime is gone: a destroy that
-	// fails leaves the sandbox running, and still filtered, for the retry
-	// (review finding 3). The gateway's IP ownership check makes the late
-	// detach harmless if the IP was reused meanwhile (D5), and a new owner's
-	// Attach purges the old entry itself.
-	if err := rt.Destroy(ctx, sandbox); err != nil {
+	// Leave the egress gateway only once the workload is gone: a destroy
+	// that fails leaves the sandbox running, and still filtered, for the
+	// retry (review finding 3). And leave it before the address is free:
+	// the runtime calls the releaser between the two (containerd, a pause
+	// netns, Firecracker), so no other sandbox ever meets this one's
+	// gateway state. A runtime whose address goes with the container
+	// (Docker's IPAM) can't, and the teardown below detaches right after;
+	// there the gateway's IP ownership check (D5) and a new gateway-mode
+	// owner's own Attach purge cover the reuse.
+	if err := rt.Destroy(s.gatewayReleaserCtx(ctx, sandbox, false), sandbox); err != nil {
 		return err
 	}
+	// The runtime is gone: end its toolbox requests now, and again on the
+	// way out for one that read the row meanwhile (toolbox_calls.go).
+	s.endToolboxCalls(id, toolboxEndDestroyed, "destroyed")
+	defer s.endToolboxCalls(id, toolboxEndDestroyed, "destroyed")
 	// Everything the installed record names goes: a transition that didn't
 	// finish may have left a gateway attachment and CIDR rules at once. The
 	// row is the retry anchor until those are recorded against the address
@@ -3503,6 +3859,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if s.logger != nil {
 		s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
 	}
+	s.NoteLocalOwnersChanged()
 	if !s.isWasmSandbox(sandbox) {
 		s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 	}
@@ -3729,7 +4086,7 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 		return nil, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
-	s.registerSnapshotHome(ctx, snapshot.Name)
+	s.registerSnapshotHome(ctx, snapshot)
 	return snapshot, nil
 }
 
@@ -3767,7 +4124,9 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	// The image goes under a tag of the snapshot's own, never under its
 	// name: a name is the caller's choice, and as a tag it would replace
 	// whatever image already had it on this node — "python" for everyone.
-	image := docker.SnapshotImageTag(name)
+	// The tag is scoped to the snapshot's owner so two tenants committing a
+	// same-named snapshot on one node do not collide on one local image.
+	image := docker.SnapshotImageTagForOwner(sandbox.OwnerRef, name)
 	imageID, err := rt.CreateSnapshot(ctx, s.runtimeRef(sandbox), image)
 	if err != nil {
 		return nil, false, err
@@ -3792,14 +4151,18 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	}
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
-			if existing, getErr := s.getSnapshotAnySpelling(ctx, name); getErr == nil {
+			// A commit's snapshot belongs to the SANDBOX's owner, which may
+			// differ from the caller (an operator/internal caller committing a
+			// tenant's sandbox). Resolve the conflicting row in that owner's
+			// namespace, not the caller's, so a legitimate retry replays.
+			if existing, getErr := s.store.GetSnapshotByNames(ctx, snapshot.OwnerRef, docker.EquivalentImageNames(name)); getErr == nil {
 				return replayExistingSnapshot(ctx, existing, sandboxID)
 			}
 		}
 		return nil, false, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
-	s.registerSnapshotHome(ctx, snapshot.Name)
+	s.registerSnapshotHome(ctx, snapshot)
 	return snapshot, true, nil
 }
 
@@ -3852,7 +4215,11 @@ func replayExistingSnapshot(ctx context.Context, existing *models.SandboxSnapsho
 // reading and deleting a snapshot all go through it, as resolving one for a
 // create does, so no spelling reaches a snapshot the others would not.
 func (s *Service) getSnapshotAnySpelling(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
-	return s.store.GetSnapshotByNames(ctx, docker.EquivalentImageNames(name))
+	// Snapshot names are per-owner, so look within the caller's namespace: a
+	// user token in its own account, operator/internal ("") in the operator
+	// namespace. This scopes the register-conflict check and by-name resolution
+	// so one tenant can neither see nor collide with another's names.
+	return s.store.GetSnapshotByNames(ctx, ownerRefForCreate(ctx), docker.EquivalentImageNames(name))
 }
 
 // initialSnapshotPushState picks the push_state value to write for a
@@ -4037,13 +4404,14 @@ func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (i
 
 // registerSnapshotHome records, best-effort, that this node holds the snapshot's
 // image, so a snapshot-by-id GET/DELETE that lands on another node can be routed
-// here (B6). A snapshot lives in per-node SQLite with no node column, so the
-// replicated name → node index is the only cluster-wide home lookup. A failure
-// costs only routing — the snapshot is still usable locally and a re-register
-// would fix it — so it never fails the create. It is a no-op single-node (the
-// Noop client). The write detaches from the request context so a client that
-// disconnected right after the commit still gets the snapshot registered.
-func (s *Service) registerSnapshotHome(ctx context.Context, name string) {
+// here (B6), and so can a create that names the snapshot's committed tag. A
+// snapshot lives in per-node SQLite with no node column, so the replicated
+// index is the only cluster-wide home lookup. A failure costs only routing —
+// the snapshot is still usable locally and a re-register would fix it — so it
+// never fails the create. It is a no-op single-node (the Noop client). The
+// write detaches from the request context so a client that disconnected right
+// after the commit still gets the snapshot registered.
+func (s *Service) registerSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
 		return
@@ -4052,21 +4420,42 @@ func (s *Service) registerSnapshotHome(ctx context.Context, name string) {
 	if self == "" {
 		return
 	}
-	if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), name, self); err != nil && s.logger != nil {
-		s.logger.Warn("snapshot home-node register failed", "snapshot", name, "error", err)
+	for _, key := range snapshotHomeKeys(snapshot) {
+		if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), key, self); err != nil && s.logger != nil {
+			s.logger.Warn("snapshot home-node register failed", "snapshot", snapshot.Name, "error", err)
+		}
 	}
 }
 
-// forgetSnapshotHome drops the snapshot's home entry after it is deleted.
+// forgetSnapshotHome drops the snapshot's home entries after it is deleted.
 // Best-effort: a stale entry is also swept when its node leaves the cluster.
-func (s *Service) forgetSnapshotHome(ctx context.Context, name string) {
+func (s *Service) forgetSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
 		return
 	}
-	if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), name); err != nil && s.logger != nil {
-		s.logger.Warn("snapshot home-node forget failed", "snapshot", name, "error", err)
+	for _, key := range snapshotHomeKeys(snapshot) {
+		if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), key); err != nil && s.logger != nil {
+			s.logger.Warn("snapshot home-node forget failed", "snapshot", snapshot.Name, "error", err)
+		}
 	}
+}
+
+// snapshotHomeKeys lists the index keys a snapshot's home is recorded under.
+// The (owner, name) key stops a tenant overwriting another tenant's same-named
+// entry and hijacking its routing (#11). A snapshot that owns its committed tag
+// is also keyed by that tag, so a create naming the tag (the SDK hands a
+// caller snap.Image) reaches this node from any other; the tag is the one
+// NormalizeCreateImageDistribution resolves through this row (snapshotCommittedAs),
+// so a registered alias that merely points at someone's tag adds no tag key.
+func snapshotHomeKeys(snapshot *models.SandboxSnapshot) []string {
+	keys := []string{cluster.SnapshotHomeKey(snapshot.OwnerRef, snapshot.Name)}
+	if snapshotImageIsOwnedTag(snapshot) {
+		if key := cluster.SnapshotImageHomeKey(snapshot.Image); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
@@ -4100,10 +4489,10 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	default:
 		s.schedulePendingImageGC(ctx, "", snapshot.Image)
 	}
-	if err := s.store.DeleteSnapshot(ctx, snapshot.Name); err != nil {
+	if err := s.store.DeleteSnapshot(ctx, snapshot.OwnerRef, snapshot.Name); err != nil {
 		return err
 	}
-	s.forgetSnapshotHome(ctx, snapshot.Name)
+	s.forgetSnapshotHome(ctx, snapshot)
 	return nil
 }
 
@@ -4111,7 +4500,20 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 // one taken from a sandbox (only a commit records its source, see
 // RegisterSnapshot), or one under its own tag.
 func snapshotOwnsImage(snapshot *models.SandboxSnapshot) bool {
-	return snapshot.SourceSandboxID != "" || strings.TrimSpace(snapshot.Image) == docker.SnapshotImageTag(snapshot.Name)
+	return snapshot.SourceSandboxID != "" || snapshotImageIsOwnedTag(snapshot)
+}
+
+// snapshotImageIsOwnedTag reports whether a snapshot's image is its own
+// committed tag. It accepts both the owner-scoped tag (new commits) and the
+// legacy owner-agnostic tag so snapshots committed before the tag was scoped
+// still classify as owning their image.
+func snapshotImageIsOwnedTag(snapshot *models.SandboxSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	img := strings.TrimSpace(snapshot.Image)
+	return img == docker.SnapshotImageTagForOwner(snapshot.OwnerRef, snapshot.Name) ||
+		img == docker.SnapshotImageTag(snapshot.Name)
 }
 
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
@@ -5190,8 +5592,14 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 
 	// "disabled" is distinct from "ok" / failure — it tells the operator
 	// "we didn't probe this on purpose" rather than masking a real fault.
+	// A node whose role does not run the gateway (a server-only node in a
+	// role-split cluster) reports "disabled" too, even with
+	// SB_ENABLE_SSH_GATEWAY on: the daemon never starts one there
+	// (Config.RunsSSHGateway), so probing it could only fail. The wording is
+	// the existing one on purpose: the dashboard, the SDKs and every other
+	// reader of ssh_gateway already treat "disabled" as "not run here".
 	sshStatus := "disabled"
-	if s.cfg.EnableSSHGateway {
+	if s.cfg.RunsSSHGateway() {
 		if err := probeSSHGateway(ctx, s.cfg.SSHListenAddr); err != nil {
 			sshStatus = err.Error()
 		} else {
@@ -5269,7 +5677,14 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		status = "degraded"
 	}
 	// SSH gateway being down only degrades health when it's expected to be up.
-	if s.cfg.EnableSSHGateway && sshStatus != "ok" {
+	if s.cfg.RunsSSHGateway() && sshStatus != "ok" {
+		status = "degraded"
+	}
+	// A revoked key stops the node's work on sealed data (§10). Health still
+	// answers, so the docs do not promise the ingress stops routing here.
+	keyCustody := ""
+	if s.KeyRevoked() {
+		keyCustody = "revoked"
 		status = "degraded"
 	}
 
@@ -5300,8 +5715,19 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		SSHGateway:      sshStatus,
 		ClusterTopology: clusterTopology,
 		ClusterNodes:    clusterNodes,
+		KeyCustody:      keyCustody,
 		Version:         version.Version,
 	}, nil
+}
+
+// sealedOpenError reports a failed open of a sealed value. A key-store class
+// (a revoke) stays visible, so the API answers 503 key_revoked instead of a
+// decrypt failure; anything else is ErrDecryptFailed as before.
+func sealedOpenError(what string, err error) error {
+	if secrets.IsKeyStoreError(err) {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return fmt.Errorf("%w: %s: %v", secrets.ErrDecryptFailed, what, err)
 }
 
 // Capacity returns the admitter's current snapshot. Returns the zero value
@@ -5331,6 +5757,9 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalWasmModuleIDs = refs
 	}
 	snap.EgressGatewayReady = s.EgressGatewayReady()
+	// Network-slot pools: a peer with CPU and memory to spare can still be
+	// full for a runtime, and placement can only skip it if we say so.
+	snap.SlotPools = s.LocalSlotPools(context.Background())
 	// Observability-only engine tag (not a placement attribute).
 	if s.cfg.ContainerEngine != "" {
 		snap.ContainerEngine = s.cfg.ContainerEngine
@@ -5503,6 +5932,7 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 	if s.admitter == nil {
 		return
 	}
+	ctx = withAuditSubsystem(ctx, auditSubsystemBootRestore)
 	sandboxes, err := s.store.List(ctx)
 	if err != nil {
 		s.logger.Warn("replay reservations: list failed", "error", err)
@@ -5519,34 +5949,10 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 	s.logger.Info("capacity reservations replayed", "count", replayed)
 }
 
-// reconcileGoneContainerConfirmed reports whether a sandbox absent from the
-// bulk ListManaged snapshot is DURABLY gone and safe to reap (which deletes the
-// store row and, in cluster mode, the FSM placement). ListManaged is one racy
-// read per tick whose per-container Inspect silently skips a container it can't
-// read at that instant (mid-adopt/mid-start — see the `if err != nil` continue
-// in the containerd driver's ListManaged). Reaping on that single miss drops a
-// healthy sandbox's row and its cluster placement, which surfaced as an
-// intermittent cross-node snapshot 404 (UC-20). So re-verify with a direct,
-// targeted Inspect before destroying: a container the driver can still resolve
-// (non-empty runtime identity, no error) is NOT gone — the bulk snapshot was
-// stale — so spare it and let the next steady-state pass adopt it. A missing
-// driver, an Inspect error, or an empty identity all fall through to the reap,
-// so a genuinely-dead container is still cleaned up on this pass.
-func (s *Service) reconcileGoneContainerConfirmed(ctx context.Context, sandbox *models.Sandbox) bool {
-	if sandbox == nil {
-		return true
-	}
-	rt, err := s.runtimeForSandbox(sandbox)
-	if err != nil {
-		return true
-	}
-	if st, err := rt.Inspect(ctx, s.runtimeRef(sandbox)); err == nil && st != nil && st.ContainerID != "" {
-		return false
-	}
-	return true
-}
-
 func (s *Service) Reconcile(ctx context.Context) error {
+	// The admin reconcile route keeps its caller: a request's Access wins
+	// over the subsystem tag.
+	ctx = withAuditSubsystem(ctx, auditSubsystemReconcile)
 	// Topology heartbeat: surface a cluster that has crossed the
 	// 10-ingress-node sharding threshold without operator opt-in to
 	// SB_CLUSTER_SHARD_AWARE_INGRESS. /health also reports this, but the
@@ -5615,6 +6021,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	for _, sandbox := range known {
 		knownIDs[sandbox.ID] = struct{}{}
 	}
+	s.reconcileUnknown.retain(knownIDs)
 	s.reconcileMissingSelfOwnedPlacements(ctx, knownIDs)
 
 	for _, sandbox := range known {
@@ -5688,10 +6095,17 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// (deleteSelfOwnedClusterPlacement): reaping a container that is
 			// actually still there turns a transient miss into permanent loss and
 			// an intermittent cross-node snapshot 404 on a healthy sandbox
-			// (UC-20). Confirmed-gone (error / no such container) still reaps.
+			// (UC-20). Only a definitive not-found reaps; an Inspect that
+			// cannot answer keeps the row (reconcile_unknown.go, UC-320).
 			if !s.reconcileGoneContainerConfirmed(ctx, sandbox) {
 				continue
 			}
+			// Definitively gone: its toolbox requests will never be
+			// answered. (An unknown answer above ends nothing.)
+			s.endToolboxCalls(sandbox.ID, toolboxEndGone, "runtime gone")
+			// The reap's record (caller system:reconcile) is written once the
+			// row is gone; the identity is resolved now, while it exists.
+			reaped := s.beginSystemAction(ctx, sandbox.ID, systemActionReap)
 			// Container is gone (manual `docker rm`, OOM kill, host reboot,
 			// previous reconcile pass already destroyed it via events). Tear
 			// down all our state and delete the row outright. Cascades through
@@ -5718,7 +6132,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				if err != nil {
 					return err
 				}
-				if err := rt.Destroy(ctx, sandbox); err != nil {
+				if err := rt.Destroy(s.gatewayReleaserCtx(ctx, sandbox, false), sandbox); err != nil {
 					return err
 				}
 			}
@@ -5786,6 +6200,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			s.forgetWakeFlight(sandbox.ID)
 			s.invalidateWarm(sandbox.ID)
 			s.forgetNetstatsActivity(sandbox.ID)
+			// Again for a request that read the row before it went.
+			s.endToolboxCalls(sandbox.ID, toolboxEndGone, "runtime gone")
 			if s.admitter != nil {
 				s.admitter.Release(sandbox.ID)
 			}
@@ -5798,21 +6214,39 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					"image", sandbox.Image,
 				)
 			}
+			reaped(nil)
+			s.NoteLocalOwnersChanged()
 			continue
 		}
 
+		// The runtime listed it, so any unknown streak is over, and an
+		// error this reconcile recorded for it no longer holds.
+		s.reconcileUnknown.forget(sandbox.ID)
+		if strings.HasPrefix(sandbox.LastError, reconcileUnknownErrorPrefix) {
+			sandbox.LastError = ""
+		}
+		// A started instance listed without an address or id has not moved;
+		// the runtime just did not say this pass (containerd's netns probe
+		// failed, firecracker's list never carries them). Keep the row's, so
+		// its routes, egress rules and toolbox target stay where they are.
+		observedIP := state.ContainerIP
+		if observedIP == "" && state.Status == models.SandboxStatusStarted {
+			observedIP = sandbox.ContainerIP
+		}
 		// A row that says started but whose container stopped or moved
 		// missed the stop (sandboxd was down, the event stream gapped): what
 		// it left at the old address is recorded and cleared now, before
 		// the row forgets the address (review 6 finding 4).
 		if sandbox.Status == models.SandboxStatusStarted && sandbox.ContainerIP != "" &&
-			(state.Status != models.SandboxStatusStarted || state.ContainerIP != sandbox.ContainerIP) {
+			(state.Status != models.SandboxStatusStarted || observedIP != sandbox.ContainerIP) {
 			if err := s.teardownSandboxEgress(ctx, sandbox, sandbox.ContainerIP); err != nil {
 				s.logger.Warn("reconcile: egress rules at a moved sandbox's old address not recorded", "sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
 			}
 		}
-		sandbox.ContainerID = state.ContainerID
-		sandbox.ContainerIP = state.ContainerIP
+		if state.ContainerID != "" {
+			sandbox.ContainerID = state.ContainerID
+		}
+		sandbox.ContainerIP = observedIP
 		sandbox.Status = state.Status
 		sandbox.PublicURL = s.sandboxPublicURL(sandbox.ID, sandbox.AllowPublicTraffic)
 		sandbox.UpdatedAt = time.Now().UTC()
@@ -5970,6 +6404,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if !s.confirmedOrphan(ctx, sandboxID) {
 				continue
 			}
+			orphanDone := s.beginSystemAction(ctx, sandboxID, systemActionOrphanReap)
 			s.logger.Warn("removing orphan runtime instance",
 				"sandbox_id", sandboxID,
 				"runtime", runtimeName,
@@ -5983,7 +6418,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				Runtime:     runtimeName,
 				Engine:      engine,
 			}
-			if err := rt.Destroy(ctx, stub); err != nil {
+			// An orphan may be a create that died after an early gateway
+			// attach (egress_early.go); its stub carries no policy, so the
+			// releaser detaches whatever the gateway holds for it before the
+			// runtime frees the address (a no-op when it holds nothing).
+			err := rt.Destroy(s.gatewayReleaserCtx(ctx, stub, true), stub)
+			orphanDone(err)
+			if err != nil {
 				s.logger.Warn("orphan runtime removal failed",
 					"sandbox_id", sandboxID,
 					"runtime", runtimeName,
@@ -6219,7 +6660,7 @@ func (s *Service) startPeriodic(ctx context.Context, interval, timeout time.Dura
 }
 
 func (s *Service) StartLifecycleSweep(ctx context.Context) {
-	s.startPeriodic(ctx, time.Minute, 30*time.Second, s.runLifecycleSweep)
+	s.startPeriodic(withAuditSubsystem(ctx, auditSubsystemLifecycle), time.Minute, 30*time.Second, s.runLifecycleSweep)
 }
 
 func (s *Service) runLifecycleSweep(ctx context.Context) {
@@ -6247,7 +6688,10 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 		floor := s.activityFloorFor(sandbox, netstatsFallback)
 		switch lifecycleActionForWithFloor(sandbox, now, globalIdle, floor) {
 		case lifecycleDestroy:
-			if err := s.DestroySandbox(ctx, sandbox.ID); err != nil {
+			done := s.beginSystemAction(ctx, sandbox.ID, systemActionAutoDelete)
+			err := s.DestroySandbox(ctx, sandbox.ID)
+			done(err)
+			if err != nil {
 				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
 				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
@@ -6256,7 +6700,10 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			// Lifecycle stop: pass mode=stopModeLifecycle so serverless
 			// sandboxes arm wake (the next inbound HTTP request will
 			// resurrect the sandbox transparently).
-			if _, err := s.stopSandboxInternal(ctx, sandbox.ID, stopModeLifecycle); err != nil {
+			done := s.beginSystemAction(ctx, sandbox.ID, systemActionAutoStop)
+			_, err := s.stopSandboxInternal(ctx, sandbox.ID, stopModeLifecycle)
+			done(err)
+			if err != nil {
 				s.logger.Warn("auto-stop failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
 				s.logger.Info("audit lifecycle auto-stop",
@@ -6655,6 +7102,7 @@ func (s *Service) StartBuiltImageGC(ctx context.Context) {
 	if !s.cfg.ImageBuildGCEnabled {
 		return
 	}
+	ctx = withAuditSubsystem(ctx, auditSubsystemImageGC)
 	interval := s.cfg.ImageBuildGCInterval
 	if interval <= 0 {
 		return
@@ -6720,6 +7168,7 @@ func (s *Service) StartPendingImageGC(ctx context.Context) {
 	if !s.cfg.ImageBuildGCEnabled {
 		return
 	}
+	ctx = withAuditSubsystem(ctx, auditSubsystemImageGC)
 	interval := s.cfg.ImageBuildGCInterval
 	if interval <= 0 {
 		return
@@ -6877,6 +7326,7 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	if !s.cfg.EnableCluster || !s.caddy.Enabled() {
 		return nil
 	}
+	ctx = withAuditSubsystem(ctx, auditSubsystemReconcile)
 	// Peer-forwarding routes belong to the ingress tier. A dedicated worker or
 	// server reconciling them downloaded a placement view it never installs
 	// anything from.

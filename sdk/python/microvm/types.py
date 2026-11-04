@@ -144,6 +144,17 @@ class GPUOptions(TypedDict, total=False):
 
 class CreateOptions(TypedDict, total=False):
     image: Union[str, "Image"]
+    # Sent as the create's Idempotency-Key header, never in the body. A
+    # create sent again with the same key and the same options returns the
+    # sandbox the first one made instead of making a second; the same key
+    # with different options raises a 422 MicroVMHTTPError whose code is
+    # "idempotency_key_reused". Keys are scoped to the caller's account.
+    # Unset, the SDK makes a random key for each create call and reuses it on
+    # that call's automatic retries, so a retry after a timeout cannot make a
+    # second sandbox. Set your own to make your own retries of the whole call
+    # safe too, such as after your process restarts. idempotencyKey is
+    # accepted too.
+    idempotency_key: str
     # Optional name, unique among the caller's sandboxes (another account may
     # use the same name); a repeat create with a held name returns HTTP 409.
     # Names starting with "owner:" or shaped like a sandbox ID ("sb-" plus 16
@@ -459,7 +470,8 @@ class SandboxData(TypedDict, total=False):
     env: Dict[str, str]
     networkBlockAll: bool
     # Hostname-egress state on get (container runtimes): "active", "held" or
-    # "unavailable". Absent otherwise.
+    # "unavailable"; "unenforced" when the server's firewall is off and
+    # nothing filters the sandbox. Absent otherwise.
     egressStatus: str
     # Egress profiles this sandbox references, and the generation of each
     # that is live on it.
@@ -635,7 +647,8 @@ class NetworkPolicy(TypedDict, total=False):
     networkEgressRules: List["EgressRule"]
     # Hostname entries in force: inline plus every profile's (at most 1024).
     effectiveHostnameCount: int
-    # "active", "held" or "unavailable" for hostname rules on a container.
+    # "active", "held" or "unavailable" for hostname rules on a container;
+    # "unenforced" when the server's firewall is off.
     egressStatus: str
 
 
@@ -729,12 +742,87 @@ class RetryConfig(TypedDict, total=False):
     maxRetries: int
     baseDelayMs: int
     maxDelayMs: int
+    # Cap in milliseconds on the wait before re-sending a 429 or 503. The
+    # client waits as long as the server's Retry-After header asks (seconds
+    # or an HTTP date), never less than its own backoff, plus up to a fifth
+    # more so clients told the same value spread out; a longer ask is cut to
+    # this. A missing or malformed header uses the backoff. Defaults to
+    # 30000; 0 ignores Retry-After.
+    maxRetryAfterMs: int
 
 
 class MicroVMConfig(TypedDict, total=False):
     apiUrl: str
+    # The bearer every request carries: the operator PAT, an avm_ API token
+    # or an OIDC ID token. Defaults to SB_PAT_TOKEN, then its alias
+    # SB_API_TOKEN; when both are set, SB_PAT_TOKEN wins.
     patToken: str
+    # The team requests act for, sent as the X-AerolVM-Team header on every
+    # request. Defaults to SB_TEAM; with neither, no header is sent.
+    team: str
     retry: RetryConfig
+
+
+class WhoAmIPrincipal(TypedDict, total=False):
+    """Who the caller is: ``kind`` ("operator", "token", "oidc", ...), a
+    stable ``id`` ("operator", "tok_…") and a display ``name``."""
+
+    kind: str
+    id: str
+    name: str
+
+
+class WhoAmI(TypedDict, total=False):
+    """The result of :meth:`MicroVM.whoami`: the caller's own identity."""
+
+    principal: WhoAmIPrincipal
+    # viewer, runner, auditor or admin.
+    role: str
+    # "*" for every team, a team name, or absent for a managed account.
+    team: str
+    # When the credential stops working (RFC 3339); absent if it never does.
+    expiresAt: str
+
+
+class APIToken(TypedDict):
+    """One scoped API token as ``client.tokens.list()`` returns it. Never
+    the secret."""
+
+    # Public id (tok_…): what tokens.revoke takes and audit records name.
+    id: str
+    name: str
+    role: str
+    # A team name, or "*" for every team.
+    team: str
+    createdBy: str
+    createdAt: str
+    expiresAt: str
+    # Expired tokens no longer work; they stay listed for 30 days.
+    expired: bool
+
+
+class CreatedAPIToken(APIToken):
+    """The result of ``client.tokens.create()``: the token plus ``token``,
+    the secret (avm_…), returned this once and never stored by the server."""
+
+    token: str
+
+
+class CreateAPITokenOptions(TypedDict, total=False):
+    """The body of ``client.tokens.create()``. All four fields are required."""
+
+    # 1 to 64 of A-Z a-z 0-9 . _ -, unique among the team's tokens.
+    name: str
+    # viewer, runner, auditor or admin.
+    role: str
+    # A team name, or "*" for every team. auditor and admin require "*".
+    team: str
+    # The lifetime: "90d", "720h" or any Go duration.
+    expiresIn: str
+
+
+class APITokenList(TypedDict):
+    tokens: List[APIToken]
 
 
 # Firecracker rootfs templates. The lifecycle mirrors the daemon's

@@ -9,7 +9,7 @@ import (
 // it sets a pids limit in the containerd resource spec opts
 func TestResourceSpecOpts_SetsPidsLimit(t *testing.T) {
 	d := &Driver{cfg: Config{PidsLimit: 1024}}
-	spec := applyOpts(t, d.resourceSpecOpts(models.CreateSandboxRequest{MemoryMB: 256, CPU: 0.5}))
+	spec := applyOpts(t, resourceSpecOpts(models.CreateSandboxRequest{MemoryMB: 256, CPU: 0.5}, d.cfg.PidsLimit))
 
 	if spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil {
 		t.Fatal("pids limit not set in Linux resources")
@@ -23,7 +23,7 @@ func TestResourceSpecOpts_SetsPidsLimit(t *testing.T) {
 // it sets a pids limit in the containerd resource spec opts (zero requests)
 func TestResourceSpecOpts_SetsPidsLimitWithZeroRequests(t *testing.T) {
 	d := &Driver{cfg: Config{PidsLimit: 1024}}
-	spec := applyOpts(t, d.resourceSpecOpts(models.CreateSandboxRequest{}))
+	spec := applyOpts(t, resourceSpecOpts(models.CreateSandboxRequest{}, d.cfg.PidsLimit))
 
 	if spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil {
 		t.Fatal("pids limit not set for zero-resource request (warm-pool parked path)")

@@ -508,6 +508,38 @@ func TestWriteStoreAwareError_EgressOperatorConfigInvalid(t *testing.T) {
 	}
 }
 
+// TestWriteStoreAwareError_NodeGuardNotReady: a create refused because the
+// node guard is not installed is a 503 with a retry and its own code, and
+// the iptables detail stays in the node's log.
+func TestWriteStoreAwareError_NodeGuardNotReady(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, fmt.Errorf("%w (runtime docker: iptables: secret detail)", service.ErrNodeGuardNotReady))
+	var body models.ErrorResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeNodeGuardNotReady || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d code=%q retry=%q", rr.Code, body.Code, rr.Header().Get("Retry-After"))
+	}
+	if strings.Contains(rr.Body.String(), "secret detail") {
+		t.Fatalf("the cause leaked to the caller: %s", rr.Body.String())
+	}
+}
+
+// TestWriteStoreAwareError_EgressFloorNotReady: a create refused because the
+// egress deny floor is not installed is a 503 with a retry and its own code,
+// and the firewall detail stays in the node's log.
+func TestWriteStoreAwareError_EgressFloorNotReady(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, fmt.Errorf("%w (runtime containerd: netlink: secret detail)", service.ErrEgressFloorNotReady))
+	var body models.ErrorResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressFloorNotReady || rr.Header().Get("Retry-After") != "5" {
+		t.Fatalf("status=%d code=%q retry=%q", rr.Code, body.Code, rr.Header().Get("Retry-After"))
+	}
+	if strings.Contains(rr.Body.String(), "secret detail") {
+		t.Fatalf("the cause leaked to the caller: %s", rr.Body.String())
+	}
+}
+
 // TestWriteStoreAwareError_EgressPolicyUpdate: the live-update failures are
 // told apart by status and code (plans/egress-domain-filtering.md §5.8), and
 // every one carries a Retry-After since the PUT is idempotent.
@@ -569,11 +601,12 @@ func TestWriteStoreAwareErrorMapsBuildErrors(t *testing.T) {
 	}
 }
 
-// RequireOperator passes an operator and refuses everyone else: a scoped
-// user token (403) and a request the auth edge never stamped (403).
-func TestRequireOperator(t *testing.T) {
+// A fleet.admin route passes an operator and refuses everyone else: a scoped
+// user token (403) and a request the auth edge never stamped (403), as the
+// operator gate it replaced did.
+func TestFleetAdminRouteRefusesNonOperators(t *testing.T) {
 	var reached bool
-	h := RequireOperator(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	h := Router{}.Route(controlplane.PermFleetAdmin, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		reached = true
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -581,7 +614,7 @@ func TestRequireOperator(t *testing.T) {
 		ctx  context.Context
 		want int
 	}{
-		"operator":   {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true}), http.StatusOK},
+		"operator":   {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Fleet: true}), http.StatusOK},
 		"user token": {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acme"}}), http.StatusForbidden},
 		"no access":  {context.Background(), http.StatusForbidden},
 	} {

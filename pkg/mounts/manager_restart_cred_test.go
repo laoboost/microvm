@@ -43,6 +43,7 @@ func restartTestManager(t *testing.T, plan adapters.Plan) (*Manager, *mountState
 		hostPath:   hostPath,
 		plan:       plan,
 		cmd:        cmd,
+		exit:       watchExit(cmd),
 		startedAt:  time.Now().UTC(),
 		supervised: true,
 	}
@@ -53,7 +54,7 @@ func restartTestManager(t *testing.T, plan adapters.Plan) (*Manager, *mountState
 }
 
 // stubProbe replaces the mount-readiness probe for the duration of the test.
-func stubProbe(t *testing.T, fn func(hostPath string, timeout time.Duration) error) {
+func stubProbe(t *testing.T, fn func(hostPath string, timeout time.Duration, exited <-chan struct{}) error) {
 	t.Helper()
 	orig := waitForMountProbe
 	waitForMountProbe = fn
@@ -68,7 +69,7 @@ func TestManagerRemovesCredFileAfterSuccessfulSupervisedRestart(t *testing.T) {
 	}
 	m, state, _ := restartTestManager(t, plan)
 	probeCalled := false
-	stubProbe(t, func(string, time.Duration) error { probeCalled = true; return nil })
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error { probeCalled = true; return nil })
 
 	m.superviseExit(state)
 
@@ -87,7 +88,7 @@ func TestManagerRemovesCredFileAfterRestartProbeTimeout(t *testing.T) {
 		t.Fatalf("seed cred: %v", err)
 	}
 	m, state, _ := restartTestManager(t, plan)
-	stubProbe(t, func(string, time.Duration) error { return errors.New("timed out waiting for mount") })
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error { return errors.New("timed out waiting for mount") })
 
 	m.superviseExit(state)
 
@@ -107,7 +108,7 @@ func TestManagerWaitsForMountProbeBeforeRemovingCredFile(t *testing.T) {
 	var once sync.Once
 	probeStarted := make(chan struct{})
 	release := make(chan struct{})
-	stubProbe(t, func(string, time.Duration) error {
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error {
 		once.Do(func() { close(probeStarted) })
 		<-release
 		return nil
@@ -142,7 +143,7 @@ func TestManagerWaitsForMountProbeBeforeRemovingCredFile(t *testing.T) {
 func TestManagerKeepsSupervisingAfterFailedRestart(t *testing.T) {
 	plan := adapters.Plan{Argv: []string{"/does-not-exist-xyz"}}
 	m, state, _ := restartTestManager(t, plan)
-	stubProbe(t, func(string, time.Duration) error { return nil })
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error { return nil })
 
 	m.superviseExit(state)
 
@@ -164,7 +165,7 @@ func TestManagerDoesNotUnlinkWhenPlanHasNoCredFile(t *testing.T) {
 	plan := adapters.Plan{Argv: []string{"sleep", "0.5"}}
 	m, state, _ := restartTestManager(t, plan)
 	oldCmd := state.cmd
-	stubProbe(t, func(string, time.Duration) error { return nil })
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error { return nil })
 
 	m.superviseExit(state) // must not panic or error on empty CredFile
 
@@ -187,7 +188,7 @@ func TestManagerDoesNotHoldMutexWhileWaitingForRestartProbe(t *testing.T) {
 	var once sync.Once
 	probeStarted := make(chan struct{})
 	block := make(chan struct{})
-	stubProbe(t, func(string, time.Duration) error {
+	stubProbe(t, func(string, time.Duration, <-chan struct{}) error {
 		once.Do(func() { close(probeStarted) })
 		<-block
 		return nil

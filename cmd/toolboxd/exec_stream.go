@@ -481,8 +481,9 @@ func isPrivilegedEnvKey(key string) bool {
 }
 
 func mergeEnvForExec(extra map[string]string) []string {
-	// Inherit container env so PATH, HOME, etc. are present.
-	base := append([]string(nil), os.Environ()...)
+	// Inherit the container env (PATH, HOME, ...) and the sandbox env; the
+	// request's env goes last so it wins.
+	base := childEnviron()
 	for k, v := range extra {
 		if isPrivilegedEnvKey(k) {
 			continue

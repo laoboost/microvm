@@ -7,6 +7,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // Facade-state helpers. These thin wrappers around the generic store API
@@ -93,6 +94,12 @@ func (s *Service) UpdateTags(ctx context.Context, sandboxID string, tags map[str
 // existing row under the same alias must also point at a visible snapshot,
 // or a user token could retarget (and so take over) another tenant's alias.
 func (s *Service) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAlias) error {
+	// Snapshot names are per-owner, so the alias is stamped with the caller's
+	// owner — the account whose snapshot it points at (requireVisibleSnapshot
+	// below confirms the snapshot is that owner's). This keys the alias to a
+	// single snapshot and makes the (owner_ref, snapshot_name) FK cascade with
+	// the right one.
+	alias.OwnerRef = ownerRefForCreate(ctx)
 	if _, scoped := ownerScope(ctx); scoped {
 		if err := s.requireVisibleSnapshot(ctx, alias.SnapshotName); err != nil {
 			return err
@@ -153,7 +160,7 @@ func (s *Service) requireVisibleSnapshot(ctx context.Context, name string) error
 	if _, scoped := ownerScope(ctx); !scoped {
 		return nil
 	}
-	snapshot, err := s.store.GetSnapshot(ctx, name)
+	snapshot, err := s.store.GetSnapshot(ctx, ownerRefForCreate(ctx), name)
 	if err != nil {
 		return err
 	}
@@ -161,6 +168,19 @@ func (s *Service) requireVisibleSnapshot(ctx context.Context, name string) error
 		return store.ErrNotFound
 	}
 	return nil
+}
+
+// RequestDigests returns keyed digests of a request under the server key
+// ring, the current key's first (secrets.Cipher.Digests). A facade that
+// stores or logs a value derived from a request that carries secrets, such
+// as an idempotency fingerprint over a create's env, uses these instead of a
+// plain hash, which anyone holding the value could test guesses against.
+// Every node that shares the server key derives the same digest.
+func (s *Service) RequestDigests(purpose string, data []byte) ([]secrets.KeyedDigest, error) {
+	if s == nil || s.cipher == nil {
+		return nil, errors.New("request digests need the server key, and none is configured")
+	}
+	return s.cipher.Digests(purpose, data)
 }
 
 func (s *Service) ClaimIdempotentRequest(ctx context.Context, scope, fingerprint string, now time.Time, pendingTTL time.Duration) (*models.IdempotentRequestRecord, bool, error) {

@@ -377,9 +377,8 @@ func TestLoadReplayableCreateResultSandboxDBError(t *testing.T) {
 
 func TestCreateSandboxFingerprintErrorPath(t *testing.T) {
 	h := newHandlers(Deps{Service: nil})
-	_, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{}, sandboxMeta{})
-	if err != nil {
-		t.Fatalf("unexpected fingerprint error: %v", err)
+	if _, err := createRequestFingerprints(h.deps.Service, "", "base", models.CreateSandboxRequest{}, sandboxMeta{}, false); err == nil {
+		t.Fatal("a fingerprint without the server key succeeded")
 	}
 	// Exercise handler path where fingerprint succeeds but claim fails with closed DB.
 	_, st, handler := newE2BHandlerTestEnv(t)
@@ -399,7 +398,7 @@ func TestCreateSandboxReadyReplayLoadError(t *testing.T) {
 	id := createE2BSandbox(t, handler)
 
 	ctx := context.Background()
-	fingerprint, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{
+	fps, err := createRequestFingerprints(svc, "", "base", models.CreateSandboxRequest{
 		Image: "ubuntu:22.04",
 		Env:   map[string]string{},
 	}, sandboxMeta{
@@ -409,10 +408,11 @@ func TestCreateSandboxReadyReplayLoadError(t *testing.T) {
 		Secure:          true,
 		NetworkAllowOut: []string{},
 		NetworkDenyOut:  []string{},
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
+	fingerprint := fps.current
 	now := time.Now().UTC()
 	if _, _, err := svc.ClaimIdempotentRequest(ctx, idempotencyScopeCreate, fingerprint, now, time.Minute); err != nil {
 		t.Fatalf("ClaimIdempotentRequest: %v", err)
@@ -580,7 +580,7 @@ func TestDeleteSnapshotResolveAndAliasErrors(t *testing.T) {
 		t.Fatalf("UpsertSnapshotAlias: %v", err)
 	}
 
-	if err := st.DeleteSnapshot(ctx, "del-snap:default"); err != nil {
+	if err := st.DeleteSnapshot(ctx, "", "del-snap:default"); err != nil {
 		t.Fatalf("DeleteSnapshot: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -949,7 +949,7 @@ func TestDeleteSnapshotAliasCleanupStoreError(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&snap); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if err := st.DeleteSnapshot(ctx, "alias-del:default"); err != nil {
+	if err := st.DeleteSnapshot(ctx, "", "alias-del:default"); err != nil {
 		t.Fatalf("DeleteSnapshot: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -979,22 +979,6 @@ func TestCreateSandboxClusterReservedLocalPath(t *testing.T) {
 		strings.NewReader(`{"templateID":"base","timeout":120}`)))
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestCreateRequestFingerprintAndMetadataHelpers(t *testing.T) {
-	fp, err := createRequestFingerprint("", "base", models.CreateSandboxRequest{Image: "ubuntu:22.04"}, sandboxMeta{
-		TemplateID: "base", TimeoutSeconds: 120, OnTimeout: "kill",
-	})
-	if err != nil || fp == "" {
-		t.Fatalf("fingerprint = %q err=%v", fp, err)
-	}
-	if got := sandboxIDFromFingerprint(fp); got == "" {
-		t.Fatal("expected deterministic sandbox id")
-	}
-	filter, err := parseMetadataFilter("env=prod")
-	if err != nil || filter["env"] != "prod" {
-		t.Fatalf("filter = %v err=%v", filter, err)
 	}
 }
 

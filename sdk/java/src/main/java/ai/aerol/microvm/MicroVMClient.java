@@ -27,6 +27,10 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
+import ai.aerol.microvm.model.ApiTokenList;
+import ai.aerol.microvm.model.CreateApiTokenOptions;
+import ai.aerol.microvm.model.CreatedApiToken;
+import ai.aerol.microvm.model.WhoAmI;
 import ai.aerol.microvm.model.AuditCoverage;
 import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
@@ -80,7 +84,21 @@ import ai.aerol.microvm.model.WasmModule;
 public class MicroVMClient {
     static final String DEFAULT_API_URL = "http://127.0.0.1:21212";
     static final String DEFAULT_API_VERSION = "v1";
-    static final String AUTH_REQUIRED_ERROR_MESSAGE = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
+    static final String AUTH_REQUIRED_ERROR_MESSAGE = "PAT token is required. Set patToken, SB_PAT_TOKEN or SB_API_TOKEN.";
+    /**
+     * The request header that selects which of a credential's teams a request
+     * acts for. Keep in sync with pkg/api.HeaderTeam on the server.
+     */
+    public static final String TEAM_HEADER = "X-AerolVM-Team";
+
+    /**
+     * The header a sandbox create carries so the server can recognise a retry
+     * of it. Keep in sync with clustercreate.HeaderIdempotencyKey on the
+     * server.
+     */
+    public static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+
+    private static final java.security.SecureRandom IDEMPOTENCY_KEY_RANDOM = new java.security.SecureRandom();
     private static final int STREAM_PREFIX_STDOUT = 0x01;
     private static final int STREAM_PREFIX_STDERR = 0x02;
     private static final int MAX_REDIRECTS = 5;
@@ -91,6 +109,7 @@ public class MicroVMClient {
 
     private final String apiUrl;
     private final String patToken;
+    private final String team;
     private final String apiVersion;
     private final String versionPrefix;
     private final HttpClient httpClient;
@@ -121,10 +140,17 @@ public class MicroVMClient {
         String configuredPatToken = trimToNull(effectiveConfig.patToken);
         String configuredApiUrl = trimToNull(effectiveConfig.apiUrl);
         String configuredApiVersion = trimToNull(effectiveConfig.apiVersion);
+        // SB_API_TOKEN is an alias of SB_PAT_TOKEN for any bearer; SB_PAT_TOKEN
+        // wins when both are set, so existing setups keep the token they had.
         String envPatToken = trimToNull(environment.get("SB_PAT_TOKEN"));
+        if (envPatToken == null) {
+            envPatToken = trimToNull(environment.get("SB_API_TOKEN"));
+        }
         String envApiUrl = trimToNull(environment.get("SB_API_URL"));
+        String configuredTeam = trimToNull(effectiveConfig.team);
 
         this.patToken = configuredPatToken != null ? configuredPatToken : envPatToken != null ? envPatToken : "";
+        this.team = configuredTeam != null ? configuredTeam : trimToNull(environment.get("SB_TEAM"));
         this.apiUrl = normalizeUrl(configuredApiUrl != null ? configuredApiUrl : envApiUrl != null ? envApiUrl : DEFAULT_API_URL);
         this.apiVersion = configuredApiVersion != null ? configuredApiVersion : DEFAULT_API_VERSION;
         String prefix = PATH_PREFIXES.get(this.apiVersion);
@@ -171,8 +197,104 @@ public class MicroVMClient {
         return patToken;
     }
 
+    /** The team sent as {@code X-AerolVM-Team}, or null when none is. */
+    public String getTeam() {
+        return team;
+    }
+
+    /**
+     * Who the server says the caller is: principal, role, team and when the
+     * credential expires. Every valid credential may ask.
+     */
+    public WhoAmI whoami() {
+        WhoAmI who = doJson("GET", versioned("/whoami"), null, WhoAmI.class);
+        if (who == null) {
+            who = new WhoAmI();
+        }
+        if (who.principal == null) {
+            who.principal = new ai.aerol.microvm.model.WhoAmIPrincipal();
+        }
+        return who;
+    }
+
+    /** Scoped API tokens ({@code avm_…}) for services and CI: {@code client.tokens().create/list/revoke}. */
+    public Tokens tokens() {
+        return new Tokens();
+    }
+
+    /**
+     * Scoped API tokens, reached through {@link MicroVMClient#tokens()}.
+     * Creating and revoking needs an admin credential; listing needs an
+     * auditor or an admin.
+     */
+    public final class Tokens {
+        private Tokens() {
+        }
+
+        /**
+         * Mints a token. The result's {@code token} is the secret, returned
+         * this once and never again. A 409 means the name is taken, possibly
+         * by an earlier attempt whose reply was lost; that secret cannot be
+         * recovered, so revoke the token and create it again.
+         */
+        public CreatedApiToken create(CreateApiTokenOptions options) {
+            CreateApiTokenOptions body = options == null ? new CreateApiTokenOptions() : options;
+            return doJson("POST", versioned("/tokens"), body, CreatedApiToken.class);
+        }
+
+        /**
+         * Lists every token, expired ones included ({@code expired} is true)
+         * until the server removes them 30 days after expiry. Never a secret.
+         */
+        public ApiTokenList list() {
+            ApiTokenList list = doJson("GET", versioned("/tokens"), null, ApiTokenList.class);
+            if (list == null) {
+                list = new ApiTokenList();
+            }
+            if (list.tokens == null) {
+                list.tokens = new ArrayList<>();
+            }
+            return list;
+        }
+
+        /**
+         * Revokes a token by id ({@code tok_…}). Revoking one that is already
+         * gone succeeds, so a retried revoke is safe.
+         */
+        public void revoke(String id) {
+            String trimmed = trimToNull(id);
+            if (trimmed == null) {
+                throw new MicroVMException("token id is required");
+            }
+            doNoContent("DELETE", versioned("/tokens/" + encodePathSegment(trimmed)), null);
+        }
+    }
+
+    /**
+     * Creates a sandbox. The request carries an {@code Idempotency-Key}: the
+     * caller's {@link CreateOptions#idempotencyKey}, or a random one made for
+     * this call. Either way it is sent unchanged on each of the call's
+     * automatic retries, so a create retried after a timeout gets back the
+     * sandbox the first attempt made instead of making a second one.
+     */
     public Sandbox create(CreateOptions options) {
-        return wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class));
+        String key = options == null ? null : trimToNull(options.idempotencyKey);
+        if (key == null) {
+            key = newIdempotencyKey();
+        }
+        return wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class, RetryMode.IDEMPOTENT,
+            Map.of(IDEMPOTENCY_KEY_HEADER, key)));
+    }
+
+    /** A fresh create key: 128 random bits as 32 lowercase hex characters. */
+    static String newIdempotencyKey() {
+        byte[] bytes = new byte[16];
+        IDEMPOTENCY_KEY_RANDOM.nextBytes(bytes);
+        StringBuilder key = new StringBuilder(32);
+        for (byte b : bytes) {
+            key.append(Character.forDigit((b >> 4) & 0xf, 16)).append(Character.forDigit(b & 0xf, 16));
+        }
+        return key.toString();
     }
 
     /**
@@ -1031,7 +1153,7 @@ public class MicroVMClient {
             }
         };
 
-        StreamingWebSocket socket = webSocketConnector.connect(webSocketUri(sandboxPath(sandboxId) + "/toolbox/process/exec/stream"), authorizationHeaderValue(), listener);
+        StreamingWebSocket socket = webSocketConnector.connect(webSocketUri(sandboxPath(sandboxId) + "/toolbox/process/exec/stream"), webSocketHeaders(), listener);
         socketRef.set(socket);
         socket.sendText(JsonSupport.write(effective));
         return new ExecStreamHandle(socket, completion);
@@ -1151,7 +1273,7 @@ public class MicroVMClient {
 
         StreamingWebSocket socket = webSocketConnector.connect(
             webSocketUri(sandboxPath(sandboxId) + "/sessions/" + encodePathSegment(sessionId) + "/attach"),
-            authorizationHeaderValue(),
+            webSocketHeaders(),
             listener
         );
         socketRef.set(socket);
@@ -1201,6 +1323,7 @@ public class MicroVMClient {
         copy.gpus = source.gpus;
         copy.customDomains = source.customDomains;
         copy.templateId = source.templateId;
+        copy.idempotencyKey = source.idempotencyKey;
         return copy;
     }
 
@@ -1227,7 +1350,12 @@ public class MicroVMClient {
     }
 
     private <T> T doJson(String method, String path, Object payload, Class<T> responseType, RetryMode retryMode) {
-        HttpResponse<byte[]> response = sendJsonRequest(method, path, payload, retryMode);
+        return doJson(method, path, payload, responseType, retryMode, null);
+    }
+
+    /** {@code extraHeaders} are set on every attempt, so a retry carries them unchanged. */
+    private <T> T doJson(String method, String path, Object payload, Class<T> responseType, RetryMode retryMode, Map<String, String> extraHeaders) {
+        HttpResponse<byte[]> response = sendJsonRequest(method, path, payload, retryMode, extraHeaders);
         ensureSuccess(response);
         if (responseType == null || response.statusCode() == 204 || response.body().length == 0) {
             return null;
@@ -1245,11 +1373,15 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendJsonRequest(String method, String path, Object payload, RetryMode retryMode) {
+        return sendJsonRequest(method, path, payload, retryMode, null);
+    }
+
+    private HttpResponse<byte[]> sendJsonRequest(String method, String path, Object payload, RetryMode retryMode, Map<String, String> extraHeaders) {
         if (payload == null) {
-            return sendRequest(method, path, HttpRequest.BodyPublishers.noBody(), null, null, retryMode);
+            return sendRequest(method, path, HttpRequest.BodyPublishers.noBody(), null, extraHeaders, retryMode);
         }
         byte[] body = JsonSupport.writeBytes(payload);
-        return sendRequest(method, path, HttpRequest.BodyPublishers.ofByteArray(body), "application/json", null, retryMode);
+        return sendRequest(method, path, HttpRequest.BodyPublishers.ofByteArray(body), "application/json", extraHeaders, retryMode);
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType) {
@@ -1264,14 +1396,17 @@ public class MicroVMClient {
         int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
         int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
         int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
+        int maxRetryAfter = retryConfig.maxRetryAfterMs != null ? retryConfig.maxRetryAfterMs : RetryAfter.DEFAULT_MAX_RETRY_AFTER_MS;
 
         Exception lastException = null;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            String retryAfter = null;
             try {
                 HttpResponse<byte[]> response = sendFollowingRedirects(method, resolve(path), bodyPublisher, contentType, extraHeaders);
                 if (attempt < maxRetries && retryMode.retriesStatus(response.statusCode())) {
                     // Fall through to retry logic
+                    retryAfter = RetryAfter.hint(response);
                 } else {
                     return response;
                 }
@@ -1288,10 +1423,12 @@ public class MicroVMClient {
                 }
             }
 
-            int delayMs = Math.min(baseDelay * (1 << attempt), maxDelay);
-            double jitter = 1.0 + (Math.random() - 0.5) * 0.5;
+            // A 429 or 503 waits as long as its Retry-After asks, within
+            // maxRetryAfterMs. An interrupt (Future.cancel(true), executor
+            // shutdown) ends the wait at once.
+            long waitMs = RetryAfter.waitMillis(baseDelay, maxDelay, maxRetryAfter, attempt, retryAfter, java.time.Instant.now(), Math.random());
             try {
-                Thread.sleep((long) (delayMs * jitter));
+                Thread.sleep(waitMs);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new MicroVMException("request interrupted during backoff", e);
@@ -1345,6 +1482,9 @@ public class MicroVMClient {
             }
             if (!crossOrigin) {
                 builder.header("Authorization", authorizationHeaderValue());
+                if (team != null) {
+                    builder.header(TEAM_HEADER, team);
+                }
             }
 
             HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
@@ -1444,11 +1584,15 @@ public class MicroVMClient {
 
     private void ensureSuccess(HttpResponse<byte[]> response) {
         if (response.statusCode() >= 400) {
+            int status = response.statusCode();
+            java.time.Duration retryAfter = RetryAfter.parse(
+                response.headers().firstValue("Retry-After").orElse(null), java.time.Instant.now());
             ErrorResponse error = JsonSupport.tryRead(response.body(), ErrorResponse.class);
             if (error != null && error.error != null && !error.error.isEmpty()) {
-                throw new MicroVMException(error.error);
+                String code = error.code == null || error.code.isEmpty() ? null : error.code;
+                throw new MicroVMApiException(status, code, error.error, retryAfter);
             }
-            throw new MicroVMException("request failed with status " + response.statusCode());
+            throw new MicroVMApiException(status, null, "request failed with status " + status, retryAfter);
         }
     }
 
@@ -1479,6 +1623,16 @@ public class MicroVMClient {
 
     private String authorizationHeaderValue() {
         return "Bearer " + patToken;
+    }
+
+    /** The WebSocket handshake headers: the same credential and team as every HTTP request. */
+    private Map<String, String> webSocketHeaders() {
+        Map<String, String> headers = new java.util.LinkedHashMap<>();
+        headers.put("Authorization", authorizationHeaderValue());
+        if (team != null) {
+            headers.put(TEAM_HEADER, team);
+        }
+        return headers;
     }
 
     private String sandboxPath(String sandboxId) {
@@ -1653,6 +1807,7 @@ public class MicroVMClient {
     @SuppressWarnings("unused")
     private static final class ErrorResponse {
         public String error;
+        public String code;
     }
 
     @SuppressWarnings("unused")

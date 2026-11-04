@@ -21,8 +21,15 @@ import (
 // touched — a real /proc/sys write either fails with EPERM or, when the suite
 // runs as root, silently disables IPv6 host-wide. Tests that need to observe the
 // invocation swap the seam locally.
+//
+// It also keeps every Run in this package off the real
+// /run/sandboxd/live.sock (a root-run test container would otherwise share
+// one path across tests); the liveness tests set their own short path.
 func TestMain(m *testing.M) {
 	ensureSandboxIPv6Disabled = func(string) error { return nil }
+	if os.Getenv("SB_LIVENESS_SOCKET") == "" {
+		_ = os.Setenv("SB_LIVENESS_SOCKET", "off")
+	}
 	os.Exit(m.Run())
 }
 

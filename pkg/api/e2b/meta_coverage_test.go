@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func TestSandboxMetaFromNativeNilTagsAndNetworkDefaults(t *testing.T) {
@@ -57,6 +58,24 @@ func TestSandboxMetaFromNativeDestroyAtAgeBranch(t *testing.T) {
 	meta := sandboxMetaFromNative(sb, compatBlob{Secure: true, OnTimeout: "kill"})
 	if meta.TimeoutSeconds <= 0 {
 		t.Fatalf("expected positive timeout from destroy-at-age, got %d", meta.TimeoutSeconds)
+	}
+}
+
+func TestCreateRequestFingerprintAndMetadataHelpers(t *testing.T) {
+	d := cipherDigester{fpCipher(t, secrets.RingKey{ID: 0, Key: fpKey(1), Current: true})}
+	fps, err := createRequestFingerprints(d, "", "base", models.CreateSandboxRequest{Image: "ubuntu:22.04"}, sandboxMeta{
+		TemplateID: "base", TimeoutSeconds: 120, OnTimeout: "kill",
+	}, false)
+	fp := fps.current
+	if err != nil || fp == "" {
+		t.Fatalf("fingerprint = %q err=%v", fp, err)
+	}
+	if got := sandboxIDFromFingerprint(fp); got == "" {
+		t.Fatal("expected deterministic sandbox id")
+	}
+	filter, err := parseMetadataFilter("env=prod")
+	if err != nil || filter["env"] != "prod" {
+		t.Fatalf("filter = %v err=%v", filter, err)
 	}
 }
 

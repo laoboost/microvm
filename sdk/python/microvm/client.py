@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import datetime
+import email.utils
 import importlib
 import json
 import os
 import random
+import secrets
 import socket
 import threading
 import time
@@ -18,6 +21,11 @@ from typing import Any, Dict, Iterator, List, Optional, Union
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .image import Image
 from .types import (
+    APIToken,
+    APITokenList,
+    CreateAPITokenOptions,
+    CreatedAPIToken,
+    WhoAmI,
     BuildImagePushOptions,
     BuildImageResult,
     CloneGeneration,
@@ -128,8 +136,36 @@ _RETRY_STATUSES = frozenset({421, 429, 502, 503, 504})
 # A request that must not run twice (exec) retries only the statuses that say
 # the server turned it away before doing any work. A 421, 502 or 504 comes
 # from a hop that already read the request, so whether the command started
-# is unknown.
+# is unknown. These are also the statuses whose Retry-After paces clients:
+# 429 when this caller is over its share, 503 when the node sheds load. A
+# Retry-After on a 421, 502 or 504 is a hop's, so those use the backoff.
 _NOT_STARTED_STATUSES = frozenset({429, 503})
+# An overloaded node asks for about a second, so the cap only bites on a long
+# ask (maintenance, a misconfigured proxy), which should not hold a call for
+# minutes per retry.
+_DEFAULT_MAX_RETRY_AFTER_MS = 30000
+# Longer delta-seconds values are clamped: no cap is that long anyway.
+_MAX_RETRY_AFTER_SECONDS = 10**9
+
+
+def _parse_retry_after(value: Optional[str], now: float) -> Optional[float]:
+    """Seconds a ``Retry-After`` value asks for, in either form RFC 9110
+    allows: delta-seconds (``"120"``) or an HTTP date. A date already past is
+    0. ``None`` for an absent or malformed value. ``now`` is a Unix time."""
+    text = (value or "").strip()
+    # isascii: str.isdigit alone also takes digits such as "²".
+    if text.isascii() and text.isdigit():
+        return float(min(int(text), _MAX_RETRY_AFTER_SECONDS))
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        # The asctime form carries no zone; HTTP dates are always GMT.
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(when.timestamp() - now, 0.0)
 
 
 def _normalize_url(value: str) -> str:
@@ -150,14 +186,85 @@ def _read_env(name: str) -> Optional[str]:
     return value if value not in (None, "") else None
 
 
+# The request header that selects which of a credential's teams a request
+# acts for. Keep in sync with pkg/api.HeaderTeam on the server.
+TEAM_HEADER = "X-AerolVM-Team"
+
+# The header a sandbox create carries so the server can recognise a retry of
+# it. Keep in sync with clustercreate.HeaderIdempotencyKey on the server.
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+def _new_idempotency_key() -> str:
+    """A fresh create key: 128 random bits as 32 lowercase hex characters."""
+    return secrets.token_hex(16)
+
+
 class MicroVMError(Exception):
     pass
 
 
 class MicroVMHTTPError(MicroVMError):
-    def __init__(self, status_code: int, message: str) -> None:
+    """An HTTP error response from sandboxd. ``str(err)`` is the server's
+    message, or the HTTP reason phrase when the body is not the server's
+    JSON (a proxy's error page). ``status_code`` is the HTTP status. The
+    other attributes are empty unless the server sent them:
+
+    - ``code``: a stable error code a client can act on, such as
+      ``idempotency_key_reused`` or ``overloaded``.
+    - ``retry_after``: how many seconds the response's ``Retry-After``
+      header asked the caller to wait; ``None`` without a usable header.
+    - ``reason``: why an avm_ API token or an OIDC token was refused
+      (``expired``, ``unknown_or_revoked``, ``no_binding``, ...).
+    - ``required_permission`` and ``role``: on a 403 for an API token or an
+      OIDC caller, the permission the route needs and the role held.
+    - ``issuer``, ``name`` and ``groups``: on the 403 an OIDC caller gets
+      when no role binding matches, the caller's own claims.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        code: str = "",
+        reason: str = "",
+        required_permission: str = "",
+        role: str = "",
+        issuer: str = "",
+        name: str = "",
+        groups: Optional[List[str]] = None,
+        retry_after: Optional[float] = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+        self.retry_after = retry_after
+        self.reason = reason
+        self.required_permission = required_permission
+        self.role = role
+        self.issuer = issuer
+        self.name = name
+        self.groups: List[str] = list(groups or [])
+
+
+def _http_error(status_code: int, data: Any, fallback: str, retry_after: Optional[float] = None) -> MicroVMHTTPError:
+    """Builds the error for a decoded JSON error body."""
+    if not isinstance(data, dict):
+        return MicroVMHTTPError(status_code, fallback, retry_after=retry_after)
+    groups = data.get("groups")
+    return MicroVMHTTPError(
+        status_code,
+        str(data.get("error", fallback)),
+        retry_after=retry_after,
+        code=str(data.get("code") or ""),
+        reason=str(data.get("reason") or ""),
+        required_permission=str(data.get("required_permission") or ""),
+        role=str(data.get("role") or ""),
+        issuer=str(data.get("issuer") or ""),
+        name=str(data.get("name") or ""),
+        groups=[str(g) for g in groups] if isinstance(groups, list) else None,
+    )
 
 
 # Cap a single WebSocket message the SDK hands to a caller, matching the Go and
@@ -539,7 +646,7 @@ class Sandbox:
 
 class MicroVM:
     default_api_url = "http://127.0.0.1:21212"
-    auth_required_error_message = "PAT token is required. Set pat_token or SB_PAT_TOKEN."
+    auth_required_error_message = "PAT token is required. Set pat_token, SB_PAT_TOKEN or SB_API_TOKEN."
 
     def __init__(
         self,
@@ -548,19 +655,35 @@ class MicroVM:
         *,
         api_version: str = _DEFAULT_API_VERSION,
         config: Optional[MicroVMConfig] = None,
+        team: Optional[str] = None,
     ) -> None:
+        """``pat_token`` is the bearer every request carries: the operator
+        PAT, an avm_ API token or an OIDC ID token. It defaults to
+        ``SB_PAT_TOKEN``, then its alias ``SB_API_TOKEN``; when both are set,
+        ``SB_PAT_TOKEN`` wins.
+
+        ``team`` (default ``SB_TEAM``) is sent as the ``X-AerolVM-Team``
+        header on every request, WebSocket handshakes included. With
+        neither, no header is sent and the server uses the credential's
+        first matching binding. The header only chooses among teams the
+        credential is already bound to: a team it does not hold is refused
+        (403), and the operator PAT ignores it.
+        """
         if config is not None:
             api_url = api_url or config.get("apiUrl")
             pat_token = pat_token or config.get("patToken")
-        
+            team = team or config.get("team")
+
         self.api_url = _normalize_url(api_url or _read_env("SB_API_URL") or self.default_api_url)
-        self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or ""
+        self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or _read_env("SB_API_TOKEN") or ""
+        self.team = (team or _read_env("SB_TEAM") or "").strip()
 
         retry_cfg: RetryConfig = config.get("retry", {}) if config else {}
         self._retry_config = {
             "maxRetries": retry_cfg.get("maxRetries", 3),
             "baseDelayMs": retry_cfg.get("baseDelayMs", 200),
             "maxDelayMs": retry_cfg.get("maxDelayMs", 5000),
+            "maxRetryAfterMs": retry_cfg.get("maxRetryAfterMs", _DEFAULT_MAX_RETRY_AFTER_MS),
         }
 
         if not self.pat_token:
@@ -586,7 +709,16 @@ class MicroVM:
         # keyword replaces the same key in the dict.
         resolved_options: Dict[str, Any] = {**(options or {}), **fields}
         resolved_options["image"] = self._resolve_image(_first_of(resolved_options, "image"))
-        sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(resolved_options))
+        # One key per call, sent unchanged on each of its automatic retries: a
+        # create retried after a timeout gets back the sandbox the first
+        # attempt made instead of making a second one.
+        key = str(_first_of(resolved_options, "idempotency_key", "idempotencyKey") or "").strip() or _new_idempotency_key()
+        sandbox = self._do_json(
+            "POST",
+            self._versioned("/sandboxes"),
+            _to_api_create_options(resolved_options),
+            headers={IDEMPOTENCY_KEY_HEADER: key},
+        )
         return self._wrap_sandbox(sandbox)
 
     def build_image(self, image: Image) -> str:
@@ -1081,6 +1213,17 @@ class MicroVM:
     def _egress_profile_path(self, name: str) -> str:
         return f"{self._version_prefix}/egress-profiles/{_resource_path(name)}"
 
+    def whoami(self) -> WhoAmI:
+        """Who the server says the caller is: principal, role, team and when
+        the credential expires. Every valid credential may ask."""
+        return _from_api_whoami(self._do_json("GET", self._versioned("/whoami"), None) or {})
+
+    @property
+    def tokens(self) -> "Tokens":
+        """Scoped API tokens (avm_…) for services and CI:
+        ``client.tokens.create/list/revoke``."""
+        return Tokens(self)
+
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         # Not idempotent: a re-sent POST runs the user's command again, so a
         # timeout or reset after the request went out surfaces instead of
@@ -1100,7 +1243,7 @@ class MicroVM:
 
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(self.api_url, f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
-        ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "exec stream")
+        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "exec stream")
         ws.send(json.dumps(_to_api_exec_stream_request(options)))
         return ExecStreamHandle(websocket_module, ws, options)
 
@@ -1146,7 +1289,7 @@ class MicroVM:
             self.api_url,
             f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
         )
-        ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "session attach")
+        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "session attach")
 
         cols = _first_of(attach_options, "cols")
         rows = _first_of(attach_options, "rows")
@@ -1278,6 +1421,12 @@ class MicroVM:
     def _url(self, path: str) -> str:
         return f"{self.api_url}{path}"
 
+    def _websocket_headers(self) -> List[str]:
+        headers = [f"Authorization: Bearer {self.pat_token}"]
+        if self.team:
+            headers.append(f"{TEAM_HEADER}: {self.team}")
+        return headers
+
     def _request(
         self,
         method: str,
@@ -1309,18 +1458,24 @@ class MicroVM:
         that prove the server never got the request, plus 429 and 503: a
         timeout or reset after the request was written leaves it unknown
         whether the command ran, and a retry would run it again.
+
+        A 429 or 503 waits as long as its ``Retry-After`` asks (see
+        :meth:`_retry_delay`). The wait is a plain ``time.sleep``, so a
+        signal handler that raises (Ctrl-C, a ``signal.alarm`` timeout) ends
+        it at once.
         """
         max_retries = self._retry_config["maxRetries"]
-        base_delay_ms = self._retry_config["baseDelayMs"]
-        max_delay_ms = self._retry_config["maxDelayMs"]
         retry_statuses = _RETRY_STATUSES if idempotent else _NOT_STARTED_STATUSES
 
         last_exc: Optional[Exception] = None
         opener = urllib.request.build_opener(_SafeRedirectHandler())
 
         for attempt in range(max_retries + 1):
+            retry_after: Optional[str] = None
             request = urllib.request.Request(url, data=body, method=method)
             request.add_header("Authorization", f"Bearer {self.pat_token}")
+            if self.team:
+                request.add_header(TEAM_HEADER, self.team)
             if content_type is not None:
                 request.add_header("Content-Type", content_type)
             for header_key, header_val in (extra_headers or {}).items():
@@ -1333,18 +1488,21 @@ class MicroVM:
             except urllib.error.HTTPError as exc:
                 last_exc = exc
                 if exc.code in retry_statuses and attempt < max_retries:
+                    if exc.code in _NOT_STARTED_STATUSES and exc.headers is not None:
+                        retry_after = exc.headers.get("Retry-After")
                     # Free the socket before the backoff sleep.
                     exc.close()
                 else:
+                    wait = _parse_retry_after(exc.headers.get("Retry-After"), time.time()) if exc.headers is not None else None
                     try:
                         payload = exc.read()
                     finally:
                         exc.close()
                     try:
                         data = json.loads(payload.decode("utf-8"))
-                        raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
                     except (ValueError, TypeError):
-                        raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
+                        raise MicroVMHTTPError(exc.code, str(exc.reason), retry_after=wait) from exc
+                    raise _http_error(exc.code, data, str(exc.reason), wait) from exc
             except urllib.error.URLError as exc:
                 last_exc = exc
                 if attempt >= max_retries or not (idempotent or _request_never_sent(exc)):
@@ -1356,17 +1514,46 @@ class MicroVM:
                 last_exc = exc
                 if attempt >= max_retries or not idempotent:
                     raise
-            
-            # Compute delay with exponential backoff and jitter
-            delay_ms = min(base_delay_ms * (2 ** attempt), max_delay_ms)
-            jitter = 1.0 + (random.random() - 0.5) * 0.5
-            time.sleep((delay_ms * jitter) / 1000.0)
+
+            time.sleep(self._retry_delay(attempt, retry_after, time.time(), random.random()))
 
         assert last_exc is not None
         raise last_exc
 
-    def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]], *, idempotent: bool = True) -> Any:
-        data, _ = self._do_json_headers(method, path, payload, idempotent=idempotent)
+    def _retry_delay(self, attempt: int, retry_after: Optional[str], now: float, rand: float) -> float:
+        """Seconds to wait before re-sending. ``attempt`` counts from 0,
+        ``retry_after`` is a 429/503's header (``None`` otherwise) and
+        ``rand`` is uniform in [0, 1).
+
+        Without a usable header it is the exponential backoff ±25%. With one,
+        it never retries sooner than the server asked (nor sooner than the
+        backoff) and adds up to a fifth so clients told the same value spread
+        out. ``maxRetryAfterMs`` is a hard ceiling: when the server asks for
+        at least that long the client is early anyway, so the spread goes
+        below it instead.
+        """
+        backoff = min(self._retry_config["baseDelayMs"] * (2 ** attempt), self._retry_config["maxDelayMs"]) / 1000.0
+        limit = self._retry_config["maxRetryAfterMs"] / 1000.0
+        hint = _parse_retry_after(retry_after, now) if limit > 0 else None
+        if hint is None:
+            return backoff * (0.75 + 0.5 * rand)
+        target = max(hint, backoff)
+        if target >= limit:
+            return limit - limit * 0.2 * rand
+        upper = min(target * 1.2, limit)
+        return target + (upper - target) * rand
+
+    def _do_json(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        idempotent: bool = True,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        """``headers`` are extra request headers, sent unchanged on every retry."""
+        data, _ = self._do_json_headers(method, path, payload, idempotent=idempotent, headers=headers)
         return data
 
     def _do_json_headers(
@@ -1376,16 +1563,19 @@ class MicroVM:
         payload: Optional[Dict[str, Any]],
         *,
         idempotent: bool = True,
+        headers: Optional[Dict[str, str]] = None,
     ) -> tuple[Any, Dict[str, str]]:
         body = None
         content_type = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
-        raw, headers = self._request_headers(method, self._url(path), body, content_type, idempotent=idempotent)
+        raw, response_headers = self._request_headers(
+            method, self._url(path), body, content_type, headers, idempotent=idempotent
+        )
         if raw == b"":
-            return {}, headers
-        return json.loads(raw.decode("utf-8")), headers
+            return {}, response_headers
+        return json.loads(raw.decode("utf-8")), response_headers
 
     def _do_multipart(
         self,
@@ -1422,11 +1612,83 @@ class MicroVM:
         self._request("POST", self._url(path), body.getvalue(), f"multipart/form-data; boundary={boundary}")
 
 
+class Tokens:
+    """Scoped API tokens (avm_…) for services and CI, reached as
+    ``client.tokens``. Creating and revoking needs an admin credential;
+    listing needs an auditor or an admin."""
+
+    def __init__(self, client: MicroVM) -> None:
+        self._client = client
+
+    def create(self, options: Optional[CreateAPITokenOptions] = None, **fields: Any) -> CreatedAPIToken:
+        """Mint a token. Takes ``name``, ``role``, ``team`` and ``expiresIn``
+        (or ``expires_in``) as a dict or as keywords. The result's ``token``
+        is the secret, returned this once and never again.
+
+        A 409 means the name is taken, possibly by an earlier attempt whose
+        reply was lost; that secret cannot be recovered, so revoke the token
+        and create it again.
+        """
+        resolved: Dict[str, Any] = {**(options or {}), **fields}
+        body = {
+            "name": str(_first_of(resolved, "name") or ""),
+            "role": str(_first_of(resolved, "role") or ""),
+            "team": str(_first_of(resolved, "team") or ""),
+            "expires_in": str(_first_of(resolved, "expiresIn", "expires_in") or ""),
+        }
+        payload = self._client._do_json("POST", self._client._versioned("/tokens"), body) or {}
+        created: CreatedAPIToken = {**_from_api_api_token(payload), "token": str(payload.get("token") or "")}  # type: ignore[typeddict-item]
+        return created
+
+    def list(self) -> APITokenList:
+        """Every token, expired ones included (``expired`` is True) until the
+        server removes them 30 days after expiry. Never a secret."""
+        payload = self._client._do_json("GET", self._client._versioned("/tokens"), None) or {}
+        tokens = payload.get("tokens") if isinstance(payload, dict) else None
+        return {"tokens": [_from_api_api_token(t) for t in tokens or [] if isinstance(t, dict)]}
+
+    def revoke(self, token_id: str) -> None:
+        """Revoke a token by id (tok_…). Revoking one that is already gone
+        succeeds, so a retried revoke is safe."""
+        trimmed = (token_id or "").strip()
+        if not trimmed:
+            raise ValueError("token id is required")
+        self._client._do_json("DELETE", self._client._versioned(f"/tokens/{urllib.parse.quote(trimmed, safe='')}"), None)
+
+
+def _from_api_whoami(payload: Dict[str, Any]) -> WhoAmI:
+    principal = payload.get("principal") or {}
+    result: WhoAmI = {
+        "principal": {"kind": str(principal.get("kind") or ""), "id": str(principal.get("id") or "")},
+        "role": str(payload.get("role") or ""),
+    }
+    if principal.get("name"):
+        result["principal"]["name"] = str(principal["name"])
+    if payload.get("team"):
+        result["team"] = str(payload["team"])
+    if payload.get("expires_at"):
+        result["expiresAt"] = str(payload["expires_at"])
+    return result
+
+
+def _from_api_api_token(payload: Dict[str, Any]) -> APIToken:
+    return {
+        "id": str(payload.get("id") or ""),
+        "name": str(payload.get("name") or ""),
+        "role": str(payload.get("role") or ""),
+        "team": str(payload.get("team") or ""),
+        "createdBy": str(payload.get("created_by") or ""),
+        "createdAt": str(payload.get("created_at") or ""),
+        "expiresAt": str(payload.get("expires_at") or ""),
+        "expired": bool(payload.get("expired", False)),
+    }
+
+
 def _load_websocket_module() -> Any:
     return importlib.import_module("websocket")
 
 
-def _connect_websocket(websocket_module: Any, ws_url: str, pat_token: str, label: str) -> Any:
+def _connect_websocket(websocket_module: Any, ws_url: str, headers: List[str], label: str) -> Any:
     """create_connection wrapper that surfaces HTTP status/body on bad
     handshake. websocket-client raises WebSocketBadStatusException for non-101
     responses, which carries .status_code and .resp_body but stringifies as
@@ -1439,7 +1701,7 @@ def _connect_websocket(websocket_module: Any, ws_url: str, pat_token: str, label
     try:
         return websocket_module.create_connection(
             ws_url,
-            header=[f"Authorization: Bearer {pat_token}"],
+            header=headers,
             enable_multithread=True,
         )
     except Exception as exc:

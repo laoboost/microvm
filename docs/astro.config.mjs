@@ -14,7 +14,11 @@ export default defineConfig({
   markdown: {
     processor: satteri({ features: { gfm: true } }),
   },
-  site: process.env.PUBLIC_SITE_URL || 'http://localhost:4321',
+  // The production docs live at microvm.aerol.ai. Cloudflare's build does
+  // not set PUBLIC_SITE_URL, so a localhost fallback put http://localhost:4321
+  // in every canonical link, og:url and the sitemap. Previews can still
+  // override it.
+  site: process.env.PUBLIC_SITE_URL || 'https://microvm.aerol.ai',
   base: process.env.PUBLIC_BASE_PATH || '/',
   outDir: './dist',
   redirects: {
@@ -32,6 +36,8 @@ export default defineConfig({
     '/preview': '/public-urls',
     '/port-allowlist': '/public-urls',
     '/comparison': '/aerolvm-vs-daytona-vs-e2b',
+    // enterprise/access-control.mdx was renamed to enterprise/sso.mdx.
+    '/enterprise/access-control': '/enterprise/sso',
   },
   integrations: [
     // Must precede starlight() so it rewrites ```mermaid fenced blocks into

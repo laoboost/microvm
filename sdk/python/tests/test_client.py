@@ -1,8 +1,13 @@
+import concurrent.futures
+import email.utils
 import http.client
 import http.server
 import json
+import os
+import signal
 import socket
 import threading
+import time
 import unittest
 import unittest.mock
 import urllib.error
@@ -20,9 +25,11 @@ class RecordingMicroVM(MicroVM):
         self.calls = []
         self.raw_calls = []
         self.non_idempotent_calls = []
+        self.headers = []
 
-    def _do_json(self, method, path, payload, *, idempotent=True):  # type: ignore[override]
+    def _do_json(self, method, path, payload, *, idempotent=True, headers=None):  # type: ignore[override]
         self.calls.append((method, path, payload))
+        self.headers.append(dict(headers or {}))
         if not idempotent:
             self.non_idempotent_calls.append((method, path))
         if method == "POST" and path == "/v1/images/build":
@@ -1515,6 +1522,396 @@ class ExecRetryTests(unittest.TestCase):
                     self.assertEqual(opened.call_count, 4 if retried else 1)
 
 
+class HTTPErrorTests(unittest.TestCase):
+    """Every HTTP error is a MicroVMHTTPError carrying the status, the
+    server's stable code and its Retry-After, with the message unchanged."""
+
+    def _serve(self, status, body, content_type="application/json", retry_after=None, retry=None):
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                hits.append(self.rfile.read(length))
+                self.send_response(status)
+                if retry_after is not None:
+                    self.send_header("Retry-After", retry_after)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        config = {"retry": dict(_FAST_RETRY["retry"], **(retry or {}))}
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config=config), hits
+
+    def test_create_errors_carry_status_code_and_retry_after(self):
+        cases = [
+            # (name, status, body, content type, Retry-After, retry config,
+            #  want code, want message, want retry_after, want hits)
+            (
+                "422 idempotency_key_reused is not retried",
+                422,
+                b'{"error": "Idempotency-Key reused with a different request", "code": "idempotency_key_reused"}',
+                "application/json",
+                None,
+                None,
+                "idempotency_key_reused",
+                "Idempotency-Key reused with a different request",
+                None,
+                1,
+            ),
+            (
+                "503 egress_floor_not_ready with Retry-After",
+                503,
+                b'{"error": "egress deny floor not ready", "code": "egress_floor_not_ready"}',
+                "application/json",
+                "5",
+                {"maxRetries": 0},
+                "egress_floor_not_ready",
+                "egress deny floor not ready",
+                5.0,
+                1,
+            ),
+            (
+                "non-JSON body keeps the reason phrase and has no code",
+                502,
+                b"<html>Bad Gateway</html>",
+                "text/html",
+                None,
+                {"maxRetries": 0},
+                "",
+                "Bad Gateway",
+                None,
+                1,
+            ),
+        ]
+        for name, status, body, ctype, header, retry, code, message, wait, want_hits in cases:
+            with self.subTest(name):
+                client, hits = self._serve(status, body, ctype, header, retry)
+                with self.assertRaises(MicroVMHTTPError) as ctx:
+                    client.create(image="ubuntu:22.04")
+                err = ctx.exception
+                self.assertIsInstance(err, MicroVMError)
+                self.assertEqual(err.status_code, status)
+                self.assertEqual(err.code, code)
+                self.assertEqual(str(err), message)
+                self.assertEqual(err.retry_after, wait)
+                self.assertEqual(len(hits), want_hits)
+
+    def test_error_types_are_exported_from_the_package(self):
+        import microvm
+
+        self.assertIs(microvm.MicroVMHTTPError, MicroVMHTTPError)
+        self.assertIs(microvm.MicroVMError, MicroVMError)
+
+
+class IdempotencyKeyTests(unittest.TestCase):
+    """A create carries an Idempotency-Key: the caller's, or one the SDK makes
+    per call and sends unchanged on every automatic retry of that call."""
+
+    def _serve(self, script):
+        """Answers request N with script[N] ("ok", "503", "hangup" or "422";
+        the last entry repeats). Returns the client and, per request, its
+        method, path, Idempotency-Key header and body."""
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _handle(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                seen.append((self.command, self.path, self.headers.get("Idempotency-Key"), self.rfile.read(length)))
+                step = script[min(len(seen), len(script)) - 1]
+                if step == "hangup":
+                    self.close_connection = True
+                    return
+                if step in ("503", "422"):
+                    code = "egress_floor_not_ready" if step == "503" else "idempotency_key_reused"
+                    body = json.dumps({"error": "refused", "code": code}).encode("utf-8")
+                    self.send_response(int(step))
+                    if step == "503":
+                        self.send_header("Retry-After", "0")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = json.dumps({"id": "sb-keyed", "image": "ubuntu:22.04", "stdout": "", "exit_code": 0}).encode("utf-8")
+                self.send_response(201 if self.command == "POST" and self.path == "/v1/sandboxes" else 200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = _handle
+            do_POST = _handle
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config=_FAST_RETRY), seen
+
+    def test_sends_the_callers_key_and_keeps_it_out_of_the_body(self):
+        for name, call in [
+            ("keyword", lambda c: c.create(image="ubuntu:22.04", idempotency_key=" order-42 ")),
+            ("dict camelCase", lambda c: c.create({"image": "ubuntu:22.04", "idempotencyKey": "order-42"})),
+        ]:
+            with self.subTest(name):
+                client, seen = self._serve(["ok"])
+                call(client)
+                self.assertEqual(seen[0][2], "order-42")
+                body = json.loads(seen[0][3])
+                self.assertNotIn("idempotency_key", body)
+                self.assertNotIn("idempotencyKey", body)
+                self.assertEqual(body["image"], "ubuntu:22.04")
+
+    def test_generated_key_is_the_same_on_every_retry(self):
+        for first in ("503", "hangup"):
+            with self.subTest(first=first):
+                client, seen = self._serve([first, first, "ok"])
+                sandbox = client.create(image="ubuntu:22.04")
+                self.assertEqual(sandbox.id, "sb-keyed")
+                keys = [entry[2] for entry in seen]
+                self.assertEqual(len(keys), 3)
+                self.assertRegex(keys[0], r"^[0-9a-f]{32}$")
+                self.assertEqual(keys, [keys[0]] * 3)
+
+    def test_callers_key_is_the_same_on_every_retry(self):
+        client, seen = self._serve(["503", "ok"])
+        client.create(image="ubuntu:22.04", idempotency_key="order-42")
+        self.assertEqual([entry[2] for entry in seen], ["order-42", "order-42"])
+
+    def test_each_create_call_gets_a_new_key(self):
+        client, seen = self._serve(["ok"])
+        client.create(image="ubuntu:22.04")
+        client.create(image="ubuntu:22.04")
+        client.create(image="ubuntu:22.04", idempotency_key="   ")
+        keys = [entry[2] for entry in seen]
+        self.assertEqual(len(set(keys)), 3)
+        for key in keys:
+            self.assertRegex(key, r"^[0-9a-f]{32}$")
+
+    def test_reused_key_is_not_retried(self):
+        client, seen = self._serve(["422"])
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            client.create(image="ubuntu:22.04", idempotency_key="order-42")
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.code, "idempotency_key_reused")
+        self.assertEqual(len(seen), 1)
+
+    def test_only_sandbox_create_sends_the_header(self):
+        client, seen = self._serve(["ok"])
+        client.get("sb-keyed")
+        client.exec("sb-keyed", {"command": "true"})
+        self.assertEqual([entry[2] for entry in seen], [None, None])
+
+
+class RetryAfterTests(unittest.TestCase):
+    """A 429 or 503 waits as long as the server's Retry-After asks, within
+    ``maxRetryAfterMs``; anything else keeps the client's own backoff."""
+
+    def _serve(self, status, refusals, retry_after, retry=None):
+        """Answer the first ``refusals`` requests with ``status`` and the
+        Retry-After ``retry_after()`` returns, then 200. Returns the client
+        and the arrival time of each request."""
+        arrivals = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _handle(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                arrivals.append(time.monotonic())
+                if len(arrivals) <= refusals:
+                    body = b'{"error": "busy", "code": "overloaded"}'
+                    self.send_response(status)
+                    value = retry_after()
+                    if value is not None:
+                        self.send_header("Retry-After", value)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                _ok(self, len(arrivals))
+
+            do_GET = _handle
+            do_POST = _handle
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        config = {"retry": dict(_FAST_RETRY["retry"], **(retry or {}))}
+        return MicroVM("http://127.0.0.1:%d" % server.server_port, "pat", config=config), arrivals
+
+    # Get is idempotent; exec is re-sent only after a refusal. Both honour it.
+    _CALLS = [
+        ("get", lambda c: c.get("sb-1")),
+        ("exec", lambda c: c.exec("sb-1", {"command": "true"})),
+    ]
+
+    def test_parse_retry_after(self):
+        now = 1793620800.0  # Mon, 02 Nov 2026 12:00:00 GMT
+        cases = [
+            (None, None),
+            ("", None),
+            ("   ", None),
+            ("3", 3.0),
+            (" 3 ", 3.0),
+            ("0", 0.0),
+            ("-1", None),
+            ("+3", None),
+            ("1.5", None),
+            ("\u00b2", None),
+            ("soon", None),
+            ("99999999999999999999", float(10**9)),
+            ("Mon, 02 Nov 2026 12:00:07 GMT", 7.0),
+            ("Monday, 02-Nov-26 12:00:07 GMT", 7.0),
+            ("Mon Nov  2 12:00:07 2026", 7.0),
+            ("Mon, 02 Nov 2026 11:59:00 GMT", 0.0),
+            ("Mon, 32 Nov 2026 12:00:07 GMT", None),
+        ]
+        for value, want in cases:
+            with self.subTest(value=value):
+                self.assertEqual(client_module._parse_retry_after(value, now), want)
+
+    def test_retry_delay(self):
+        now = 1793620800.0
+        cases = [
+            # (name, maxRetryAfterMs, attempt, header, rand, seconds)
+            ("no header: backoff minus a quarter", 2000, 0, None, 0, 0.075),
+            ("no header: backoff plus a quarter", 2000, 0, None, 1, 0.125),
+            ("no header: doubles per attempt", 2000, 2, None, 0.5, 0.4),
+            ("no header: capped by maxDelayMs", 2000, 5, None, 0.5, 1.0),
+            ("malformed header falls back", 2000, 0, "soon", 0, 0.075),
+            ("seconds: never sooner than asked", 2000, 0, "1", 0, 1.0),
+            ("seconds: at most a fifth later", 2000, 0, "1", 1, 1.2),
+            ("HTTP date", 2000, 0, "Mon, 02 Nov 2026 12:00:01 GMT", 0, 1.0),
+            ("backoff is the floor", 2000, 2, "0", 0, 0.4),
+            ("spread stops at the cap", 1100, 0, "1", 1, 1.1),
+            ("long ask is cut to the cap", 2000, 0, "120", 0, 2.0),
+            ("long ask spreads below the cap", 2000, 0, "120", 1, 1.6),
+            ("cap 0 ignores the header", 0, 0, "120", 0, 0.075),
+        ]
+        for name, limit, attempt, header, rand, want in cases:
+            with self.subTest(name):
+                client = MicroVM(
+                    "http://127.0.0.1:1",
+                    "pat",
+                    config={"retry": {"baseDelayMs": 100, "maxDelayMs": 1000, "maxRetryAfterMs": limit}},
+                )
+                self.assertAlmostEqual(client._retry_delay(attempt, header, now, rand), want)
+
+    def test_default_cap_is_thirty_seconds(self):
+        self.assertEqual(MicroVM("http://127.0.0.1:1", "pat")._retry_config["maxRetryAfterMs"], 30000)
+
+    def test_waits_out_retry_after_on_429_and_503(self):
+        # With a 1 ms backoff, only the server's Retry-After explains a 1 s
+        # gap. The cases run side by side so the test takes about 2 s.
+        def in_two_seconds():
+            return email.utils.formatdate(time.time() + 2, usegmt=True)
+
+        cases = [
+            # (name, status, header, min seconds, max seconds). The date has
+            # whole-second precision, so it asks for 1-2 s.
+            ("429 seconds", 429, lambda: "1", 1.0, 2.0),
+            ("503 seconds", 503, lambda: "1", 1.0, 2.0),
+            ("503 HTTP date", 503, in_two_seconds, 1.0, 3.0),
+        ]
+        runs = []
+        for name, status, header, low, high in cases:
+            for kind, call in self._CALLS:
+                client, arrivals = self._serve(status, 1, header)
+                runs.append(("%s/%s" % (name, kind), call, client, arrivals, low, high))
+        with concurrent.futures.ThreadPoolExecutor(len(runs)) as pool:
+            for future in [pool.submit(call, client) for _, call, client, _, _, _ in runs]:
+                future.result()
+        for name, _, _, arrivals, low, high in runs:
+            with self.subTest(name):
+                self.assertEqual(len(arrivals), 2)
+                self.assertGreaterEqual(arrivals[1] - arrivals[0], low)
+                self.assertLessEqual(arrivals[1] - arrivals[0], high)
+
+    def test_cap_applies(self):
+        client, arrivals = self._serve(503, 1, lambda: "120", retry={"maxRetryAfterMs": 100})
+
+        client.get("sb-1")
+
+        self.assertEqual(len(arrivals), 2)
+        self.assertGreaterEqual(arrivals[1] - arrivals[0], 0.08)
+        self.assertLessEqual(arrivals[1] - arrivals[0], 1.0)
+
+    def test_falls_back_to_backoff_without_a_usable_header(self):
+        # A missing or malformed header, or one on a status that is a hop's
+        # rather than the server's pacing (421/502/504).
+        cases = [(503, None), (429, "soon"), (503, "-1"), (421, "120"), (502, "120"), (504, "120")]
+        for status, header in cases:
+            with self.subTest(status=status, header=header):
+                client, arrivals = self._serve(status, 1, lambda: header)
+                client.get("sb-1")
+                self.assertEqual(len(arrivals), 2)
+                self.assertLess(arrivals[1] - arrivals[0], 0.5)
+
+    def test_keeps_retry_budget_and_statuses(self):
+        client, arrivals = self._serve(503, 100, lambda: "0")
+        with self.assertRaises(MicroVMHTTPError) as ctx:
+            client.get("sb-1")
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(len(arrivals), 4)  # 1 + 3 retries
+
+        for status in (400, 404, 500):
+            with self.subTest(status=status):
+                client, arrivals = self._serve(status, 100, lambda: "1")
+                with self.assertRaises(MicroVMHTTPError):
+                    client.get("sb-1")
+                self.assertEqual(len(arrivals), 1)
+
+        client, arrivals = self._serve(502, 100, lambda: "1")
+        with self.assertRaises(MicroVMHTTPError):
+            client.exec("sb-1", {"command": "true"})
+        self.assertEqual(len(arrivals), 1)
+
+    @unittest.skipUnless(hasattr(signal, "setitimer"), "needs signal.setitimer")
+    def test_raising_signal_handler_ends_the_wait(self):
+        # A sync client is cancelled by a signal (Ctrl-C, a signal.alarm
+        # timeout). The wait must end there, not after a 30 s Retry-After.
+        class Interrupted(Exception):
+            pass
+
+        def interrupt(signum, frame):
+            raise Interrupted()
+
+        for kind, call in self._CALLS:
+            with self.subTest(kind):
+                client, arrivals = self._serve(503, 100, lambda: "30")
+                previous = signal.signal(signal.SIGALRM, interrupt)
+                try:
+                    signal.setitimer(signal.ITIMER_REAL, 0.2)
+                    start = time.monotonic()
+                    with self.assertRaises(Interrupted):
+                        call(client)
+                    self.assertLess(time.monotonic() - start, 2.0)
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                    signal.signal(signal.SIGALRM, previous)
+                self.assertEqual(len(arrivals), 1)
+
+
 class ListFilterTests(unittest.TestCase):
     """Mirrors pkg/api/v1/list_filter_test.go: a tag-filter list call must
     render every tag as `?tag.<k>=<v>` on the wire, since that is the prefix
@@ -2179,3 +2576,231 @@ class CloneGenerationTest(unittest.TestCase):
         )
         self.assertEqual(gen.generation, "2d0d8c69")
         self.assertEqual(gen.resumedAt, 1700000000000000000)
+
+
+class _IdentityServer:
+    """A local sandboxd stand-in for the identity routes. Records each
+    request's method, path, auth and team headers and JSON body."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _serve(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                outer.requests.append(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "authorization": self.headers.get("Authorization"),
+                        "team": self.headers.get_all(client_module.TEAM_HEADER),
+                        "body": json.loads(raw) if raw else None,
+                    }
+                )
+                status, body = outer.routes.get((self.command, self.path), (404, {"error": "unexpected"}))
+                self.send_response(status)
+                if body is None:
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                payload = json.dumps(body).encode("utf-8")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            do_GET = _serve
+            do_POST = _serve
+            do_DELETE = _serve
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_port
+        # A short poll interval keeps shutdown() from adding 0.5 s per test.
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+_WHOAMI_BODY = {
+    "principal": {"kind": "token", "id": "tok_abc123def456", "name": "ci"},
+    "role": "runner",
+    "team": "payments",
+    "expires_at": "2027-01-02T03:04:05Z",
+}
+
+_TOKEN_BODY = {
+    "id": "tok_abc123def456",
+    "name": "ci",
+    "role": "runner",
+    "team": "payments",
+    "created_by": "operator",
+    "created_at": "2026-10-17T09:00:00Z",
+    "expires_at": "2027-01-02T03:04:05Z",
+    "expired": False,
+}
+
+
+class IdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.server = _IdentityServer({("GET", "/v1/whoami"): (200, _WHOAMI_BODY)})
+        self.addCleanup(self.server.close)
+
+    def _env(self, **values):
+        """Patches the three identity env vars: the given ones set, the rest unset."""
+        env = {k: v for k, v in os.environ.items() if k not in ("SB_PAT_TOKEN", "SB_API_TOKEN", "SB_TEAM")}
+        env.update(values)
+        return unittest.mock.patch.dict(os.environ, env, clear=True)
+
+    def test_token_and_team_resolution(self):
+        cases = [
+            ("SB_PAT_TOKEN only", {}, {"SB_PAT_TOKEN": "pat"}, "Bearer pat", None),
+            ("SB_API_TOKEN alias", {}, {"SB_API_TOKEN": "avm_alias"}, "Bearer avm_alias", None),
+            ("SB_PAT_TOKEN beats the alias", {}, {"SB_PAT_TOKEN": "pat", "SB_API_TOKEN": "avm_alias"}, "Bearer pat", None),
+            ("option beats both", {"pat_token": "opt"}, {"SB_PAT_TOKEN": "pat", "SB_API_TOKEN": "avm_alias"}, "Bearer opt", None),
+            ("config patToken beats both", {"config": {"patToken": "cfg"}}, {"SB_PAT_TOKEN": "pat"}, "Bearer cfg", None),
+            ("SB_TEAM sends the header", {}, {"SB_API_TOKEN": "avm_alias", "SB_TEAM": " payments "}, "Bearer avm_alias", ["payments"]),
+            ("team option beats SB_TEAM", {"team": "ml"}, {"SB_PAT_TOKEN": "pat", "SB_TEAM": "payments"}, "Bearer pat", ["ml"]),
+            ("config team beats SB_TEAM", {"config": {"team": "ml"}}, {"SB_PAT_TOKEN": "pat", "SB_TEAM": "payments"}, "Bearer pat", ["ml"]),
+            ("blank SB_TEAM sends nothing", {}, {"SB_PAT_TOKEN": "pat", "SB_TEAM": "   "}, "Bearer pat", None),
+        ]
+        for name, kwargs, env, want_auth, want_team in cases:
+            with self.subTest(name), self._env(**env):
+                self.server.requests.clear()
+                client = MicroVM(self.server.url, **kwargs)
+                client.whoami()
+                self.assertEqual(self.server.requests[0]["authorization"], want_auth)
+                self.assertEqual(self.server.requests[0]["team"], want_team)
+                self.assertEqual(client.team, (want_team or [""])[0])
+
+    def test_missing_token_names_the_alias(self):
+        with self._env():
+            with self.assertRaisesRegex(MicroVMError, "SB_API_TOKEN"):
+                MicroVM(self.server.url)
+
+    def test_whoami_maps_the_identity(self):
+        client = MicroVM(self.server.url, "avm_x")
+        self.assertEqual(
+            client.whoami(),
+            {
+                "principal": {"kind": "token", "id": "tok_abc123def456", "name": "ci"},
+                "role": "runner",
+                "team": "payments",
+                "expiresAt": "2027-01-02T03:04:05Z",
+            },
+        )
+        self.server.routes[("GET", "/v1/whoami")] = (200, {"principal": {"kind": "operator", "id": "operator"}, "role": "admin"})
+        self.assertEqual(client.whoami(), {"principal": {"kind": "operator", "id": "operator"}, "role": "admin"})
+
+    def test_tokens_create_list_revoke(self):
+        self.server.routes.update(
+            {
+                ("POST", "/v1/tokens"): (201, {**_TOKEN_BODY, "token": "avm_secret"}),
+                ("GET", "/v1/tokens"): (200, {"tokens": [{**_TOKEN_BODY, "expired": True}]}),
+                ("DELETE", "/v1/tokens/tok_abc123def456"): (204, None),
+                ("DELETE", "/v1/tokens/..%2Fsandboxes"): (204, None),
+            }
+        )
+        client = MicroVM(self.server.url, "avm_admin", team="ops")
+
+        created = client.tokens.create(name="ci", role="runner", team="payments", expires_in="90d")
+        self.assertEqual(created["token"], "avm_secret")
+        self.assertEqual(created["id"], "tok_abc123def456")
+        self.assertEqual(created["createdBy"], "operator")
+        self.assertFalse(created["expired"])
+        self.assertEqual(self.server.requests[0]["body"], {"name": "ci", "role": "runner", "team": "payments", "expires_in": "90d"})
+        # The dict spelling sends the same body.
+        client.tokens.create({"name": "ci", "role": "runner", "team": "payments", "expiresIn": "90d"})
+        self.assertEqual(self.server.requests[1]["body"], self.server.requests[0]["body"])
+
+        listed = client.tokens.list()
+        self.assertEqual(len(listed["tokens"]), 1)
+        self.assertTrue(listed["tokens"][0]["expired"])
+        self.assertNotIn("token", listed["tokens"][0])
+
+        # A repeat revoke is another 204; the id stays one escaped path segment.
+        client.tokens.revoke("tok_abc123def456")
+        client.tokens.revoke(" tok_abc123def456 ")
+        client.tokens.revoke("../sandboxes")
+        with self.assertRaisesRegex(ValueError, "token id is required"):
+            client.tokens.revoke("  ")
+
+        self.assertEqual(
+            [(r["method"], r["path"]) for r in self.server.requests],
+            [
+                ("POST", "/v1/tokens"),
+                ("POST", "/v1/tokens"),
+                ("GET", "/v1/tokens"),
+                ("DELETE", "/v1/tokens/tok_abc123def456"),
+                ("DELETE", "/v1/tokens/tok_abc123def456"),
+                ("DELETE", "/v1/tokens/..%2Fsandboxes"),
+            ],
+        )
+        for request in self.server.requests:
+            self.assertEqual(request["team"], ["ops"], request)
+
+    def test_tokens_list_normalizes_null(self):
+        self.server.routes[("GET", "/v1/tokens")] = (200, {"tokens": None})
+        self.assertEqual(MicroVM(self.server.url, "pat").tokens.list(), {"tokens": []})
+
+    def test_http_errors_carry_identity_fields(self):
+        cases = [
+            (
+                "name taken",
+                409,
+                {"error": 'token name already used in this team: "ci"'},
+                {"code": "", "reason": "", "required_permission": "", "role": "", "issuer": "", "name": "", "groups": []},
+            ),
+            (
+                "expired token",
+                401,
+                {"error": "unauthorized", "reason": "expired"},
+                {"reason": "expired", "required_permission": "", "groups": []},
+            ),
+            (
+                "missing permission",
+                403,
+                {"error": "role viewer on team payments cannot token.write", "required_permission": "token.write", "role": "viewer"},
+                {"reason": "", "required_permission": "token.write", "role": "viewer"},
+            ),
+            (
+                "no binding",
+                403,
+                {"error": "no binding matches", "reason": "no_binding", "issuer": "okta", "name": "Ada", "groups": ["eng", "oncall"]},
+                {"reason": "no_binding", "issuer": "okta", "name": "Ada", "groups": ["eng", "oncall"]},
+            ),
+        ]
+        client = MicroVM(self.server.url, "avm_x", config={"retry": {"maxRetries": 0}})
+        for name, status, body, want in cases:
+            with self.subTest(name):
+                self.server.routes[("POST", "/v1/tokens")] = (status, body)
+                with self.assertRaises(MicroVMHTTPError) as ctx:
+                    client.tokens.create(name="ci", role="runner", team="payments", expiresIn="90d")
+                self.assertEqual(ctx.exception.status_code, status)
+                self.assertEqual(str(ctx.exception), body["error"])
+                for attr, value in want.items():
+                    self.assertEqual(getattr(ctx.exception, attr), value, attr)
+
+    def test_websocket_handshakes_carry_the_team(self):
+        for team, want in (("payments", ["Authorization: Bearer pat", "X-AerolVM-Team: payments"]), (None, ["Authorization: Bearer pat"])):
+            with self.subTest(team=team), self._env():
+                exec_module = FakeWebSocketModule(FakeWebSocket([json.dumps({"type": "exit", "code": 0})]))
+                attach_module = FakeWebSocketModule(FakeWebSocket([json.dumps({"type": "exit", "code": 0})]))
+                original_loader = client_module._load_websocket_module
+                try:
+                    client = MicroVM("https://sandbox.example.com", "pat", team=team)
+                    client_module._load_websocket_module = lambda: exec_module
+                    client.exec_stream("sb-1", {"command": "true"}).wait(1)
+                    client_module._load_websocket_module = lambda: attach_module
+                    client.attach_session("sb-1", "ses-1").wait(1)
+                finally:
+                    client_module._load_websocket_module = original_loader
+                self.assertEqual(exec_module.calls[0][1], want)
+                self.assertEqual(attach_module.calls[0][1], want)

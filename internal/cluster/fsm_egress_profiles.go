@@ -25,9 +25,31 @@ const (
 // meta ("fv"). An old build fails an op it doesn't know, so a leader accepts
 // a write that needs a newer op only once every Raft server reports at least
 // that version (egressProfileWritesAllowed).
+//
+// fv is also the build's cross-node format version: a feature that writes
+// something an older build cannot read back gates on it the same way. Bump
+// it once per release that adds such a feature, and give the feature its
+// own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 1
+	fsmOpsVersion              = 5
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
+	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
+	// field (AuditCallerWritesAllowed).
+	auditCallerFSMOpsVersion = 2
+	// apiTokenFSMOpsVersion: opPutAPIToken, opDeleteAPIToken (fsm_tokens.go).
+	apiTokenFSMOpsVersion = 3
+	// ServerKeyRingFSMOpsVersion: the server key is a ring and sealed blobs
+	// may name their key (ServerKeyRingAllowed). No FSM op: the version
+	// gates `sandboxd key rotate --stage`, which writes a ring file older
+	// builds refuse to boot from.
+	ServerKeyRingFSMOpsVersion = 4
+	// sshSessionOwnerRecordFSMOpsVersion: the owner honours
+	// X-Cluster-Ssh-Gateway, writing the ssh record of a session another
+	// node's SSH gateway bridged to it (SSHSessionOwnerRecordAllowed). No
+	// FSM op. It is not 4: that value is unreleased but already names the
+	// key-ring build, and a build with fv 4 and without this would drop the
+	// record the gateway handed it.
+	sshSessionOwnerRecordFSMOpsVersion = 5
 )
 
 var (

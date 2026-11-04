@@ -1,6 +1,12 @@
-from .client import MicroVM
+from .client import MicroVM, MicroVMError, MicroVMHTTPError, Tokens
 from .image import Image
 from .types import (
+    APIToken,
+    APITokenList,
+    CreateAPITokenOptions,
+    CreatedAPIToken,
+    WhoAmI,
+    WhoAmIPrincipal,
     AuditEvent,
     AuditOptions,
     AuditPage,
@@ -36,6 +42,13 @@ from .types import (
 )
 
 __all__ = [
+    "APIToken",
+    "APITokenList",
+    "CreateAPITokenOptions",
+    "CreatedAPIToken",
+    "Tokens",
+    "WhoAmI",
+    "WhoAmIPrincipal",
     "AuditEvent",
     "AuditOptions",
     "AuditPage",
@@ -61,6 +74,8 @@ __all__ = [
     "DNSRecord",
     "Image",
     "MicroVM",
+    "MicroVMError",
+    "MicroVMHTTPError",
     "ExposeProtocol",
     "ExposeResult",
     "Failover",

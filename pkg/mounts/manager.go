@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -45,13 +46,12 @@ type Manager struct {
 	waitTimeout time.Duration
 	adapters    map[models.MountType]adapters.Adapter
 
-	mu    sync.Mutex
-	state map[string][]*mountState // sandboxID -> per-index states
-	// inFlight holds sandboxIDs with a MountAll currently establishing mounts.
-	// Sweep consults it: a start in flight has not committed its state yet, so
-	// without this gate a reconcile-tick sweep would kill the starting
-	// sandbox's mounts as "orphans" (prod incident 2026-09-09).
-	inFlight map[string]struct{}
+	// mu guards state, mounting and sweeping, which together say who owns
+	// rootDir/<id>; see claimOrphan for the rule.
+	mu       sync.Mutex
+	state    map[string][]*mountState // sandboxID -> per-index states
+	mounting map[string]int           // sandboxID -> MountAll calls in flight
+	sweeping map[string]chan struct{} // sandboxID -> closed when Sweep is done with it
 
 	// onMountCrash snapshots Config.OnMountCrash; SetOnMountCrash allows late
 	// wiring (the service is constructed after the manager in the daemon).
@@ -68,6 +68,7 @@ type mountState struct {
 	plan       adapters.Plan
 	cmd        *exec.Cmd
 	output     *capturedOutput // captured stdout+stderr of the FUSE mount tool
+	exit       *procExit       // cmd's exit; superviseExit waits on it
 	startedAt  time.Time
 	restarts   int
 	lastCrash  time.Time
@@ -105,7 +106,8 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 		waitTimeout:  cfg.WaitTimeout,
 		adapters:     adapters.Adapters(),
 		state:        make(map[string][]*mountState),
-		inFlight:     make(map[string]struct{}),
+		mounting:     make(map[string]int),
+		sweeping:     make(map[string]chan struct{}),
 		onMountCrash: cfg.OnMountCrash,
 		closeCh:      make(chan struct{}),
 	}, nil
@@ -143,12 +145,20 @@ func ValidateSandboxID(s string) error {
 	return nil
 }
 
+// ErrMountsEstablished refuses a MountAll for a sandbox ID whose mounts are
+// established or being established. A sandbox has one mount set: a second
+// MountAll would replace it, losing track of the first set's processes, and
+// its failure's UnmountAll would tear down the first set's storage. It is
+// ErrSandboxExists because the ID belongs to whatever holds those mounts.
+var ErrMountsEstablished = fmt.Errorf("%w: its mounts are already established", models.ErrSandboxExists)
+
 // MountAll mounts every spec for a sandbox. The per-spec mounts are
 // independent (distinct host paths, distinct credential files), so they are
 // established concurrently — five serialized mount-s3 spawns are ~25s of
 // every sandbox start (prod 2026-09-09); in parallel the wall time is the
 // slowest single mount. On any failure already-mounted entries are torn down
-// before returning.
+// before returning. It refuses, untouched, an ID that already has mounts
+// (ErrMountsEstablished).
 func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []models.MountSpec) ([]ContainerBind, error) {
 	if len(mounts) == 0 {
 		return nil, nil
@@ -162,9 +172,24 @@ func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []model
 	if err := models.ValidateSandboxID(sandboxID); err != nil {
 		return nil, fmt.Errorf("mount: %w", err)
 	}
-
-	m.markInFlight(sandboxID)
-	defer m.clearInFlight(sandboxID)
+	// Own rootDir/<id> before creating it, and until state holds the mounts
+	// (the deferred release runs after the store below), so Sweep never sees
+	// this directory unowned. This gate is the successor of the fork's earlier
+	// inFlight set: the same sweep-vs-start race (prod incident 2026-09-09),
+	// claimed per-ID instead of snapshot-checked.
+	release, err := m.beginMount(ctx, sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("mount: %w", err)
+	}
+	defer release()
+	m.mu.Lock()
+	// beginMount counted this call, so more than one is another MountAll of
+	// the ID still running.
+	taken := len(m.state[sandboxID]) > 0 || m.mounting[sandboxID] > 1
+	m.mu.Unlock()
+	if taken {
+		return nil, fmt.Errorf("mount %s: %w", sandboxID, ErrMountsEstablished)
+	}
 	if err := os.MkdirAll(filepath.Join(m.rootDir, sandboxID), 0o700); err != nil {
 		return nil, fmt.Errorf("create sandbox mount dir: %w", err)
 	}
@@ -214,19 +239,6 @@ func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []model
 	return binds, nil
 }
 
-// markInFlight registers a sandbox as mid-establishment for Sweep's guard.
-func (m *Manager) markInFlight(sandboxID string) {
-	m.mu.Lock()
-	m.inFlight[sandboxID] = struct{}{}
-	m.mu.Unlock()
-}
-
-func (m *Manager) clearInFlight(sandboxID string) {
-	m.mu.Lock()
-	delete(m.inFlight, sandboxID)
-	m.mu.Unlock()
-}
-
 // UnmountAll tears down every mount for a sandbox. Always best-effort.
 func (m *Manager) UnmountAll(sandboxID string) error {
 	if err := ValidateSandboxID(sandboxID); err != nil {
@@ -272,10 +284,12 @@ func (m *Manager) HostBindsFor(sandboxID string) []ContainerBind {
 //   - umount(s) every mountpoint under the orphan dir, lazily if needed
 //   - removes the orphan directory tree
 //
-// Intended for sandboxd startup, after the reconciler has computed the set of
-// sandboxes that should still exist. A crash mid-MountAll can leave a FUSE
-// process attached to a directory whose sandbox row is gone or whose container
-// never came up; without this sweep those mounts pile up forever.
+// Called at the end of every reconcile pass (at startup and on the periodic
+// ticker), after the reconciler has computed the set of sandboxes that should
+// still exist. A crash mid-MountAll can leave a FUSE process attached to a
+// directory whose sandbox row is gone or whose container never came up;
+// without this sweep those mounts pile up forever. Directories the manager
+// owns in-process (tracked, or with a MountAll in flight) are never swept.
 func (m *Manager) Sweep(keep map[string]struct{}) {
 	entries, err := os.ReadDir(m.rootDir)
 	if err != nil {
@@ -284,13 +298,6 @@ func (m *Manager) Sweep(keep map[string]struct{}) {
 		}
 		return
 	}
-
-	m.mu.Lock()
-	tracked := make(map[string]struct{}, len(m.state))
-	for id := range m.state {
-		tracked[id] = struct{}{}
-	}
-	m.mu.Unlock()
 
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -307,23 +314,94 @@ func (m *Manager) Sweep(keep map[string]struct{}) {
 		if _, ok := keep[id]; ok {
 			continue
 		}
-		if _, ok := tracked[id]; ok {
-			// We're already managing it in-process; never sweep an active mount.
-			continue
-		}
-		// A MountAll may have registered itself between the directory listing
-		// and this check — re-read the in-flight set before destroying anything.
-		m.mu.Lock()
-		_, starting := m.inFlight[id]
-		m.mu.Unlock()
-		if starting {
-			m.logger.Info("mounts sweep: skipping sandbox with mounts in flight", "sandbox_id", id)
+		done, mountInFlight := m.claimOrphan(id)
+		if done == nil {
+			if mountInFlight {
+				m.logger.Info("mounts sweep: skipping, mount in progress", "sandbox_id", id)
+			}
 			continue
 		}
 		path := filepath.Join(m.rootDir, id)
 		m.logger.Info("mounts sweep: removing orphan", "sandbox_id", id, "path", path)
 		m.cleanupOrphanDir(path)
+		m.releaseOrphan(id, done)
 	}
+}
+
+// claimOrphan claims rootDir/<id> for Sweep to remove. It returns nil when
+// someone else owns the directory; mountInFlight then says whether that owner
+// is a MountAll still running.
+//
+// Ownership rule: rootDir/<id>, and every mount tool whose argv names a path
+// in it, belongs to exactly one of
+//   - the MountAll calls in flight for id (mounting), from before the first
+//     one creates the directory until the last one returns;
+//   - the tracked mounts (state), from MountAll's success until UnmountAll;
+//   - a Sweep that claimed id (sweeping), until the directory is gone.
+//
+// Each is checked and taken under mu, and Sweep claims one id right before
+// cleaning it, not from a snapshot taken earlier. So a sweep that finds a
+// mount in flight skips it, and a mount that finds a sweep in progress waits
+// for it (beginMount) instead of building a directory the sweep then deletes.
+// Before this, the claim was a tracked-only snapshot and state was written
+// only once every mount was ready, so the periodic reconcile sweep took a
+// mount still waiting for mount-s3 for an orphan: it SIGKILLed the tool,
+// removed the directory, and the create waited out the full 30s mount
+// timeout (UC-84).
+func (m *Manager) claimOrphan(id string) (done chan struct{}, mountInFlight bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mounting[id] > 0 {
+		return nil, true
+	}
+	if _, tracked := m.state[id]; tracked {
+		return nil, false
+	}
+	if _, swept := m.sweeping[id]; swept {
+		return nil, false // a concurrent Sweep already has it
+	}
+	done = make(chan struct{})
+	m.sweeping[id] = done
+	return done, false
+}
+
+// releaseOrphan ends Sweep's claim on id and wakes any MountAll waiting for it.
+func (m *Manager) releaseOrphan(id string, done chan struct{}) {
+	m.mu.Lock()
+	delete(m.sweeping, id)
+	m.mu.Unlock()
+	close(done)
+}
+
+// beginMount marks a MountAll of id as in flight until the returned release
+// is called. If Sweep is removing id's directory it waits for that to finish
+// first: a create retried with the id of a genuine orphan then mounts into a
+// clean directory rather than one the sweep is still deleting. The wait is
+// one directory's cleanup, and it ends early if ctx is cancelled.
+func (m *Manager) beginMount(ctx context.Context, id string) (release func(), err error) {
+	m.mu.Lock()
+	for {
+		done, swept := m.sweeping[id]
+		if !swept {
+			break
+		}
+		m.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		m.mu.Lock()
+	}
+	m.mounting[id]++
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.mounting[id]--; m.mounting[id] <= 0 {
+			delete(m.mounting, id)
+		}
+	}, nil
 }
 
 // cleanupOrphanDir kills FUSE processes attached to anything under dir,
@@ -337,7 +415,8 @@ func (m *Manager) cleanupOrphanDir(dir string) {
 }
 
 // Reestablish ensures a sandbox's mounts are running, mounting any that are
-// missing. Called by the reconciler at startup and periodically.
+// missing. Called by the reconciler at startup and periodically. It mounts
+// only through MountAll, so its mounts are owned against Sweep the same way.
 func (m *Manager) Reestablish(ctx context.Context, sandboxID string, mounts []models.MountSpec) error {
 	m.mu.Lock()
 	already, present := m.state[sandboxID]
@@ -397,7 +476,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 		out, runErr := cmd.CombinedOutput()
 		if runErr != nil {
 			m.cleanupCred(plan)
-			return nil, ContainerBind{}, fmt.Errorf("kernel mount failed: %w (%s)", runErr, string(out))
+			return nil, ContainerBind{}, fmt.Errorf("kernel mount failed: %w (%s)", toolStartError(plan.Argv[0], runErr), string(out))
 		}
 		// Done; nothing to supervise.
 		bind := ContainerBind{HostPath: hostPath, ContainerPath: spec.Target, ReadOnly: spec.ReadOnly}
@@ -407,18 +486,20 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 	// User-space FUSE: spawn and supervise. stdout+stderr are captured so a
 	// mount that never becomes ready surfaces the tool's own error instead of a
 	// bare "timed out waiting for mount" (cluster-hetero UC-81..84).
-	cmd, out, err := spawnMountProcess(plan, m.credFailureHandler(sandboxID, index))
+	cmd, out, exit, err := spawnMountProcess(plan, m.credFailureHandler(sandboxID, index))
 	if err != nil {
 		m.cleanupCred(plan)
-		return nil, ContainerBind{}, fmt.Errorf("spawn mount tool: %w", err)
+		return nil, ContainerBind{}, fmt.Errorf("spawn mount tool: %w", toolStartError(plan.Argv[0], err))
 	}
 	state.cmd = cmd
 	state.output = out
+	state.exit = exit
 
-	if err := waitForMountProbe(hostPath, m.waitTimeout); err != nil {
+	if err := waitForMountProbe(hostPath, m.waitTimeout, exit.done); err != nil {
+		err = mountWaitError(err, exit, out) // before killMount, so the exit status is the tool's own
 		_ = killMount(cmd)
 		m.cleanupCred(plan)
-		return nil, ContainerBind{}, mountWaitError(err, out)
+		return nil, ContainerBind{}, err
 	}
 
 	if plan.UnlinkCred && plan.CredFile != "" {
@@ -435,10 +516,11 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 // superviseExit waits for the mount process to exit and either restarts it
 // once or marks the mount disabled if it crashes a second time within 30s.
 func (m *Manager) superviseExit(state *mountState) {
-	if state.cmd == nil {
-		return
+	if state.exit == nil {
+		return // no process to supervise
 	}
-	err := state.cmd.Wait()
+	<-state.exit.done
+	err := state.exit.err
 
 	m.mu.Lock()
 	if !m.trackedAndEnabledLocked(state) {
@@ -500,7 +582,7 @@ func (m *Manager) restartMount(state *mountState, plan adapters.Plan, hostPath s
 	if plan.CredFile != "" {
 		_ = writeCredFile(plan.CredFile, plan.CredBody)
 	}
-	cmd, out, err := spawnMountProcess(plan, m.credFailureHandler(state.sandboxID, state.index))
+	cmd, out, exit, err := spawnMountProcess(plan, m.credFailureHandler(state.sandboxID, state.index))
 	if err != nil {
 		m.mu.Lock()
 		if m.trackedAndEnabledLocked(state) {
@@ -510,8 +592,11 @@ func (m *Manager) restartMount(state *mountState, plan adapters.Plan, hostPath s
 		m.logger.Warn("mount restart spawn failed", "sandbox_id", state.sandboxID, "index", state.index, "error", err)
 		return
 	}
+	state.cmd = cmd
+	state.output = out
+	state.exit = exit
 
-	if err := waitForMountProbe(hostPath, m.waitTimeout); err != nil {
+	if err := waitForMountProbe(hostPath, m.waitTimeout, exit.done); err != nil {
 		m.logger.Warn("mount restart probe failed",
 			"sandbox_id", state.sandboxID,
 			"index", state.index,
@@ -608,28 +693,51 @@ func writeCredFile(path string, data []byte) error {
 // replace it to avoid requiring a real FUSE/kernel mount in unit tests.
 var waitForMountProbe = waitForMount
 
+// errMountToolExited and errMountPathRemoved end the readiness wait early.
+// Every FUSE tool here runs in the foreground (mount-s3 --foreground,
+// sshfs -f, rclone mount), so a tool that has exited is not mounting anything,
+// and a mount path that is gone cannot become a mount. Waiting out the timeout
+// on either only hides the cause behind "timed out" (UC-84 waited 30s for a
+// tool the sweep had already killed).
+var (
+	errMountToolExited  = errors.New("mount tool exited before the mount was ready")
+	errMountPathRemoved = errors.New("mount path was removed while waiting for the mount")
+)
+
 // waitForMount polls until the host path appears mounted (its underlying
-// device differs from the parent dir's). Falls back to a sentinel-file probe
-// if the parent is itself a mount point. Returns ErrTimeout after waitTimeout.
-func waitForMount(hostPath string, timeout time.Duration) error {
+// device differs from the parent dir's). It fails fast once exited is closed
+// (the mount tool is gone) or the path no longer exists, and times out after
+// timeout for a tool that is alive but slow. A nil exited never fires.
+func waitForMount(hostPath string, timeout time.Duration, exited <-chan struct{}) error {
 	parent := filepath.Dir(hostPath)
 	parentStat, err := os.Stat(parent)
 	if err != nil {
 		return fmt.Errorf("stat parent: %w", err)
 	}
 	parentSys, _ := parentStat.Sys().(*syscall.Stat_t)
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	poll := time.NewTicker(200 * time.Millisecond)
+	defer poll.Stop()
+	for {
 		st, err := os.Stat(hostPath)
-		if err == nil {
+		switch {
+		case err == nil:
 			sys, _ := st.Sys().(*syscall.Stat_t)
 			if parentSys != nil && sys != nil && sys.Dev != parentSys.Dev {
 				return nil
 			}
+		case errors.Is(err, fs.ErrNotExist):
+			return fmt.Errorf("%w: %s", errMountPathRemoved, hostPath)
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-exited:
+			return fmt.Errorf("%w at %s", errMountToolExited, hostPath)
+		case <-deadline.C:
+			return fmt.Errorf("timed out waiting for mount at %s", hostPath)
+		case <-poll.C:
+		}
 	}
-	return fmt.Errorf("timed out waiting for mount at %s", hostPath)
 }
 
 // killMount sends SIGTERM to the process group, waits briefly, then SIGKILL.

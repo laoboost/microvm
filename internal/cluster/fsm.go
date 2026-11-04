@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/google/btree"
@@ -53,7 +54,8 @@ const (
 	// opReportStorageObligations = 26: owner delete-outbox snapshots folded by
 	// the leader (storage_obligations.go).
 	// 26 is opReportStorageObligations (storage_obligations.go); 27/28 are the
-	// egress-profile ops (fsm_egress_profiles.go). Next free codes are 29/30.
+	// egress-profile ops (fsm_egress_profiles.go); 31/32 are the API-token
+	// ops (fsm_tokens.go). The next free code is 33.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -214,6 +216,11 @@ type command struct {
 	// which a snapshot's local-only SQLite catalogue row cannot answer after
 	// the request lands elsewhere.
 	SnapshotName string `json:"snapshot_name,omitempty"`
+	// APIToken carries the record for opPutAPIToken (its secret hash, never
+	// the secret); APITokenID names the token opDeleteAPIToken removes
+	// (fsm_tokens.go).
+	APIToken   *identity.TokenRecord `json:"api_token,omitempty"`
+	APITokenID string                `json:"api_token_id,omitempty"`
 }
 
 type reservationCommand struct {
@@ -462,6 +469,14 @@ type placementFSM struct {
 	pendingReservationCapacity   map[string]capacity.Request
 	pendingReservationIDsByOwner map[string]map[string]struct{}
 	pendingReservationExpiries   pendingReservationExpiryHeap
+	// pendingReservationRuntimes counts the same live reservations by owner
+	// and runtime. A reserved create has not taken its network slot yet, so
+	// the owner's capacity heartbeat cannot show it; placement subtracts
+	// these from the owner's advertised free slots (placement.go slotsFit).
+	// Like pendingReservationCapacity it is derived, never persisted: the
+	// same claim/release paths rebuild it on log replay and Restore, so
+	// every replica holds the same counts.
+	pendingReservationRuntimes map[string]map[string]int
 	// reservedIndex tracks rows that are still State=Reserved even after their
 	// capacity claim has been pruned as expired. The leader GC uses it to find
 	// expired reservation rows without scanning every placed sandbox.
@@ -548,6 +563,11 @@ type placementFSM struct {
 	// rebuilt on Restore from the rows.
 	egressProfiles    map[EgressProfileKey]*EgressProfileRecord
 	egressProfileRefs map[EgressProfileKey]map[string]struct{}
+	// tokens is the replicated API-token table and its change ring
+	// (fsm_tokens.go, snapshotted rows, node-local ring). It has its own
+	// lock: token reads on the request path never take mu.
+	tokens       *apiTokenState
+	apiTokenInit sync.Once
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -616,6 +636,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		pendingReservationClaims:     make(map[string]pendingReservationClaim),
 		pendingReservationCapacity:   make(map[string]capacity.Request),
 		pendingReservationIDsByOwner: make(map[string]map[string]struct{}),
+		pendingReservationRuntimes:   make(map[string]map[string]int),
 		reservedIndex:                make(map[string]struct{}),
 		deletingIndex:                make(map[string]struct{}),
 		drainedNodes:                 make(map[string]bool),
@@ -635,6 +656,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
 		egressProfiles:               make(map[EgressProfileKey]*EgressProfileRecord),
 		egressProfileRefs:            make(map[EgressProfileKey]map[string]struct{}),
+		tokens:                       newAPITokenState(),
 	}
 }
 
@@ -1796,6 +1818,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		return nil
+	case opPutAPIToken:
+		result, err := f.applyPutAPITokenLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteAPIToken:
+		if err := f.applyDeleteAPITokenLocked(cmd); err != nil {
+			return err
+		}
+		return nil
 	case opAllocateArtifactEpoch:
 		// Issue a publisher its fencing token. This is an ALLOCATION, not a
 		// read: a process that reads the current epoch and locally picks "one
@@ -2629,10 +2662,32 @@ func (f *placementFSM) addPendingCapacityLocked(owner string, req capacity.Reque
 	cur.DiskGB += req.DiskGB
 	cur.GPUs += req.GPUs
 	f.pendingReservationCapacity[owner] = cur
+	if f.pendingReservationRuntimes == nil {
+		f.pendingReservationRuntimes = make(map[string]map[string]int)
+	}
+	byRuntime := f.pendingReservationRuntimes[owner]
+	if byRuntime == nil {
+		byRuntime = make(map[string]int)
+		f.pendingReservationRuntimes[owner] = byRuntime
+	}
+	byRuntime[req.Runtime]++
 }
 
 func (f *placementFSM) subtractPendingCapacityLocked(owner string, req capacity.Request) {
-	if owner == "" || f.pendingReservationCapacity == nil {
+	if owner == "" {
+		return
+	}
+	if byRuntime := f.pendingReservationRuntimes[owner]; byRuntime != nil {
+		if byRuntime[req.Runtime] <= 1 {
+			delete(byRuntime, req.Runtime)
+		} else {
+			byRuntime[req.Runtime]--
+		}
+		if len(byRuntime) == 0 {
+			delete(f.pendingReservationRuntimes, owner)
+		}
+	}
+	if f.pendingReservationCapacity == nil {
 		return
 	}
 	cur := f.pendingReservationCapacity[owner]
@@ -3049,6 +3104,15 @@ func (f *placementFSM) currentVersion() uint64 {
 // lazily from the expiry heap, so this path does not scan the full placement
 // table at 100k-sandbox scale.
 func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.Request {
+	out, _ := f.pendingReservationLoadByNode(now)
+	return out
+}
+
+// pendingReservationLoadByNode is pendingReservationsByNode plus the same
+// reservations counted by owner and runtime, read under one lock so the two
+// agree. Placement needs both: the aggregate for CPU, memory and disk, the
+// counts for network slots (a pool serves some runtimes, not others).
+func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capacity.Request, map[string]map[string]int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pruneExpiredPendingReservationsLocked(now)
@@ -3056,7 +3120,15 @@ func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.
 	for owner, req := range f.pendingReservationCapacity {
 		out[owner] = req
 	}
-	return out
+	runtimes := make(map[string]map[string]int, len(f.pendingReservationRuntimes))
+	for owner, byRuntime := range f.pendingReservationRuntimes {
+		cp := make(map[string]int, len(byRuntime))
+		for rt, n := range byRuntime {
+			cp[rt] = n
+		}
+		runtimes[owner] = cp
+	}
+	return out, runtimes
 }
 
 func (f *placementFSM) expiredReservationIDs(now int64) []string {
@@ -3531,6 +3603,10 @@ type fsmSnapshotPayload struct {
 	// Optional; an older snapshot decodes it as nil, which reads as "no
 	// snapshot-home entries" and routing falls back to local serving.
 	SnapshotNodes map[string]string
+	// APITokens is the replicated API-token table (hashes, never secrets).
+	// Optional; an older snapshot decodes it as nil, which reads as "no
+	// tokens". An older build decoding a newer snapshot ignores the field.
+	APITokens []identity.TokenRecord
 }
 
 type placementSnapshotRow struct {
@@ -3609,6 +3685,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
 		egressProfiles:     f.egressProfilesSnapshotLocked(),
 		snapshotNodes:      snapshotNodes,
+		apiTokens:          f.apiTokens().snapshot(),
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 	}, nil
@@ -3691,12 +3768,14 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationClaims = make(map[string]pendingReservationClaim)
 	f.pendingReservationCapacity = make(map[string]capacity.Request)
 	f.pendingReservationIDsByOwner = make(map[string]map[string]struct{})
+	f.pendingReservationRuntimes = make(map[string]map[string]int)
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
 	f.deletingIndex = make(map[string]struct{})
 	f.customHostnameIndex = make(map[string]string)
 	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
 	f.restoreEgressProfilesLocked(payload.EgressProfiles)
+	f.apiTokens().restore(payload.APITokens, payload.Version)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -3851,6 +3930,7 @@ type fsmSnapshot struct {
 	volumeAttachments  []models.VolumeAttachment
 	egressProfiles     []EgressProfileRecord
 	snapshotNodes      map[string]string
+	apiTokens          []identity.TokenRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 }
@@ -3875,6 +3955,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		VolumeAttachments:  s.volumeAttachments,
 		EgressProfiles:     s.egressProfiles,
 		SnapshotNodes:      s.snapshotNodes,
+		APITokens:          s.apiTokens,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)

@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
 	apiclient "github.com/aerol-ai/microvm/sdk/go/internal/apiclient"
@@ -34,7 +33,18 @@ var (
 )
 
 const defaultAPIURL = "http://127.0.0.1:21212"
-const authRequiredErrorMessage = "PAT token is required. Set PATToken or SB_PAT_TOKEN."
+const authRequiredErrorMessage = "PAT token is required. Set PATToken, SB_PAT_TOKEN or SB_API_TOKEN."
+
+// Environment variables NewClientWithConfig falls back to. SB_API_TOKEN is
+// an alias of SB_PAT_TOKEN for any bearer (an avm_ API token, an OIDC ID
+// token or the PAT); SB_PAT_TOKEN wins when both are set, so existing
+// setups keep the token they had.
+const (
+	envPATToken = "SB_PAT_TOKEN"
+	envAPIToken = "SB_API_TOKEN"
+	envAPIURL   = "SB_API_URL"
+	envTeam     = "SB_TEAM"
+)
 
 type Client struct {
 	apiURL   string
@@ -72,6 +82,7 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 	apiURL := ""
 	patToken := ""
 	apiVersion := ""
+	team := ""
 	var httpClient *http.Client
 
 	if config != nil {
@@ -79,16 +90,20 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 		patToken = strings.TrimSpace(config.PATToken)
 		httpClient = config.HTTPClient
 		apiVersion = strings.TrimSpace(config.APIVersion)
+		team = strings.TrimSpace(config.Team)
 	}
 
 	if patToken == "" {
-		patToken = strings.TrimSpace(os.Getenv("SB_PAT_TOKEN"))
+		patToken = firstEnv(envPATToken, envAPIToken)
 	}
 	if apiURL == "" {
-		apiURL = strings.TrimSpace(os.Getenv("SB_API_URL"))
+		apiURL = firstEnv(envAPIURL)
 		if apiURL == "" {
 			apiURL = defaultAPIURL
 		}
+	}
+	if team == "" {
+		team = firstEnv(envTeam)
 	}
 	if patToken == "" {
 		return nil, errors.New(authRequiredErrorMessage)
@@ -96,6 +111,7 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 
 	opts := apiclient.ClientOptions{
 		PATToken:   patToken,
+		Team:       team,
 		HTTPClient: httpClient,
 		APIVersion: apiclient.APIVersion(apiVersion),
 	}
@@ -110,6 +126,9 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 		if config.Retry.MaxDelayMs != nil {
 			opts.Retry.MaxDelayMs = config.Retry.MaxDelayMs
 		}
+		if config.Retry.MaxRetryAfterMs != nil {
+			opts.Retry.MaxRetryAfterMs = config.Retry.MaxRetryAfterMs
+		}
 	}
 
 	inner := apiclient.NewClient(apiURL, opts)
@@ -121,8 +140,24 @@ func NewClientWithConfig(config *sdktypes.MicroVMConfig) (*Client, error) {
 	}, nil
 }
 
+// Create creates a sandbox. It sends a random Idempotency-Key, made once
+// for this call and sent unchanged on each of its automatic retries, so a
+// create retried after a timeout gets back the sandbox the first attempt
+// made instead of making a second one. Use CreateWithIdempotencyKey to
+// choose the key.
 func (c *Client) Create(ctx context.Context, opts sdktypes.CreateSandboxOptions) (*Sandbox, error) {
-	item, sshPrivateKey, err := c.inner.Create(ctx, opts)
+	return c.CreateWithIdempotencyKey(ctx, opts, "")
+}
+
+// CreateWithIdempotencyKey is Create with key as the Idempotency-Key. A
+// create sent again with the same key and the same options returns the
+// sandbox the first one made instead of making a second, so your own
+// retries of the whole call are safe too, such as after your process
+// restarts. The same key with different options fails with an *APIError
+// whose Code is "idempotency_key_reused" (HTTP 422). Keys are scoped to the
+// caller's account. A blank key gets a random one, as Create does.
+func (c *Client) CreateWithIdempotencyKey(ctx context.Context, opts sdktypes.CreateSandboxOptions, key string) (*Sandbox, error) {
+	item, sshPrivateKey, err := c.inner.CreateWithIdempotencyKey(ctx, opts, key)
 	if err != nil {
 		return nil, err
 	}

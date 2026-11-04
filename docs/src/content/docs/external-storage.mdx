@@ -221,7 +221,7 @@ The mount programs (`mount-s3`, `mount`, `sshfs`, `rclone`) run on the server it
 - **Outbound network rules do not cover mounts.** [Network access](/network-access/) controls traffic from inside the sandbox. The mount runs on the server, so it can still reach the storage.
 - **Which sandboxes support mounts:** Docker, gVisor and WebAssembly sandboxes. Firecracker and V8 isolate sandboxes refuse them.
 - **SSHFS needs the storage server's host key in advance.** The mount runs with `StrictHostKeyChecking=yes` and `ProxyCommand=none`, so a host key the server does not already know is refused rather than trusted on first use (see NFS and SSHFS options above).
-- **The host needs the mount tools.** `fuse3`, `sshfs`, `nfs-common`, `rclone` and AWS's `mountpoint-s3` must be installed on the server; the install script takes care of them.
+- **The host needs the mount tools.** `fuse3`, `sshfs`, `nfs-common`, `rclone` and AWS's `mountpoint-s3` must be installed on the server; the install script takes care of them. A server without the program for a mount, such as a [local install](/getting-started/local-setup/), refuses the sandbox with `501` and the code `mount_tool_unavailable`. The error names the missing program. Retrying does not help: the operator installs the program, or you create the sandbox without the mount.
 - **Operators can tune where mounts live.** `SB_MOUNTS_ROOT` (default `/var/lib/sandboxd/mounts`), `SB_MOUNTS_CRED_DIR` (default `/run/sandboxd`) and `SB_MOUNT_WAIT_TIMEOUT` (default `30s`) set the mount root, the credential-file folder, and how long a mount may take before the create call fails.
 
 ## Next steps

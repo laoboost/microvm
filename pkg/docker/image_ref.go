@@ -23,11 +23,24 @@ const SnapshotImageNamespace = "aerolvm-snapshot"
 // catalog treats as one snapshot) gets one tag, and a retried commit lands
 // on the tag the first attempt used.
 func SnapshotImageTag(name string) string {
+	return SnapshotImageTagForOwner("", name)
+}
+
+// SnapshotImageTagForOwner is SnapshotImageTag scoped to an owner: the hash
+// folds in the owning tenant, so two tenants that commit a same-named snapshot
+// on one node get DIFFERENT local tags instead of colliding on one image (a
+// tenant could otherwise boot, or fail over onto, another tenant's committed
+// bytes). owner "" reproduces the legacy owner-agnostic tag, so operator and
+// pre-existing snapshots are unchanged.
+func SnapshotImageTagForOwner(owner, name string) string {
 	canonical := strings.TrimSpace(name)
 	if named, err := reference.ParseNormalizedNamed(canonical); err == nil {
 		if _, digested := named.(reference.Digested); !digested {
 			canonical = reference.TagNameOnly(named).String()
 		}
+	}
+	if owner = strings.TrimSpace(owner); owner != "" {
+		canonical = owner + "\x00" + canonical
 	}
 	sum := sha256.Sum256([]byte(canonical))
 	return SnapshotImageNamespace + "/" + hex.EncodeToString(sum[:])[:32] + ":latest"
@@ -38,11 +51,31 @@ func SnapshotImageTag(name string) string {
 // "aerolvm-snapshot/x", "docker.io/aerolvm-snapshot/x" and
 // "index.docker.io/aerolvm-snapshot/x:latest" are all the same local image.
 func IsSnapshotImageRef(ref string) bool {
+	_, ok := parseSnapshotImageRef(ref)
+	return ok
+}
+
+// CanonicalSnapshotImageTag returns the one spelling of a snapshot-namespace
+// ref that SnapshotImageTag produces ("aerolvm-snapshot/<hash>:latest"), so a
+// tag used as a lookup key matches whichever spelling the caller wrote. ok is
+// false for a ref outside the snapshot namespace.
+func CanonicalSnapshotImageTag(ref string) (string, bool) {
+	named, ok := parseSnapshotImageRef(ref)
+	if !ok {
+		return "", false
+	}
+	return reference.FamiliarString(reference.TagNameOnly(named)), true
+}
+
+func parseSnapshotImageRef(ref string) (reference.Named, bool) {
 	named, err := reference.ParseNormalizedNamed(strings.TrimSpace(ref))
 	if err != nil {
-		return false
+		return nil, false
 	}
-	return reference.Domain(named) == "docker.io" && strings.HasPrefix(reference.Path(named), SnapshotImageNamespace+"/")
+	if reference.Domain(named) != "docker.io" || !strings.HasPrefix(reference.Path(named), SnapshotImageNamespace+"/") {
+		return nil, false
+	}
+	return named, true
 }
 
 // LooksLikeImageID reports a reference the engine would resolve by image id

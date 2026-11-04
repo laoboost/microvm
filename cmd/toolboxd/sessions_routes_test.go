@@ -19,7 +19,7 @@ import (
 
 func TestSessionsRoute_DispatchAndErrors(t *testing.T) {
 	srv := newDaytonaTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	t.Run("create_list_get_log_delete", func(t *testing.T) {
 		createReq := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(`{"name":"alpha","command":"printf hello"}`))
@@ -161,8 +161,8 @@ func TestSessionsRoute_DispatchAndErrors(t *testing.T) {
 }
 
 func TestSessionsRoute_DisabledManagerBranches(t *testing.T) {
-	srv := &server{authOptional: true}
-	h := srv.routes()
+	srv := &server{}
+	h := authedRoutes(srv)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/sessions", nil)
@@ -187,8 +187,8 @@ func TestSessionsRoute_DisabledManagerBranches(t *testing.T) {
 }
 
 func TestSessionsRoute_DisabledManagerAdditionalBranches(t *testing.T) {
-	srv := &server{authOptional: true}
-	h := srv.routes()
+	srv := &server{}
+	h := authedRoutes(srv)
 
 	cases := []struct {
 		name string

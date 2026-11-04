@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -267,6 +268,12 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 		"SB_TOOLBOX_TOKEN=" + bootstrapToken,
 	}
 	envValues = append(envValues, pl.EnvVars()...)
+	// A parked toolboxd caps a gVisor sentry at park time, sized for the
+	// park's default memory: the adopt handshake does not restart it.
+	hostPids, pidsEnv := gvisorpids.ForRuntime(ociRuntime, c.pidsLimit, models.DefaultMemoryMB)
+	if !c.resourceLimitsOff {
+		envValues = append(envValues, pidsEnv...)
+	}
 
 	labels := map[string]string{
 		managedLabelKey:  "true",
@@ -299,13 +306,14 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 	if c.network != "" && c.network != "bridge" {
 		hostConfig["NetworkMode"] = c.network
 	}
+	setSandboxIPv6Off(hostConfig, c.network)
 	if ociRuntime != "" {
 		hostConfig["Runtime"] = ociRuntime
 	}
 	if !c.resourceLimitsOff {
 		// Inline, not nested under "Resources": HostConfig embeds the
 		// Resources fields in the Docker API JSON (see the cold path).
-		maps.Copy(hostConfig, parkDefaultResources(c))
+		maps.Copy(hostConfig, parkDefaultResources(hostPids))
 	}
 	if c.parkDiskGB > 0 && effectiveRuntime != models.RuntimeGvisor {
 		hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", c.parkDiskGB)}
@@ -359,15 +367,13 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 	}, nil
 }
 
-func parkDefaultResources(c *Client) map[string]any {
+func parkDefaultResources(pidsLimit int64) map[string]any {
 	cpu := models.DefaultCPU
 	mem := models.DefaultMemoryMB
 	resources := map[string]any{}
 	// Pids limit applies unconditionally: parked bootstrap containers are
-	// fork-bomb vectors too (Devil's Advocate I4).
-	if c.pidsLimit > 0 {
-		resources["PidsLimit"] = int64(c.pidsLimit)
-	}
+	// fork-bomb vectors too (Devil's Advocate I4). It lands via the
+	// pidsLimit argument (the caller passes its configured limit).
 	if cpu > 0 {
 		resources["CpuPeriod"] = int64(100000)
 		resources["CpuQuota"] = int64(cpu * 100000)
@@ -375,6 +381,9 @@ func parkDefaultResources(c *Client) map[string]any {
 	if mem > 0 {
 		resources["Memory"] = int64(mem) * 1024 * 1024
 		resources["MemorySwap"] = int64(mem) * 1024 * 1024
+	}
+	if pidsLimit > 0 {
+		resources["PidsLimit"] = pidsLimit
 	}
 	return resources
 }
@@ -506,15 +515,19 @@ func (c *Client) applyAdoptNetworkPolicy(containerIP string, req models.CreateSa
 		// idempotent and re-asserts it in case it was lost.
 		return c.networkRules.BlockAllEgress(containerIP)
 	}
-	return c.networkRules.ClearBlockAllEgress(containerIP)
+	// The adopted sandbox keeps the slot's address: lift the park block.
+	return c.networkRules.LiftBlockAllEgress(containerIP)
 }
 
 func (c *Client) destroyParked(ctx context.Context, slot *dockerpool.ParkedSlot) error {
 	if slot == nil {
 		return nil
 	}
+	// The slot holds its address until it is removed: everything keyed by
+	// the address goes first (the park block, and anything an adopt
+	// that failed half way put there).
 	if slot.ContainerIP != "" {
-		_ = c.ClearNetworkRules(slot.ContainerIP)
+		_ = c.networkRules.ClearAddress(slot.ContainerIP)
 	}
 	if slot.Handle != nil {
 		_ = slot.Handle.Close()

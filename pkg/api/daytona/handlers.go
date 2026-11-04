@@ -18,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -41,6 +42,22 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	// A keyed create replays only the request it was made with: digest the
+	// Daytona request as the client sent it. A forward re-sends this same
+	// wire body, so the target node digests it the same way.
+	idempotencyKey := strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	var requestDigests []string
+	if idempotencyKey != "" {
+		r = r.WithContext(service.WithIdempotencyKey(r.Context(), idempotencyKey))
+		canonical, err := json.Marshal(req)
+		if err == nil {
+			requestDigests, err = h.deps.Service.CreateRequestDigests("daytona", canonical)
+		}
+		if err != nil {
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
+	}
 
 	placementReq, err := h.clusterPlacementRequest(r.Context(), req)
 	if err != nil {
@@ -58,7 +75,25 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serviceReq, freshlyBuiltImage, err := h.translateCreateSandboxRequest(r.Context(), req)
+	// One create of a sandbox id runs on this node at a time, through the
+	// facade's own steps too: the translate (which may cancel the
+	// reservation), the create, and the state row whose failure rolls the
+	// sandbox back. A keyed retry arriving meanwhile waits here for all of
+	// them, then replays the sandbox (or creates afresh after a failure),
+	// instead of rolling back a sandbox that is not its own. The service
+	// create inside joins this lease.
+	ctx := r.Context()
+	if id := firstNonEmpty(decision.ReservationID, preferredID); id != "" {
+		var release func()
+		ctx, release, err = h.deps.Service.BeginSandboxCreate(ctx, id, requestDigests)
+		if err != nil {
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
+		defer release()
+	}
+
+	serviceReq, freshlyBuiltImage, err := h.translateCreateSandboxRequest(ctx, req)
 	if err != nil {
 		clustercreate.CancelReservationBestEffort(context.Background(), h.deps.Service, h.deps.Logger, decision.ReservationID)
 		// Build failures map like every surface's (service.BuildImage):
@@ -67,7 +102,8 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := clustercreate.CreateOnSelectedNode(r.Context(), h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true, SandboxID: preferredID})
+	serviceReq.CreateRequestDigests = requestDigests
+	response, err := clustercreate.CreateOnSelectedNode(ctx, h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true, SandboxID: preferredID})
 	if err != nil {
 		// A build this request made is now orphaned: no sandbox row
 		// references it. Hand it back so a storm of failed creates does not
@@ -98,8 +134,12 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		NetworkAllowList:    strings.TrimSpace(valueOrEmpty(req.NetworkAllowList)),
 		AutoArchiveInterval: float32(int32Value(req.AutoArchiveInterval, 0)),
 	})
-	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
-		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+	if err := h.persistSandboxMeta(ctx, response.ID, meta); err != nil {
+		// A replay's sandbox is the earlier create's, whose state row is in
+		// place: answer the error, never destroy it.
+		if !response.Replayed {
+			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -333,6 +373,12 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteJSON(w, http.StatusOK, []sandboxResponse{})
 		return
 	}
+	release, err := clusterlist.Admit(h.deps.ListGate, h.deps.Service.Cluster(), r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
@@ -422,6 +468,12 @@ func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request
 		apihttp.WriteJSON(w, http.StatusOK, paginatedSandboxesResponse{})
 		return
 	}
+	release, err := clusterlist.Admit(h.deps.ListGate, h.deps.Service.Cluster(), r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 	sandboxes, err := h.deps.Service.ListSandboxes(r.Context(), nil)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
@@ -807,13 +859,11 @@ func (h *handlers) hydrateEnvIfRequested(r *http.Request, sandbox *models.Sandbo
 	return nil
 }
 
+// includeEnvRequested is the parse the route's permission classifier uses
+// (apihttp.ReadOrSecrets), so any spelling that returns env needed
+// sandbox.secrets to get here.
 func includeEnvRequested(r *http.Request) bool {
-	switch strings.TrimSpace(strings.ToLower(r.URL.Query().Get("include_env"))) {
-	case "true", "1", "yes":
-		return true
-	default:
-		return false
-	}
+	return apihttp.IncludeEnvRequested(r)
 }
 
 func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models.Sandbox, string, error) {
@@ -836,6 +886,9 @@ func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models
 	if err != nil {
 		return nil, "", err
 	}
+	// The path named the sandbox by its name: the call's api record must
+	// carry the id, or the sandbox's own audit history would not find it.
+	auditlog.NoteSandbox(ctx, sandbox.ID)
 	return sandbox, sandbox.ID, nil
 }
 
