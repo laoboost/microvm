@@ -58,8 +58,11 @@ who do not opt in see no behavior change on these axes.
   (`pkg/models/types.go:672-712`; `sdk/go` `CreateSandboxOptions` is an alias),
   stamped by the service create at `internal/service/service.go:2477-2489`
   alongside upstream's own egress fields (`NetworkBlockAll/AllowOut/DenyOut`).
-  The `perf/egress-attach-*` collision called out in the sync spec resolved to
-  keeping both stamp sets.
+  Provenance correction to the sync spec's call-out: there was no
+  `perf/egress-attach-*` collision — `pkg/models/types.go` is byte-identical
+  to upstream v0.6.11 (these five fields are upstream's own, verified present
+  and identical on both sides) and `pkg/egresspolicy` predates v0.6.6, so both
+  stamp sets simply stand as merged.
 
 ## Merge conflict resolutions (sync to v0.6.11)
 
@@ -232,11 +235,43 @@ proxy-clean environment.
 
 ## Release
 
-- Tag: `v0.6.11-speshu.1` (pending — this file's commit is the release carrier;
-  Task 3 of the sync adds one patch group to it)
-- Suite state: `go build ./...` + `go test ./... -parallel 8` green at the
-  merge commit (Task 1, proxy-clean environment); re-verified for this audit's
-  edits: `go build ./...` and `go test ./internal/service/ ./pkg/docker/netrules/ -count=1`
-  green.
-- Assets, checksums and the verification block: to be recorded after the
-  release workflow runs (as for v0.6.7-speshu.1).
+- Tag: `v0.6.11-speshu.1` at `f1b474ae26f89021018422d5f839166249432ceb`
+  (published 2026-11-04 on github.com/laoboost/microvm, marked Latest —
+  `releases/latest` resolves to this tag)
+- Release commit: the commit carrying this file (`f1b474ae`, see the header)
+- Suite state at release commit: `go build ./...` + `go test ./... -parallel 8`
+  green at the merge commit (Task 1, proxy-clean environment); re-verified for
+  this audit's edits: `go build ./...` and
+  `go test ./internal/service/ ./pkg/docker/netrules/ -count=1` green.
+- Assets (laoboost/microvm, 58 files: `install.sh`, `sandboxd`/`toolboxd`/
+  `caddy`/`aerolvm` per-arch binaries, the cluster scripts, `checksums.txt`,
+  `sbom.cdx.json`, `v0.6.11-speshu.1.intoto.jsonl`; tag-scoped copies also
+  attached as `v0.6.11-speshu.1_<asset>` per the release workflow):
+  - https://github.com/laoboost/microvm/releases/download/v0.6.11-speshu.1/install.sh
+  - https://github.com/laoboost/microvm/releases/download/v0.6.11-speshu.1/sandboxd_linux_amd64
+  - https://github.com/laoboost/microvm/releases/download/v0.6.11-speshu.1/toolboxd_linux_amd64
+  - https://github.com/laoboost/microvm/releases/download/v0.6.11-speshu.1/caddy_linux_amd64
+  - https://github.com/laoboost/microvm/releases/download/v0.6.11-speshu.1/checksums.txt
+  - https://github.com/laoboost/microvm/releases/download/v0.6.11-speshu.1/sbom.cdx.json
+  - https://github.com/laoboost/microvm/releases/download/v0.6.11-speshu.1/v0.6.11-speshu.1.intoto.jsonl
+- Verification block: filled post-tag below (checksums + provenance, per
+  RELEASE-VERIFICATION.md).
+
+## Verification (post-tag)
+
+- Tagged commit: `f1b474ae26f89021018422d5f839166249432ceb` (tag
+  `v0.6.11-speshu.1`; verified via the GitHub refs API)
+- Release workflow: `release.yml` run `41815962828` (5 attempts) — the final
+  attempt's "Publish release" job is red although every asset upload in its log
+  reports success and the release carries the complete 58-asset set (three
+  assets were left untouched by digest match); the step log shows no error
+  line. Read the red status as a publish-step exit-code fault, not an asset
+  fault — but re-check the uploader before the next release.
+- Checksums verified out-of-band against the attached `checksums.txt`:
+  `sha256sum -c checksums.txt --ignore-missing` passed for `install.sh`,
+  `sandboxd_linux_amd64`, `toolboxd_linux_amd64`, `caddy_linux_amd64`
+- Provenance: `v0.6.11-speshu.1.intoto.jsonl` attached (sigstore bundle). As
+  for v0.6.7-speshu.1 the DSSE signature was not verified locally (this
+  machine's `gh` 2.46.0 has no `attestation` subcommand and no cosign); verify
+  with `gh attestation verify … --repo laoboost/microvm --signer-workflow
+  laoboost/microvm/.github/workflows/release.yml` from a newer gh.
