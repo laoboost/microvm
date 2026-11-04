@@ -465,7 +465,7 @@ resource "terraform_data" "validate_cluster_ops" {
     # hatch additionally requires the explicit allow_admin_from_anywhere opt-in.
     precondition {
       condition     = !contains(var.admin_allowed_cidrs, "0.0.0.0/0") || var.allow_admin_from_anywhere
-      error_message = "admin_allowed_cidrs contains 0.0.0.0/0 (SSH + operator API + Grafana open to the whole internet). Set allow_public_admin = true only if that is intentional, or scope the list to your operator CIDRs."
+      error_message = "admin_allowed_cidrs contains 0.0.0.0/0 (SSH + operator API + Grafana open to the whole internet). Set allow_admin_from_anywhere = true only if that is intentional, or scope the list to your operator CIDRs."
     }
   }
 }

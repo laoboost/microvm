@@ -165,6 +165,8 @@ const bearerSubprotocol = "sandbox.bearer"
 // toolboxd authenticates from Authorization, so dropping the token element costs
 // nothing there while preventing the caller's credential from reaching
 // tenant-controlled code.
+//
+// Retained for upstream parity; unused since the fork strips the whole header.
 func stripSmuggledBearerSubprotocol(h http.Header) {
 	const key = "Sec-WebSocket-Protocol"
 	vals := h.Values(key)

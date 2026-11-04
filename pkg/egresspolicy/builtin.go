@@ -69,6 +69,9 @@ var builtinCatalogue = map[string]map[int64][]string{
 			"docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
 		},
 	},
+	"speshu": {20261104: {
+		"speshu.ai", "*.speshu.ai", "subchat.ru", "*.subchat.ru", "*.ok.speshu.link",
+	}},
 }
 
 // BuiltinProfile is one resolved built-in profile version.

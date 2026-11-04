@@ -46,6 +46,34 @@ func TestResolveBuiltin(t *testing.T) {
 	if names := strings.Join(BuiltinNames(), ","); !strings.HasPrefix(names, "apt-ubuntu,crates,docker-hub") {
 		t.Fatalf("names = %s", names)
 	}
+	if names := strings.Join(BuiltinNames(), ","); !strings.HasSuffix(names, ",speshu") {
+		t.Fatalf("names = %s", names)
+	}
+}
+
+// TestBuiltinSpeshuProfile: the SpeShu deployment's own hosts are a built-in
+// profile, pinned by the control plane as builtin:speshu@<version>.
+func TestBuiltinSpeshuProfile(t *testing.T) {
+	p, err := ResolveBuiltin("builtin:speshu")
+	if err != nil || p.Version != 20261104 {
+		t.Fatalf("speshu = %+v %v", p, err)
+	}
+	want := []string{"speshu.ai", "*.speshu.ai", "subchat.ru", "*.subchat.ru", "*.ok.speshu.link"}
+	if len(p.AllowOut) != len(want) {
+		t.Fatalf("hosts = %v", p.AllowOut)
+	}
+	for _, h := range want {
+		if !slices.Contains(p.AllowOut, h) {
+			t.Errorf("speshu@%d is missing %s", p.Version, h)
+		}
+	}
+	pinned, err := ResolveBuiltin("builtin:speshu@20261104")
+	if err != nil || pinned.Ref != p.Ref {
+		t.Fatalf("pinned = %+v %v", pinned, err)
+	}
+	if _, err := Compile(Spec{AllowOut: p.AllowOut}); err != nil {
+		t.Fatalf("the profile must compile: %v", err)
+	}
 }
 
 // TestBuiltinDockerHubCoversBlobRedirects: the latest docker-hub version

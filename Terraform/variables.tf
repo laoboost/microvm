@@ -95,9 +95,9 @@ variable "admin_allowed_cidrs" {
   # to ship the RFC 5737 documentation range (203.0.113.0/24) as its value; an
   # operator who copied it got a plan that succeeded while SSH/API/Grafana were
   # reachable from nowhere. Loopback/link-local/multicast/reserved ranges can
-  # never carry operator traffic either. 0.0.0.0/0 is rejected here as well as
-  # gated on allow_public_admin in locals.tf, so the failure is attached to the
-  # variable rather than a precondition.
+  # never carry operator traffic either. 0.0.0.0/0 is not rejected here; it is
+  # gated on allow_admin_from_anywhere in locals.tf, so a world-open admin
+  # fails at the precondition unless the operator opted in explicitly.
   validation {
     condition = alltrue([
       for c in var.admin_allowed_cidrs : !can(regex(
